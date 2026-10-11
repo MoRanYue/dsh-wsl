@@ -2419,8 +2419,23 @@ async function toolTests(tools, shim) {
   await rejects('run without a command is refused before attaching',
     () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'run' }, { agent: termAgent }),
     /non-empty command/)
-  await rejects('an unknown terminal id is refused',
-    () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'read', id: 'zz' }, { agent: termAgent }),
+  // A vanished id must not break the workflow: ids change when the app re-creates a
+  // terminal, and the caller has no way to know. It falls back, and says so.
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t2')] })
+    const run = await makeTermTool(stub).execute({ action: 'read', id: 'zz' }, { agent: termAgent })
+    check('a vanished id falls back to the terminal that is there',
+      run.summary.includes('terminal t2') && run.summary.includes('"zz" is gone'), run.summary)
+    check('and it says which one it used instead', run.summary.includes('the newest running terminal was used'), run.summary.slice(0, 300))
+  }
+  {
+    const stub = makeTerminalStub({ terminals: [] })
+    const run = await makeTermTool(stub).execute({ action: 'read', id: 'zz' }, { agent: termAgent })
+    check('a vanished id with nothing left opens a terminal instead of failing',
+      run.summary.includes('opened a terminal') || run.summary.includes('a new one was opened'), run.summary.slice(0, 400))
+  }
+  await rejects('close with an unknown id is still refused (it never ends a terminal nobody named)',
+    () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'close', id: 'zz' }, { agent: termAgent }),
     /no terminal with id/)
   await rejects('a non-positive timeout is refused',
     () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'run', command: 'ls', timeoutMs: -1 }, { agent: termAgent }),
