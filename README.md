@@ -190,8 +190,14 @@ sidebar's tabs belong to the app's layout owner**, and nothing on the Host side 
 add one — the client half mounts a view per `(session, tabId)` that its layout
 declares, and the only route a Host-created terminal has into the UI is the layout
 owner calling `recover(sessionId)`. Measured: a terminal this tool opened did not
-show up as a tab. So the dependable way to get a terminal you can both see and
-share is to open one yourself in the sidebar first; the tool then works in that one.
+show up as a tab, and the Client exposes no service that could add one (`layout`
+only selects panels and opens the right bar). So the dependable way to get a
+terminal you can both see and share is to open one yourself in the sidebar first;
+the tool then works in that one.
+
+A terminal also belongs to **this DSH run**: restarting DSH ends the session's
+terminals with it, so the next call opens a fresh `dsh-agent` — the id a closed
+terminal burned stays burned only for that run.
 
 Four things are worth knowing before switching it on:
 
