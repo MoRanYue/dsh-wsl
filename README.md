@@ -196,6 +196,9 @@ Three things to know before switching it on:
   full-screen programs (`vim`, `htop`) come back as their raw screen.
 - **`run` needs a POSIX-style shell** (`sh`, `bash`, `zsh`). On `cmd.exe` or
   PowerShell, use `input`.
+- **Long output is not thrown away.** A build or synthesis log's answer is at the
+  bottom, so what comes back is the end of the output; the complete text is written
+  to a file and the result names it.
 
 Commands run as **you**, exactly as if you had typed them — and you see the command
 line appear in the terminal — which is why this ships off by default, behind the
@@ -569,7 +572,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 671 host checks against real WSL (shim for ctx.subprocess) + 141 client checks
+npm test          # 685 host checks against real WSL (shim for ctx.subprocess) + 141 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

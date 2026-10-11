@@ -42,8 +42,8 @@ import {
 import { createWslDoctorTool } from '../lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from '../lib/tools/wsl-bootstrap.js'
 import {
-  autoTerminalIds, describeSessionCwd, extractCommand, inputLine, markerPair, OPENED_TERMINAL_NOTE,
-  pickTerminal, renderTerminals, stripAnsi, wrapCommand,
+  autoTerminalIds, clipTail, describeSessionCwd, extractCommand, inputLine, markerPair, OPENED_TERMINAL_NOTE,
+  pickTerminal, renderTerminals, spillLine, stripAnsi, wrapCommand,
 } from '../lib/terminal.js'
 import { createWslTermTool } from '../lib/tools/wsl-term.js'
 
@@ -456,7 +456,7 @@ const DOCTOR_PROBE_TEXT = [
   'sudo.passwordless=0',
 ].join('\n')
 
-function makeCtx(shim, { jobs, shellEnv, settings, profileContext, terminalController } = {}) {
+function makeCtx(shim, { jobs, shellEnv, settings, profileContext, terminalController, spillStore } = {}) {
   const tools = {}
   const handlers = new Map()
   const routes = []
@@ -486,7 +486,8 @@ function makeCtx(shim, { jobs, shellEnv, settings, profileContext, terminalContr
       : name === 'shellEnv' ? shellEnv
         : name === 'profileContext' ? profileContext
           : name === 'terminalController' ? terminalController
-            : undefined),
+            : name === 'spillStore' ? spillStore
+              : undefined),
     // Event handlers, so a test can fire a live settings update. Kept off the tool
     // map's enumerable keys: those are asserted on with Object.keys.
     on: (event, callback) => { handlers.set(event, callback) },
@@ -1345,6 +1346,25 @@ async function terminalUnitTests() {
   check('a free keyboard is reported as free', inputLine({}).includes('free'), inputLine({}))
   check('another attachment is named as the input holder',
     inputLine({ controllerId: 'client-7' }).includes('client-7'), inputLine({ controllerId: 'client-7' }))
+
+  // Measured need: a 60 492-character `make` output was clipped to its first 20 000
+  // characters, which held the churn and none of the result. The tail is what a build
+  // log is for, and the whole capture goes to a file.
+  const short = 'ok'
+  eq('short output passes through untouched', clipTail(short, 10), 'ok')
+  const long = `${'head'.repeat(100)}THE-ANSWER`
+  const clipped = clipTail(long, 20)
+  check('a long capture keeps its END, where the answer is',
+    clipped.endsWith('THE-ANSWER'), JSON.stringify(clipped.slice(-40)))
+  check('and says how much it dropped', /clipped: \d+ earlier characters omitted/.test(clipped), clipped.slice(0, 80))
+  check('a single dropped character is described in the singular',
+    clipTail('abcdef', 5).includes('1 earlier character omitted'), clipTail('abcdef', 5).split('\n')[0])
+  eq('no spill reference means no line', spillLine({}), '')
+  eq('the spill line names the file, its size and the hint',
+    spillLine({ locator: '/tmp/x.log', bytes: 12, retrievalHint: 'read it' }),
+    'full output (12 bytes): /tmp/x.log — read it')
+  eq('a spill line without size or hint still names the file',
+    spillLine({ locator: '/tmp/x.log' }), 'full output: /tmp/x.log')
 }
 
 // --- tool-level tests ------------------------------------------------------
@@ -2254,6 +2274,68 @@ async function toolTests(tools, shim) {
     const run = await makeTermTool(stub).execute({ action: 'run', command: 'exit' }, { agent: termAgent })
     check('a shell that exits mid-command is reported as an exit, with its code',
       run.summary.includes('did not return before the shell exited') && run.summary.includes('130'), run.summary)
+  }
+
+  // Long output: this is the case that produced the rule. A build log's answer is at
+  // the bottom, so the tail comes back inline and the whole capture is filed.
+  const longFrames = (data) => {
+    const nonce = /__DSH_TERM_START_(\w+)__/.exec(data)?.[1]
+    return [
+      { type: 'output', data: `__DSH_TERM_START_${nonce}__\r\n` },
+      { type: 'output', data: `START-OF-LOG\r\n${'x'.repeat(25_000)}\r\nTHE-ACTUAL-ANSWER\r\n` },
+      { type: 'output', data: `__DSH_TERM_END_${nonce}:0\r\n` },
+    ]
+  }
+  const termCtx = (stub, spillStore) => ({
+    get: (name) => (name === 'terminalController' ? stub : name === 'spillStore' ? spillStore : undefined),
+  })
+  {
+    const spillCalls = []
+    const spillStore = {
+      async saveText(input) {
+        spillCalls.push(input)
+        return {
+          locator: '/spilled/wsl-term-run-output.log',
+          bytes: Buffer.byteLength(input.content, 'utf8'),
+          retrievalHint: 'read it back with the file tools',
+        }
+      },
+    }
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], onWrite: longFrames })
+    const run = await createWslTermTool({ ctx: termCtx(stub, spillStore), config: CONFIG })
+      .execute({ action: 'run', command: 'make syn' }, { agent: termAgent })
+    check('a long command log returns its END, not its beginning',
+      run.summary.includes('THE-ACTUAL-ANSWER') && !run.summary.includes('START-OF-LOG'), run.summary.slice(-240))
+    check('and names the file that holds all of it',
+      run.summary.includes('/spilled/wsl-term-run-output.log') && run.summary.includes('read it back'), run.summary.slice(-200))
+    check('the spilled content is complete and free of escape sequences',
+      spillCalls.length === 1 && spillCalls[0].content.includes('START-OF-LOG')
+      && spillCalls[0].content.includes('THE-ACTUAL-ANSWER') && !spillCalls[0].content.includes('\u001b'),
+      JSON.stringify(spillCalls[0]?.content?.length))
+    check('and it is scoped to the calling session',
+      spillCalls[0]?.owner?.sessionId === 'session-1', JSON.stringify(spillCalls[0]?.owner))
+    check('the inline body is the configured window, not the whole log',
+      run.summary.includes('earlier characters omitted'), run.summary.slice(-240))
+  }
+  {
+    // No spill service (an older build): a temp file still beats losing the output.
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], onWrite: longFrames })
+    const run = await makeTermTool(stub).execute({ action: 'run', command: 'make syn' }, { agent: termAgent })
+    const path = /full output \(\d+ bytes\): (\S+)/.exec(run.summary)?.[1]
+    check('without a spill service the output still lands in a file',
+      typeof path === 'string' && path.includes('dsh-wsl-term-'), run.summary.slice(-200))
+    if (typeof path === 'string') { try { rmSync(path, { force: true }) } catch { /* best effort */ } }
+  }
+  {
+    // A storage failure must not fail a command that already ran.
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], onWrite: longFrames })
+    const failing = { async saveText() { throw new Error('ENOSPC') } }
+    const run = await createWslTermTool({ ctx: termCtx(stub, failing), config: CONFIG })
+      .execute({ action: 'run', command: 'make syn' }, { agent: termAgent })
+    check('a storage failure still reports the tail and the exit code',
+      run.summary.includes('THE-ACTUAL-ANSWER') && run.summary.includes('exit code: 0'), run.summary.slice(-240))
+    const path = /full output \(\d+ bytes\): (\S+)/.exec(run.summary)?.[1]
+    if (typeof path === 'string') { try { rmSync(path, { force: true }) } catch { /* best effort */ } }
   }
   {
     const stub = makeTerminalStub({ terminals: [termInfoOf('t1')] })

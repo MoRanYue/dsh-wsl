@@ -166,6 +166,8 @@ wsl-term({ action: "close", id: "…" })                        → 关闭你点
   你正在打字时模型发起的调用会被拒绝，不会插进你那半行命令里。
 - **`read` 返回的是屏幕内容**：已经滚出去的内容取不回来；`vim`、`htop` 这类全屏程序返回的是它们的原始屏幕。
 - **`run` 需要 POSIX 风格的 shell**（`sh`、`bash`、`zsh`）；`cmd.exe` 或 PowerShell 下请用 `input`。
+- **长输出不会丢。** 构建与综合日志的结论在末尾，所以返回的是输出的**末尾部分**；完整内容会写入文件，
+  结果里给出该文件的路径。
 
 命令以**你的身份**运行，和你自己敲完全一样，而且你能在终端里看到模型发出的那行命令——所以它默认关，
 藏在面板的「终端接入」开关后面。
@@ -500,7 +502,7 @@ argv 包一层过 `ctx.sandbox`）和文件系统服务（`@deepseek-ai/dsh-fs-s
 ### 测试
 
 ```sh
-npm test          # 671 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 141 项客户端检查
+npm test          # 685 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 141 项客户端检查
 npm run test:real # 同一套检查改跑真实 provider，外加 seam 事实套件
 ```
 
