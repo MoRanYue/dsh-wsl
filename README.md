@@ -303,6 +303,7 @@ explanation.
 | 默认跟随会话工作区 | start in the session's directory instead of `~` when `workdir` is omitted. **On by default**: with it off, every relative path an agent writes lands in the Linux home, which is invisible from Explorer and grows the WSL disk image |
 | Linux 默认工作目录 | a fixed Linux directory (for example `/mnt/d/project`) used when `workdir` is omitted. Filling it in wins over the switch above; clearing it goes back to following the session |
 | WSL 终端启动路径 | the optional sidebar terminal's startup directory — `--cd <dir>` on the `terminal-controller` row of your **profile patch** (see [Optional: a WSL terminal in the sidebar](#optional-a-wsl-terminal-in-the-sidebar)). Empty clears it, and the panel reads the current value from the same file |
+| 终端历史行数 | how many lines of output that terminal keeps (`scrollback` on the same row). The platform default is 1000; `0` keeps none and an empty box restores the default. Both fields take effect at the next DSH start |
 | 危险命令守卫 | whether a destructive command needs an explicit `allowDangerous` |
 | 管理员模式（root） | whether `wsl` accepts `asRoot: true` (`wsl -u root`). WSL's root needs no password, so this switch is the authorisation itself; **off by default** |
 
@@ -358,6 +359,12 @@ checking what landed before it is kept. Clearing the field removes the flag, whi
 the terminal back on the session workspace (the Windows directory it is started from,
 translated to `/mnt/…`); `~` pins it to the Linux home. It takes effect at the next app
 start too.
+
+Beside it, 「终端历史行数」 sets `scrollback` on the same row: how many lines of output
+the terminal keeps, so long builds stay readable instead of scrolling away (the platform
+default is 1000). `0` keeps none, and an empty box goes back to the default. A longer
+history costs memory in both the app and the Host, which is why it is a number you
+choose rather than a fixed large value. Same write rules and the same next-start rule.
 
 ```yaml
 - id: terminal-controller
@@ -572,7 +579,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 685 host checks against real WSL (shim for ctx.subprocess) + 141 client checks
+npm test          # 706 host checks against real WSL (shim for ctx.subprocess) + 151 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

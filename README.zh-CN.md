@@ -254,6 +254,7 @@ DSH_SUBPROCESS_LOCAL=/path/to/dsh/node_modules npm run test:real
 | 默认跟随会话工作区 | 未传 `workdir` 时从会话目录开始，而不是 `~`。**默认开**：关掉的话，agent 写的相对路径都会落进 Linux 家目录 —— 那儿在资源管理器里看不见，还会撑大 WSL 磁盘镜像 |
 | Linux 默认工作目录 | 未传 `workdir` 时使用的固定 Linux 目录（如 `/mnt/d/project`）。填了就优先于上面的开关；清空则回到跟随会话 |
 | WSL 终端启动路径 | 可选的侧边栏终端从哪个目录启动 —— 写进你 **profile patch** 里 `terminal-controller` 那一行的 `--cd <目录>`（见[可选：在侧边栏开一个 WSL 终端](#可选在侧边栏开一个-wsl-终端)）。留空则删掉该参数；当前值也是从这个文件读的 |
+| 终端历史行数 | 那个终端保留多少行输出（同一行上的 `scrollback`）。平台默认 1000；填 `0` 不保留，留空回到默认。这两项都在重启 DSH 后生效 |
 | 危险命令守卫 | 危险命令是否必须显式 `allowDangerous` |
 | 管理员模式（root） | `wsl` 是否接受 `asRoot: true`（`wsl -u root`）。WSL 的 root 免密，所以这项开关就是授权本身；**默认关** |
 
@@ -290,6 +291,10 @@ patch 层 —— 每次写入前先备份该文件，只重写终端那一行的
 文件读出当前值，再把 `--cd <目录>` 写到该行 `args` 上 —— 写前先备份 patch 文件，只改这一行，
 写后读回来核对。**清空**则删掉该参数，终端回到跟随会话工作区（启动时的 Windows 目录会被翻译成
 `/mnt/…`）；填 `~` 固定到 Linux 家目录。改完同样**重启 DSH 生效**。
+
+它旁边的「终端历史行数」在**同一行**上设置 `scrollback`：终端保留多少行输出，长构建才不会被滚掉
+（平台默认 1000 行）。填 `0` 表示不保留，留空则回到默认。历史越长，应用与宿主两侧占用的内存越多，
+所以这是一个由你决定的数字，而不是一个固定的大值。写入规则与生效时机（重启 DSH）都与上面一致。
 
 ```yaml
 - id: terminal-controller
@@ -502,7 +507,7 @@ argv 包一层过 `ctx.sandbox`）和文件系统服务（`@deepseek-ai/dsh-fs-s
 ### 测试
 
 ```sh
-npm test          # 685 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 141 项客户端检查
+npm test          # 706 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 151 项客户端检查
 npm run test:real # 同一套检查改跑真实 provider，外加 seam 事实套件
 ```
 

@@ -31,7 +31,15 @@ import { parseDefaultDistro } from './lib/tools/wsl-env.js'
 import { resolveConfig } from './lib/config.js'
 import { pickSchemaBuilder } from './lib/schema.js'
 import { createRunner } from './lib/runner.js'
-import { readTerminalCwd, reviewTerminalWrite, writeTerminalCwd } from './lib/terminal-cwd.js'
+import {
+  readTerminalCwd,
+  readTerminalScrollback,
+  reviewTerminalWrite,
+  verifyTerminalRewrite,
+  verifyTerminalScrollbackRewrite,
+  writeTerminalCwd,
+  writeTerminalScrollback,
+} from './lib/terminal-cwd.js'
 import { createWslTool } from './lib/tools/wsl.js'
 import { createWslPathTool } from './lib/tools/wsl-path.js'
 import { createWslEnvTool } from './lib/tools/wsl-env.js'
@@ -349,7 +357,7 @@ function prunePatchBackups(file, keep) {
 async function serveTerminalCwd(ctx, request, response) {
   const file = resolvePatchFile(ctx, process.env)
   if (file === null) {
-    answerJson(response, 200, { ok: false, path: '', available: false, error: NO_PATCH_ERROR })
+    answerJson(response, 200, { ok: false, path: '', scrollback: null, available: false, error: NO_PATCH_ERROR })
     return
   }
 
@@ -358,11 +366,17 @@ async function serveTerminalCwd(ctx, request, response) {
     try {
       text = readFileSync(file, 'utf8')
     } catch {
-      answerJson(response, 200, { path: '', available: false, error: `读不到 ${PATCH_FILE_NAME}` })
+      answerJson(response, 200, { path: '', scrollback: null, available: false, error: `读不到 ${PATCH_FILE_NAME}` })
       return
     }
-    const read = readTerminalCwd(text)
-    answerJson(response, 200, { path: read.path, available: read.row, error: read.error })
+    const cwdRead = readTerminalCwd(text)
+    const scrollRead = readTerminalScrollback(text)
+    answerJson(response, 200, {
+      path: cwdRead.path,
+      scrollback: scrollRead.value,
+      available: cwdRead.row,
+      error: cwdRead.error ?? scrollRead.error,
+    })
     return
   }
 
@@ -382,17 +396,25 @@ async function serveTerminalCwd(ctx, request, response) {
   // rewriting the patch.
   const contentType = requestHeader(request, 'content-type')
   if (!/^application\/json\s*(?:;|$)/i.test(contentType)) {
-    answerJson(response, 415, { ok: false, path: '', error: '请求必须是 application/json' })
+    answerJson(response, 415, { ok: false, path: '', scrollback: null, error: '请求必须是 application/json' })
     return
   }
 
   const body = await readJsonBody(request)
   if (body.error !== undefined) {
-    answerJson(response, 400, { ok: false, path: '', error: body.error })
+    answerJson(response, 400, { ok: false, path: '', scrollback: null, error: body.error })
     return
   }
-  if (typeof body.value.path !== 'string') {
-    answerJson(response, 400, { ok: false, path: '', error: '请求体里需要一个字符串字段 path' })
+  const wantsPath = typeof body.value.path === 'string'
+  const wantsScrollback = body.value.scrollback !== undefined && body.value.scrollback !== null
+  if (!wantsPath && !wantsScrollback) {
+    answerJson(response, 400, { ok: false, path: '', scrollback: null, error: '请求体里需要 path 或 scrollback 字段' })
+    return
+  }
+  // One property per request: the write is only accepted when exactly one line changed,
+  // and that guarantee is what makes a mis-write recoverable.
+  if (wantsPath && wantsScrollback) {
+    answerJson(response, 400, { ok: false, path: '', scrollback: null, error: '一次请求只能修改一项' })
     return
   }
 
@@ -400,24 +422,24 @@ async function serveTerminalCwd(ctx, request, response) {
   try {
     original = readFileSync(file, 'utf8')
   } catch {
-    answerJson(response, 200, { ok: false, path: '', error: `读不到 ${PATCH_FILE_NAME}` })
+    answerJson(response, 200, { ok: false, path: '', scrollback: null, error: `读不到 ${PATCH_FILE_NAME}` })
     return
   }
 
-  // Bad input (a line break, a quote) and an unrecognized file both stop HERE, with the
-  // file still byte-for-byte what it was.
-  const next = writeTerminalCwd(original, body.value.path)
+  const currentPath = readTerminalCwd(original).path
+  const currentScrollback = readTerminalScrollback(original).value
+  const refused = (error) => answerJson(response, 200, { ok: false, path: currentPath, scrollback: currentScrollback, error })
+
+  // Bad input (a line break, a quote, a non-number) and an unrecognized file both stop
+  // HERE, with the file still byte-for-byte what it was.
+  const next = wantsPath ? writeTerminalCwd(original, body.value.path) : writeTerminalScrollback(original, body.value.scrollback)
   if (!next.ok) {
-    answerJson(response, 200, {
-      ok: false,
-      path: readTerminalCwd(original).path,
-      error: next.error,
-    })
+    refused(next.error)
     return
   }
   if (next.text === original) {
     // Already what was asked for: no write, and no backup for a no-op.
-    answerJson(response, 200, { ok: true, path: next.path, error: null })
+    answerJson(response, 200, { ok: true, path: currentPath, scrollback: currentScrollback, error: null })
     return
   }
 
@@ -426,11 +448,7 @@ async function serveTerminalCwd(ctx, request, response) {
     backup = backupPatchFile(file)
   } catch (error) {
     console.warn('dsh-wsl-tool: could not back up the profile patch', error)
-    answerJson(response, 200, {
-      ok: false,
-      path: readTerminalCwd(original).path,
-      error: '备份 profile patch 失败，未改动文件',
-    })
+    refused('备份 profile patch 失败，未改动文件')
     return
   }
   prunePatchBackups(file, backup)
@@ -439,11 +457,7 @@ async function serveTerminalCwd(ctx, request, response) {
     writeFileSync(file, next.text, 'utf8')
   } catch (error) {
     console.warn('dsh-wsl-tool: writing the profile patch failed', error)
-    answerJson(response, 200, {
-      ok: false,
-      path: readTerminalCwd(original).path,
-      error: '写入 profile patch 失败',
-    })
+    refused('写入 profile patch 失败')
     return
   }
 
@@ -457,9 +471,11 @@ async function serveTerminalCwd(ctx, request, response) {
   } catch {
     written = null
   }
-  const review = reviewTerminalWrite(original, written, next.text, next.path)
+  const verify = wantsPath ? verifyTerminalRewrite : verifyTerminalScrollbackRewrite
+  const expected = wantsPath ? next.path : next.value
+  const review = reviewTerminalWrite(original, written, next.text, expected, verify)
   if (review.verdict === 'conflict') {
-    answerJson(response, 200, { ok: false, path: '', error: review.error })
+    answerJson(response, 200, { ok: false, path: '', scrollback: null, error: review.error })
     return
   }
   if (review.verdict === 'undo') {
@@ -470,15 +486,16 @@ async function serveTerminalCwd(ctx, request, response) {
       console.error('dsh-wsl-tool: could not restore the profile patch', error)
       restored = false
     }
-    answerJson(response, 200, {
-      ok: false,
-      path: readTerminalCwd(original).path,
-      error: `写入校验失败（${review.error}）${restored ? '，已还原' : '，且还原失败，请从备份恢复'}`,
-    })
+    refused(`写入校验失败（${review.error}）${restored ? '，已还原' : '，且还原失败，请从备份恢复'}`)
     return
   }
 
-  answerJson(response, 200, { ok: true, path: next.path, error: null })
+  answerJson(response, 200, {
+    ok: true,
+    path: readTerminalCwd(next.text).path,
+    scrollback: readTerminalScrollback(next.text).value,
+    error: null,
+  })
 }
 
 /** Read this package's own manifest once; a broken manifest must not break the route. */

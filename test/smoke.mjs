@@ -30,8 +30,9 @@ import { assertLauncherReachable, collectForwardEnv, resolveDistro, sessionCwdOf
 import { capabilityLines, launcherSummary, parseFacts, workspaceLine } from '../lib/diagnostics.js'
 import { parseDefaultDistro } from '../lib/tools/wsl-env.js'
 import {
-  parseFlowSequence, readTerminalCwd, reviewTerminalWrite, splitPatchLines, validateTerminalCwd,
-  verifyTerminalRewrite, writeTerminalCwd,
+  parseFlowSequence, readTerminalCwd, readTerminalScrollback, reviewTerminalWrite, splitPatchLines,
+  validateTerminalCwd, validateTerminalScrollback, verifyTerminalRewrite, verifyTerminalScrollbackRewrite,
+  writeTerminalCwd, writeTerminalScrollback,
 } from '../lib/terminal-cwd.js'
 import {
   commandState, composeDoctorReport, needsFromFacts, parseProbe, suggestionRecipes, versionToken,
@@ -715,8 +716,11 @@ async function unitTests() {
   console.log('\nterminal startup directory: write verification')
   eq('a good rewrite verifies', verifyTerminalRewrite(before, set.text, '/mnt/d/project'), null)
   check('a BOM is caught', /BOM/.test(String(verifyTerminalRewrite(before, `\uFEFF${set.text}`, '/mnt/d/project'))))
+  // Removing a newline merges two lines. The write must still be refused; the reason is
+  // now the terminator shape rather than the line count, because a one-line insertion or
+  // deletion is a legitimate shape for a key that is added or cleared.
   check('a lost line is caught',
-    /行数/.test(String(verifyTerminalRewrite(before, set.text.replace('\n', ''), '/mnt/d/project'))))
+    /换行符|行数|改动/.test(String(verifyTerminalRewrite(before, set.text.replace('\n', ''), '/mnt/d/project'))))
   check('a second changed line is caught',
     /应当只改/.test(String(verifyTerminalRewrite(before, set.text.replace('name: WSL', 'name: WSL2'), '/mnt/d/project'))))
   check('a value that does not read back is caught',
@@ -1625,6 +1629,51 @@ async function toolTests(tools, shim) {
     check('an empty path clears the flag', cleared.ok === true, cleared.body)
     eq('the cleared file carries no --cd', readTerminalCwd(readFileSync(patchFile, 'utf8')).path, '')
     eq('the clear is a second backup', backupsIn(profileDir).length, 2)
+
+    // The same row also carries how much history its terminal keeps. Same rules: one
+    // property per request, exactly one changed line, a backup before the write, and a
+    // value that is not a sane count changes nothing.
+    const beforeScroll = readFileSync(patchFile, 'utf8')
+    const scrollSaved = JSON.parse((await call('POST', JSON.stringify({ scrollback: '5000' }))).body)
+    check('a history length saves', scrollSaved.ok === true && scrollSaved.scrollback === 5000, JSON.stringify(scrollSaved))
+    const afterScroll = readFileSync(patchFile, 'utf8')
+    eq('the history length landed in the row', readTerminalScrollback(afterScroll).value, 5000)
+    // A new key is an INSERTED line, so the positional helper cannot describe it; what
+    // matters is that the file gained exactly one line and lost nothing.
+    eq('the history length is a new line, not a rewrite of another',
+      afterScroll.split('\n').length, beforeScroll.split('\n').length + 1)
+    eq('and the tail of the file is untouched', afterScroll.endsWith(beforeScroll.slice(beforeScroll.lastIndexOf('\n'))), true)
+    eq('the row itself is still readable', readTerminalCwd(afterScroll).row, true)
+    eq('a third backup was taken', backupsIn(profileDir).length, 3)
+    eq('GET reports the history length', JSON.parse((await call('GET')).body).scrollback, 5000)
+    check('nothing else in the file moved', verifyTerminalScrollbackRewrite(beforeScroll, afterScroll, 5000) === null)
+
+    const badScroll = JSON.parse((await call('POST', JSON.stringify({ scrollback: 'many' }))).body)
+    check('a non-numeric history length is refused',
+      badScroll.ok === false && /数字/.test(String(badScroll.error)), String(badScroll.error))
+    eq('the refusal left the file alone', readFileSync(patchFile, 'utf8'), afterScroll)
+    const hugeScroll = JSON.parse((await call('POST', JSON.stringify({ scrollback: '999999' }))).body)
+    check('an absurd history length is refused and says the range',
+      hugeScroll.ok === false && /100000/.test(String(hugeScroll.error)), String(hugeScroll.error))
+    const twoFields = await call('POST', JSON.stringify({ path: '/mnt/x', scrollback: '10' }))
+    eq('changing two settings in one request is refused', twoFields.code, 400)
+    eq('and that refusal changed nothing', readFileSync(patchFile, 'utf8'), afterScroll)
+
+    const clearedScroll = JSON.parse((await call('POST', JSON.stringify({ scrollback: '' }))).body)
+    check('an empty history length clears the key',
+      clearedScroll.ok === true && clearedScroll.scrollback === null, JSON.stringify(clearedScroll))
+    eq('the key is gone from the file', readTerminalScrollback(readFileSync(patchFile, 'utf8')).value, null)
+    // Pure rules behind those answers, so a failure names the rule rather than the route.
+    eq('a negative history length is not a count', validateTerminalScrollback('-1').ok, false)
+    eq('a fractional history length is not a count', validateTerminalScrollback('1.5').ok, false)
+    check('blank means "platform default"',
+      validateTerminalScrollback('   ').ok === true && validateTerminalScrollback('').value === null)
+    eq('a plain count parses', validateTerminalScrollback('2000').value, 2000)
+    check('a row without a block config is refused rather than guessed at',
+      writeTerminalScrollback('plugins:\n  - id: terminal-controller\n    config: {}\n', '10').ok === false,
+      writeTerminalScrollback('plugins:\n  - id: terminal-controller\n    config: {}\n', '10').error)
+    check('a patch without the row is refused',
+      writeTerminalScrollback('plugins: []\n', '10').ok === false)
 
     eq('a malformed body is a 400', (await call('POST', '{oops')).code, 400)
     eq('a body without a path field is a 400', (await call('POST', JSON.stringify({ nope: true }))).code, 400)

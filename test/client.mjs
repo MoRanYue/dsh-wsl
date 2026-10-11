@@ -737,6 +737,52 @@ check('a refused save settles as failed', refusedTerminal === false, String(refu
 const refusedText = textOf(mounted.tree())
 check('the panel shows why the save failed',
   refusedText.includes('保存失败') && refusedText.includes('没有可改的行'), refusedText.slice(-240))
+/** The terminal history field of whatever tree is current: its input and its 保存. */
+const historyFieldIn = (root) => {
+  const area = sectionIn(collect(root), '终端历史行数')
+  const inner = area === undefined ? [] : collect(area)
+  return {
+    input: inner.find((node) => node.type === 'input'),
+    save: inner.find((node) => typeof node.props?.children === 'string'
+      && node.props.children.startsWith('保存')),
+  }
+}
+
+// (5) The same row also carries how much history its terminal keeps. Same route, same
+// rules, one property per save — and the panel has to say a restart is needed, because
+// that row is read when the composition is built.
+console.log('\nterminal history length: the same route, one property per save')
+getAnswer = { path: '/mnt/d/current', scrollback: null, available: true, error: null }
+const historyMounted = mountStateful(main.component, { ...panelProps })
+await historyMounted.flush()
+const historyField = historyFieldIn(historyMounted.tree())
+check('the panel offers a history-length field',
+  historyField.input !== undefined && historyField.save !== undefined, textOf(historyMounted.tree()).slice(-240))
+eq('an unset history length leaves the box empty', historyField.input?.props?.value, '')
+check('and the placeholder names the platform default',
+  /1000/.test(String(historyField.input?.props?.placeholder)), String(historyField.input?.props?.placeholder))
+const historyWritesBefore = ops.length
+historyField.input.props.onChange({ target: { value: '5000' } })
+eq('the field is controlled: typing shows the typed value',
+  historyFieldIn(historyMounted.tree()).input?.props?.value, '5000')
+postAnswer = { ok: true, path: '/mnt/d/current', scrollback: 5000, error: null }
+const savedHistory = await historyFieldIn(historyMounted.tree()).save.props.onClick()
+check('the save settles as successful', savedHistory === true, String(savedHistory))
+const historyPost = terminalCalls().filter((entry) => entry.method === 'POST').pop()
+eq('the save sends only the scrollback property',
+  JSON.stringify(JSON.parse(historyPost?.body)), JSON.stringify({ scrollback: '5000' }))
+const historyText = textOf(historyMounted.tree())
+check('the panel confirms the saved length and the restart',
+  historyText.includes('已保存：5000 行') && historyText.includes('重启 DSH 后生效'), historyText.slice(-240))
+eq('the history save writes the patch, not the settings scope', ops.length, historyWritesBefore)
+postAnswer = { ok: false, path: '/mnt/d/current', scrollback: null, error: '历史行数只能填数字' }
+historyFieldIn(historyMounted.tree()).input.props.onChange({ target: { value: 'many' } })
+const refusedHistory = await historyFieldIn(historyMounted.tree()).save.props.onClick()
+check('a refused history save settles as failed', refusedHistory === false, String(refusedHistory))
+check('and the panel shows the Host\'s reason',
+  textOf(historyMounted.tree()).includes('历史行数只能填数字'), textOf(historyMounted.tree()).slice(-240))
+historyMounted.unmount()
+
 mounted.unmount()
 
 // (4) A profile without the terminal row: the panel points at the opt-in instead of
