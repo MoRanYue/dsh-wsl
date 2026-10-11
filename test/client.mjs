@@ -277,12 +277,13 @@ check('the panel says the installer is off unless the user turns it on',
 check('and it explains that root is the authorisation itself',
   rendered.includes('管理员模式（root）') && rendered.includes('这项开关就是授权本身'), rendered.slice(0, 200))
 // The terminal row is the only one whose ON position touches the user's own shell,
-// so the panel has to name both consequences: it may open a terminal, and the user's
-// view goes read-only while the model works.
-check('the panel says the terminal tool may open a terminal and takes the keyboard',
+// so the panel has to name all three consequences: it may open a terminal, the view
+// goes read-only while the model works, and MEASURED, the keyboard does not come
+// back by itself — the user has to click 接管输入.
+check('the panel says the terminal tool may open a terminal, takes the keyboard, and does not give it back',
   switches.some((node) => node.props?.label === 'wsl-term 终端接入'
     && String(node.props?.title).includes('dsh-agent')
-    && String(node.props?.title).includes('暂时只读')),
+    && String(node.props?.title).includes('接管输入')),
   JSON.stringify(switches.find((node) => node.props?.label === 'wsl-term 终端接入')?.props?.title))
 // The panel now OFFERS the sidebar terminal's startup directory (one field, one 保存),
 // but it still must not print the patch RECIPE: pointing a terminal at WSL is the

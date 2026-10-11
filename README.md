@@ -206,7 +206,12 @@ Four things are worth knowing before switching it on:
   newest attachment exclusive input control, so your sidebar view is read-only for
   the duration of a call — and if you are typing when the model calls, the call is
   rejected rather than merged into your line. Every action detaches before it
-  returns, and the tests assert that.
+  returns, and the tests assert that. **Measured, and the part worth knowing
+  before you switch it on: detaching does not hand the keyboard back.** When the
+  tool lets go, the control slot is empty, your view keeps showing 「此页面当前只读」, and
+  you click **「接管输入」** to type again. The platform has no call that returns
+  input to the attachment it displaced, so the tool's result tells the model to say
+  this out loud instead of leaving you typing into nothing.
 - **`read` is the screen, not the log.** What comes back is the host's terminal
   emulator viewport, so anything that has scrolled out of the buffer is gone, and
   full-screen programs (`vim`, `htop`) return their escape-driven screen. Line-based

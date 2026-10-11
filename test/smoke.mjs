@@ -2206,6 +2206,16 @@ async function toolTests(tools, shim) {
       JSON.stringify(stub.calls.write[0].data.slice(0, 60)))
     eq('run does not open a second terminal when one exists', stub.calls.create.length, 0)
     eq('run detaches as well', stub.calls.detached, 1)
+    // Measured on a real sidebar terminal: after this tool detaches, the user's view
+    // stays read-only until they click 接管输入, so the model must be told to say so.
+    check('run tells the model the user has to take the input back',
+      run.summary.includes('接管输入') && /tell them/i.test(run.summary), run.summary)
+  }
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], screen: 'ready' })
+    const listed = await makeTermTool(stub).execute({ action: 'list' }, { agent: termAgent })
+    check('listing does not mention a keyboard handover, because it never attaches',
+      !listed.summary.includes('接管输入'), listed.summary)
   }
   {
     const stub = makeTerminalStub({ terminals: [], onWrite: replyWithCommand })
