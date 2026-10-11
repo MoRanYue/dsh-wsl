@@ -97,7 +97,7 @@ export const Config = Schema?.object({
     doctor: Schema.boolean().default(true).description('注册 `wsl-doctor` 工具：对照项目清单与发行版实际能力，指出缺什么，以及哪些命令其实是 Windows 的。').volatile(),
     bootstrap: Schema.boolean().default(false).description('注册 `wsl-bootstrap` 工具：在发行版里补装缺失的工具链。默认关；打开后它以 root 执行固定配方，且调用方仍需显式 `dryRun: false`。').volatile(),
     term: Schema.boolean().default(false).description('注册 `wsl-term` 工具：读写本会话侧边栏里的那个终端，必要时自行新开一个（会出现在侧边栏）。默认关；打开后模型可以在你看着的那个终端里执行命令，执行期间输入控制权在它手上。').volatile(),
-  }).description('要注册哪些工具；这几项在重启 DSH 后生效。'),
+  }).description('要注册哪些工具；改动即时生效（面板开关一拨，工具就出现或消失，不需要重启）。'),
   backgroundJobs: Schema.boolean().default(true).description('允许长任务以 `runInBackground` 后台执行，结果由内置 job 工具读取。').volatile(),
   translatePaths: Schema.boolean().default(true).description('命令中的 Windows 路径默认转为 `/mnt/...`。').volatile(),
   startInSessionWorkspace: Schema.boolean().default(true).description('未传 `workdir` 时从会话目录启动；默认开。关闭后使用下方固定目录，该目录留空时为家目录 `~`。').volatile(),
@@ -605,22 +605,56 @@ export function apply(ctx, settings = {}) {
   // volatile-update hook below can change it in place without remounting.
   const config = resolveConfig(process.env, settings)
   const runner = createRunner(ctx, config)
-  // `ctx` is passed to the `wsl` tool for the optional `jobs` service only
-  // (background commands); it is read with ctx.get at call time, never injected,
-  // so a preset without tool-jobs still mounts this plugin.
-  if (config.tools.wsl) ctx.tools.register(createWslTool({ ctx, config, runner }))
-  if (config.tools.path) ctx.tools.register(createWslPathTool({ config, runner }))
-  if (config.tools.env) ctx.tools.register(createWslEnvTool({ config, runner }))
-  if (config.tools.doctor) ctx.tools.register(createWslDoctorTool({ config, runner }))
-  // The installer is the one tool that is NOT registered by default: turning on
-  // its switch is the user's decision to let this plugin add software to their
-  // distribution.
-  if (config.tools.bootstrap) ctx.tools.register(createWslBootstrapTool({ config, runner }))
-  // The terminal tool is off by default for the same reason: its ON position lets
-  // the model type into the terminal the user is looking at. It reads the
-  // `terminalController` service lazily, so a build without a sidebar terminal
-  // still mounts this plugin and reports that clearly instead of failing to load.
-  if (config.tools.term) ctx.tools.register(createWslTermTool({ ctx, config }))
+
+  // ------------------------------------------------------------- tool switches
+  //
+  // Registering a tool is a live operation (`register` returns its own disposer),
+  // so `tools.*` is not a restart-only setting: the volatile-update hook below
+  // diffs the desired set against the mounted one. That matters because the panel
+  // is where these are toggled — measured: a user flipped a tool switch 24 seconds
+  // after starting the app and the tool was still missing, which reads as "the
+  // switch did nothing".
+  //
+  // Every factory is built lazily inside its own `register`, so a tool that is
+  // switched on later gets a fresh definition rather than a stale captured one.
+  const toolFactories = {
+    wsl: () => createWslTool({ ctx, config, runner }),
+    path: () => createWslPathTool({ config, runner }),
+    env: () => createWslEnvTool({ config, runner }),
+    doctor: () => createWslDoctorTool({ config, runner }),
+    // The installer is NOT registered by default: turning on its switch is the
+    // user's decision to let this plugin add software to their distribution.
+    bootstrap: () => createWslBootstrapTool({ config, runner }),
+    // The terminal tool is off by default for the same reason: its ON position lets
+    // the model type into the terminal the user is looking at. It reads the
+    // `terminalController` service lazily, so a build without a sidebar terminal
+    // still mounts this plugin and reports that clearly instead of failing to load.
+    term: () => createWslTermTool({ ctx, config }),
+  }
+  /** name -> disposer for the tools currently mounted by this plugin. */
+  const mountedTools = new Map()
+  const syncTools = () => {
+    for (const [name, factory] of Object.entries(toolFactories)) {
+      const wanted = config.tools[name] === true
+      const disposer = mountedTools.get(name)
+      if (wanted && disposer === undefined) {
+        try {
+          mountedTools.set(name, ctx.tools.register(factory()))
+        } catch (error) {
+          // A tool whose factory throws must not take the other five down.
+          console.error(`dsh-wsl-tool: registering the ${name} tool failed`, error)
+        }
+      } else if (!wanted && disposer !== undefined) {
+        mountedTools.delete(name)
+        try {
+          disposer()
+        } catch (error) {
+          console.error(`dsh-wsl-tool: unregistering the ${name} tool failed`, error)
+        }
+      }
+    }
+  }
+  syncTools()
 
   // ---------------------------------------------------------------- self info
   //
@@ -674,15 +708,15 @@ export function apply(ctx, settings = {}) {
   }
 
   // A volatile edit is written into the same object the loader handed us and then
-  // announced, so re-resolving in place is what makes the behaviour switches
-  // (background jobs, path translation, the guard, workdir, distro, timeout) take
-  // effect without a restart. The three `tools.*` switches are the exception: they
-  // decide which tools were registered, so they need the next start, and the panel
-  // says so on those rows.
+  // announced, so re-resolving in place is what makes every switch take effect
+  // without a restart: the behaviour values are read at call time, and the tool
+  // switches are diffed into the registry by `syncTools` above. The panel says a
+  // change applies immediately, because it does.
   if (typeof ctx.on === 'function') {
     ctx.on('loader/volatile-update', () => {
       try {
         Object.assign(config, resolveConfig(process.env, settings))
+        syncTools()
       } catch (error) {
         console.error('dsh-wsl-tool: applying a live settings change failed', error)
       }

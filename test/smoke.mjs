@@ -467,7 +467,18 @@ function makeCtx(shim, { jobs, shellEnv, settings, profileContext, terminalContr
     },
   }
   const ctx = {
-    tools: { register(tool) { tools[tool.name] = tool } },
+    // `register` returns the disposer that removes exactly this tool, which is what
+    // lets a tool switch take effect live. Modelling that here is not decoration:
+    // without it a test cannot tell "the switch registered the tool" from "the
+    // switch retired it".
+    tools: {
+      register(tool) {
+        tools[tool.name] = tool
+        return () => {
+          if (tools[tool.name] === tool) delete tools[tool.name]
+        }
+      },
+    },
     subprocess: shim,
     // Optional services: the plugin must work when these return undefined.
     get: (name) => (name === 'jobs' ? jobs
@@ -1445,6 +1456,31 @@ async function toolTests(tools, shim) {
     command: 'rm -r -f /tmp/dsh-wsl-live; echo ran', description: 'now unguarded',
   })
   eq('a behaviour switch applies without a restart', liveRun.stdout.trim(), 'ran')
+
+  // A tool switch is the same kind of live setting: the panel is where these are
+  // flipped, and a switch that only works after a restart reads as broken. Measured
+  // in the wild: a user turned a tool switch on 24 seconds after starting the app
+  // and the tool was still missing, because registration only ran at mount.
+  const switchableSettings = { tools: { wsl: true, path: true, env: true, doctor: true, bootstrap: false, term: false } }
+  const switchableTools = makeCtx(shim, { settings: switchableSettings })
+  const fireToolUpdate = switchableTools.handlers?.get('loader/volatile-update')
+  check('the plugin listens for volatile updates that add tools', typeof fireToolUpdate === 'function')
+  eq('the opt-in tools start absent',
+    Object.keys(switchableTools).sort().join(','), 'wsl,wsl-doctor,wsl-env,wsl-path')
+  switchableSettings.tools.term = true
+  switchableSettings.tools.bootstrap = true
+  if (typeof fireToolUpdate === 'function') fireToolUpdate()
+  eq('turning a tool switch on registers its tool live, without a restart',
+    Object.keys(switchableTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-doctor,wsl-env,wsl-path,wsl-term')
+  switchableSettings.tools.term = false
+  switchableSettings.tools.doctor = false
+  if (typeof fireToolUpdate === 'function') fireToolUpdate()
+  eq('turning a tool switch off retires its tool live too',
+    Object.keys(switchableTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-env,wsl-path')
+  switchableSettings.tools.doctor = true
+  if (typeof fireToolUpdate === 'function') fireToolUpdate()
+  eq('and it can come back afterwards',
+    Object.keys(switchableTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-doctor,wsl-env,wsl-path')
 
   // The panel's 「复制插件信息」 gets the version from here, so a release never has to
   // edit a string in the client half: the Host half reads its own manifest.

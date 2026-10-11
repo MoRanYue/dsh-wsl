@@ -327,10 +327,14 @@ plugin, so that field edits your profile's patch layer instead — the file is b
 up before every write, only the terminal row's `args` line is rewritten, and the
 result is read back and undone if it is not exactly that one line.
 
-**A change takes effect at the next DSH start**: the host reads this configuration
-once per mount, and the panel says so. Distro and timeout are values rather than
-features — set them in the patch or with `DSH_WSL_DISTRO` / `DSH_WSL_TIMEOUT_MS`,
-and the panel shows what is currently in effect.
+**A change takes effect immediately**, tool switches included: registering a tool
+returns its own disposer, so every settings update is diffed into the tool registry
+and a switch flips the tool on or off in place — no restart, which matters because
+the panel is where these get flipped. The one exception is 「WSL 终端启动路径」: it
+edits another plugin's startup arguments in your profile patch, which that plugin
+reads at boot, so that field applies after a restart. Distro and timeout are values
+rather than features — set them in the patch or with `DSH_WSL_DISTRO` /
+`DSH_WSL_TIMEOUT_MS`, and the panel shows what is currently in effect.
 
 The settings surface needs `@deepseek-ai/schemastery`, which the plugin declares as
 an optional peer dependency: without it the tools still run on their defaults
