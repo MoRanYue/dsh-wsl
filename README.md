@@ -184,7 +184,8 @@ one (the newest running terminal when you name no id), and you can watch what
 happens. If the session has no terminal at all, the tool opens one for itself: it is
 a normal shell for that session, but **it does not appear as a sidebar tab**, so open
 your own when you want to see or use it. Terminals also belong to the current DSH
-run — restarting DSH ends them.
+run — restarting DSH ends them, and a tab the app restores afterwards is a dead tab
+(only a newly opened one asks for a shell), so close it and use 新建终端 again.
 
 Three things to know before switching it on:
 
