@@ -42,7 +42,8 @@ import {
 import { createWslDoctorTool } from '../lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from '../lib/tools/wsl-bootstrap.js'
 import {
-  autoTerminalIds, extractCommand, inputLine, markerPair, pickTerminal, renderTerminals, stripAnsi, wrapCommand,
+  autoTerminalIds, describeSessionCwd, extractCommand, inputLine, markerPair, OPENED_TERMINAL_NOTE,
+  pickTerminal, renderTerminals, stripAnsi, wrapCommand,
 } from '../lib/terminal.js'
 import { createWslTermTool } from '../lib/tools/wsl-term.js'
 
@@ -1326,10 +1327,21 @@ async function terminalUnitTests() {
   check('autoTerminalIds skips names already in use',
     autoTerminalIds([{ id: 'dsh-agent' }])[0] === 'dsh-agent-2', JSON.stringify(autoTerminalIds([{ id: 'dsh-agent' }])))
   check('the empty list explains how a terminal appears',
-    renderTerminals([], undefined)[0].includes('will open one'), renderTerminals([], undefined)[0])
+    renderTerminals([], undefined)[0].includes('can open one'), renderTerminals([], undefined)[0])
   const rendered = renderTerminals([{ id: 'x', state: 'running', title: 'WSL', shell: { name: 'bash' }, cwd: '/home/xiny', cols: 120, rows: 30 }], 'x').join('\n')
-  check('the list names the terminal, its shell, cwd, size and provenance',
+  check('the list names the terminal, its shell, workspace, size and provenance',
     rendered.includes('id=x') && rendered.includes('bash') && rendered.includes('/home/xiny') && rendered.includes('120x30') && rendered.includes('opened by this tool'), rendered)
+  // Measured live: the controller reports the SESSION's workspace, which on Windows
+  // is a Windows path the WSL shell cannot use — so it must not be printed as a
+  // plain `cwd` that implies where the shell actually is.
+  check('a Linux workspace is reported plainly',
+    describeSessionCwd('/home/xiny') === 'session workspace: /home/xiny', describeSessionCwd('/home/xiny'))
+  const windowsCwd = describeSessionCwd('D:\\DSHworkarea')
+  check('a Windows workspace says whose directory it is and what the shell does with it',
+    windowsCwd.startsWith('session workspace: D:\\DSHworkarea (') && windowsCwd.includes('/home/<user>'), windowsCwd)
+  check('a missing workspace is still named', describeSessionCwd(undefined).includes('unknown'), describeSessionCwd(undefined))
+  check('the opened-terminal note does not promise sidebar visibility',
+    OPENED_TERMINAL_NOTE.includes('may not appear'), OPENED_TERMINAL_NOTE)
   check('a free keyboard is reported as free', inputLine({}).includes('free'), inputLine({}))
   check('another attachment is named as the input holder',
     inputLine({ controllerId: 'client-7' }).includes('client-7'), inputLine({ controllerId: 'client-7' }))
@@ -2200,8 +2212,9 @@ async function toolTests(tools, shim) {
     const run = await makeTermTool(stub).execute({ action: 'run', command: 'pwd' }, { agent: termAgent })
     eq('with no terminal at all the tool opens one', stub.calls.create[0]?.id, 'dsh-agent')
     eq('and drives the terminal it opened', stub.calls.follow[0]?.id, 'dsh-agent')
-    check('the summary says it opened one and that it is visible in the sidebar',
-      run.summary.includes('opened by this tool') && run.summary.includes('sidebar'), run.summary)
+    check('the summary names the terminal it opened and does not promise a sidebar tab',
+      run.summary.includes('opened by this tool') && run.summary.includes('may not appear there')
+      && !run.summary.includes('visible in the sidebar'), run.summary)
     check('the opened terminal is described by the controller, not invented',
       run.summary.includes('/home/xiny') && run.summary.includes('120x30'), run.summary)
   }

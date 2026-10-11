@@ -184,10 +184,16 @@ wsl-term({ action: "close", id: "…" })                        → ends a termi
 ```
 
 When the session has no terminal at all, `read`/`run`/`input`/`interrupt` open one
-(`dsh-agent`, 120×30) so the work has somewhere to happen — it appears in the
-sidebar, where you can watch it.
+(`dsh-agent`, 120×30) so the work has somewhere to happen. Be clear about what that
+does and does not give you: it is a real shell owned by this session, but **the
+sidebar's tabs belong to the app's layout owner**, and nothing on the Host side can
+add one — the client half mounts a view per `(session, tabId)` that its layout
+declares, and the only route a Host-created terminal has into the UI is the layout
+owner calling `recover(sessionId)`. Measured: a terminal this tool opened did not
+show up as a tab. So the dependable way to get a terminal you can both see and
+share is to open one yourself in the sidebar first; the tool then works in that one.
 
-Three things are worth knowing before switching it on:
+Four things are worth knowing before switching it on:
 
 - **It takes the keyboard while it works.** Attaching to a terminal gives the
   newest attachment exclusive input control, so your sidebar view is read-only for
@@ -202,7 +208,14 @@ Three things are worth knowing before switching it on:
   (`printf <start>; <your command>; printf <end>$?`), which is how the exit code and
   the exact output range are recovered; a command that never returns is reported as
   still running, and `interrupt` stops it. That wrapper needs a POSIX-style shell
-  (`sh`/`bash`/`zsh`); on `cmd.exe` or PowerShell, use `input`.
+  (`sh`/`bash`/`zsh`); on `cmd.exe` or PowerShell, use `input`. The wrapped line is
+  visible in the terminal, which is inherent — someone watching that shell sees what
+  the model typed, and the markers are what makes the result exact.
+- **The workspace field is not the shell's directory.** What the controller reports
+  as a terminal's `cwd` is the *session's* workspace; on Windows that is a Windows
+  path, and a WSL shell launched with it starts in its own home (`/home/<user>`)
+  instead. Use the panel's 「WSL 终端启动路径」 if you want the sidebar terminal to
+  start somewhere specific.
 
 Commands typed into that terminal run as **you**, below the DSH sandbox, exactly as
 if you had typed them — which is why this ships off by default, behind the panel's
