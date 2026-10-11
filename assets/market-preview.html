@@ -47,38 +47,38 @@
     font-size: 12px; letter-spacing: 2px; color: var(--dim-2);
     text-transform: uppercase; margin-bottom: 10px;
   }
-  ul.features { list-style: none; display: grid; grid-template-columns: 1fr 1fr; gap: 7px 12px; }
+  ul.features { list-style: none; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 11px; }
   ul.features li {
     background: linear-gradient(180deg, var(--panel), #121721);
-    border: 1px solid var(--line); border-radius: 9px; padding: 7px 11px;
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px;
   }
-  ul.features b { font-size: 13px; display: block; }
-  ul.features p { color: var(--dim); font-size: 11px; margin-top: 3px; line-height: 1.4; }
+  ul.features b { font-size: 12.5px; display: block; }
+  ul.features p { color: var(--dim); font-size: 10.5px; margin-top: 2px; line-height: 1.35; }
   code {
     font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px;
     color: var(--accent-2); background: #0e1a18; border: 1px solid #1e3d36;
     border-radius: 5px; padding: 1px 5px;
   }
   .limit {
-    margin-top: 12px; border: 1px solid #3a2f1d; border-radius: 9px;
-    background: linear-gradient(180deg, #1b1710, #14120c); padding: 10px 12px;
-    font-size: 11.5px; line-height: 1.55; color: #d9c9a8;
+    margin-top: 9px; border: 1px solid #3a2f1d; border-radius: 9px;
+    background: linear-gradient(180deg, #1b1710, #14120c); padding: 8px 11px;
+    font-size: 11px; line-height: 1.5; color: #d9c9a8;
   }
   .limit b { color: var(--warn); font-size: 12.5px; }
   .panel {
     background: linear-gradient(180deg, #151b25, #10151d);
-    border: 1px solid var(--line); border-radius: 14px; padding: 14px 15px;
-    display: flex; flex-direction: column; gap: 10px; min-height: 0;
+    border: 1px solid var(--line); border-radius: 12px; padding: 11px 13px;
+    display: flex; flex-direction: column; gap: 8px; min-height: 0;
   }
   .panel .bar { display: flex; justify-content: space-between; align-items: center; }
   .panel .bar .t { font-size: 15px; font-weight: 600; }
   .panel .bar .r { font-size: 11.5px; color: var(--accent); border: 1px solid #24406e; background: #101b2e; border-radius: 6px; padding: 3px 8px; }
-  .group { display: flex; flex-direction: column; gap: 8px; }
-  .group + .group { border-top: 1px dashed var(--line); padding-top: 9px; }
+  .group { display: flex; flex-direction: column; gap: 6px; }
+  .group + .group { border-top: 1px dashed var(--line); padding-top: 7px; }
   .row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
   .row .l { min-width: 0; }
-  .row .l b { font-size: 13px; font-weight: 600; display: block; }
-  .row .l p { font-size: 11.5px; color: var(--dim); margin-top: 3px; line-height: 1.45; }
+  .row .l b { font-size: 12.5px; font-weight: 600; display: block; }
+  .row .l p { font-size: 11px; color: var(--dim); margin-top: 2px; line-height: 1.4; }
   .sw {
     flex: none; width: 34px; height: 19px; border-radius: 999px;
     background: #263041; position: relative; margin-top: 2px;
@@ -149,6 +149,10 @@
         <li>
           <b>管理员模式（root）</b>
           <p>开关打开后 apt、systemctl 可按需以 root 执行。</p>
+        </li>
+        <li>
+          <b><code>wsl-term</code> 终端接入</b>
+          <p>在你打开的终端里执行命令；建议先自己开一个（默认关）。</p>
         </li>
         <li>
           <b>会话事实转发</b>
@@ -224,6 +228,10 @@
         </div>
         <div class="row">
           <div class="l"><b>wsl-bootstrap 安装工具链</b><p>允许在发行版里补装工具链（默认关）</p></div>
+          <div class="sw"></div>
+        </div>
+        <div class="row">
+          <div class="l"><b>wsl-term 终端接入</b><p>在你打开的终端里执行命令（默认关）</p></div>
           <div class="sw"></div>
         </div>
       </div>

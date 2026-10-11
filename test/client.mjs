@@ -253,8 +253,13 @@ const collectText = (node) => {
 }
 collectText(tree)
 const rendered = texts.join('\n')
-for (const mention of ['每次调用使用全新 shell', 'systemd', '内置 job 工具读取结果', 'translatePaths', 'workdir', '请谨慎']) {
+// The panel is user-facing copy: it explains what each switch does in plain
+// sentences, without parameter names or implementation terms.
+for (const mention of ['全新的 shell', 'systemd', '后台执行', 'Windows 路径', '默认工作目录', '危险命令']) {
   check(`it renders the explanation mentioning "${mention}"`, rendered.includes(mention))
+}
+for (const jargon of ['`runInBackground`', '`translatePaths`', '`workdir`', '`asRoot`', '`dryRun`']) {
+  check(`the panel does not name the ${jargon} parameter`, !rendered.includes(jargon), rendered.slice(0, 200))
 }
 check('the destructive-guard switch warns in its own tooltip',
   switches.some((node) => node.props?.label === '危险命令守卫' && /有风险/.test(String(node.props?.title))),
@@ -272,18 +277,19 @@ check('the guard keeps its own wording rather than the new one',
   switches.some((node) => node.props?.label === '危险命令守卫' && String(node.props?.title).includes('有风险')),
   JSON.stringify(switches.map((node) => node.props?.title)))
 check('the panel says the installer is off unless the user turns it on',
-  rendered.includes('wsl-bootstrap 安装工具链') && rendered.includes('dryRun: false'),
+  rendered.includes('wsl-bootstrap 安装工具链') && rendered.includes('模型再确认一次才会真正安装'),
   rendered.slice(0, 200))
 check('and it explains that root is the authorisation itself',
   rendered.includes('管理员模式（root）') && rendered.includes('这项开关就是授权本身'), rendered.slice(0, 200))
 // The terminal row is the only one whose ON position touches the user's own shell,
-// so the panel has to name all three consequences: it may open a terminal, the view
-// goes read-only while the model works, and MEASURED, the keyboard does not come
-// back by itself — the user has to click 接管输入.
-check('the panel says the terminal tool may open a terminal, takes the keyboard, and does not give it back',
+// so the panel has to name all three consequences: the model works in the terminal
+// the user opened, that terminal is read-only while it does, and MEASURED, the
+// keyboard does not come back by itself — the user clicks 接管输入.
+check('the panel says the terminal row works in the user\'s terminal, that it goes read-only, and how to take input back',
   switches.some((node) => node.props?.label === 'wsl-term 终端接入'
-    && String(node.props?.title).includes('dsh-agent')
-    && String(node.props?.title).includes('接管输入')),
+    && String(node.props?.title).includes('接管输入')
+    && String(node.props?.title).includes('只读')
+    && String(node.props?.title).includes('以你的身份')),
   JSON.stringify(switches.find((node) => node.props?.label === 'wsl-term 终端接入')?.props?.title))
 // The panel now OFFERS the sidebar terminal's startup directory (one field, one 保存),
 // but it still must not print the patch RECIPE: pointing a terminal at WSL is the
@@ -739,7 +745,7 @@ getAnswer = { path: '', available: false, error: null }
 const missingRow = mountStateful(main.component, { ...panelProps })
 await missingRow.flush()
 check('a profile without the terminal row points at the opt-in',
-  textOf(missingRow.tree()).includes('还没有 WSL 终端那一项'), textOf(missingRow.tree()).slice(-240))
+  textOf(missingRow.tree()).includes('还没有 WSL 终端这一项'), textOf(missingRow.tree()).slice(-240))
 eq('and saving is withheld until that opt-in exists', fieldIn(missingRow.tree()).save?.props?.disabled, true)
 check('while the field itself stays editable',
   fieldIn(missingRow.tree()).input?.props?.disabled !== true,

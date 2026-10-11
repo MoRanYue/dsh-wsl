@@ -2340,11 +2340,11 @@ async function toolTests(tools, shim) {
     optInTools['wsl-bootstrap'] === undefined || optInTools['wsl-bootstrap'].description.includes('dryRun: false'),
     optInTools['wsl-bootstrap']?.description ?? '(not mounted)')
   // The terminal tool's description is where the model learns that it may open a
-  // terminal and that it takes the keyboard while it works.
-  check('the terminal tool says it may open a terminal and takes the keyboard',
+  // terminal and that the user's view goes read-only while it works.
+  check('the terminal tool says it may open a terminal and that the view goes read-only',
     optInTools['wsl-term'] === undefined
-    || (optInTools['wsl-term'].description.includes('open one')
-      && optInTools['wsl-term'].description.includes('exclusive input control')),
+    || (optInTools['wsl-term'].description.includes('one is opened here')
+      && optInTools['wsl-term'].description.includes('read-only')),
     optInTools['wsl-term']?.description ?? '(not mounted)')
 
   // The bundle patch must stay minimal: installing a tool plugin must not decide

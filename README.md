@@ -15,7 +15,7 @@ project kept on a Windows drive keeps **Windows** filesystem semantics — no PO
 permissions, case-insensitive names, no file-change notifications — at a fraction
 of the speed (see [Notes](#notes)).
 
-![The feature list and the left-sidebar switch panel](assets/market-preview-features-3.png)
+![The feature list and the left-sidebar switch panel](assets/market-preview-features-4.png)
 
 ## Tools
 
@@ -157,101 +157,64 @@ apt would report:
 run it for real with `dryRun: false`.
 ```
 
-The apt recipes collapse into **one** step (the `apt-get update` is the slow half,
-and running it once per recipe would look like a hang), and an `apt-get -s`
-simulation is included so the plan shows what apt itself would do. Recipes already
-satisfied are skipped, so a second run is cheap. The steps run through
-`wsl -u root` — see the next section for why — and a failing step stops the run
-with the tail of its output.
+Recipes that are already satisfied are skipped, and the plan includes what apt itself
+would do, so you can see the exact changes before anything is installed. Installation
+runs as root; a failing step stops the run.
 
 ### `wsl-term`
 
-Every other tool here starts a **fresh shell per call**: that is what makes them
-safe to run in parallel and easy to reason about, and it stays the default. The
-sidebar terminal is the other way to work — it *is* a shell you are already
-looking at, with your current directory, your environment, your history and
-whatever you were in the middle of.
+Every other tool here starts a **fresh shell per call**. That is what makes them
+safe to run in parallel, and it stays the default. The sidebar terminal is the other
+way to work: it is a shell you already have open, with your directory, your
+environment and your history.
 
-`wsl-term` reads and drives that terminal:
+`wsl-term` works in that terminal:
 
 ```
-wsl-term({ action: "list" })                                  → what is open, and who holds its keyboard
-wsl-term({ action: "read" })                                  → the current screen (viewport)
-wsl-term({ action: "run", command: "make sta" })              → runs it there, returns output + exit code
-wsl-term({ action: "input", data: "ls", submit: true })       → raw keystrokes
-wsl-term({ action: "interrupt" })                             → Ctrl-C
-wsl-term({ action: "close", id: "…" })                        → ends a terminal you name
+wsl-term({ action: "list" })                                  → which terminals are open
+wsl-term({ action: "read" })                                  → the current screen
+wsl-term({ action: "run", command: "make sta" })               → runs it there, returns output and exit code
+wsl-term({ action: "input", data: "ls", submit: true })        → raw keystrokes
+wsl-term({ action: "interrupt" })                              → Ctrl-C
+wsl-term({ action: "close", id: "…" })                         → ends a terminal you name
 ```
 
-When the session has no terminal at all, `read`/`run`/`input`/`interrupt` open one
-(`dsh-agent`, 120×30) so the work has somewhere to happen. Be clear about what that
-does and does not give you: it is a real shell owned by this session, but **the
-sidebar's tabs belong to the app's layout owner**, and nothing on the Host side can
-add one — the client half mounts a view per `(session, tabId)` that its layout
-declares, and the only route a Host-created terminal has into the UI is the layout
-owner calling `recover(sessionId)`. Measured: a terminal this tool opened did not
-show up as a tab, and the Client exposes no service that could add one (`layout`
-only selects panels and opens the right bar). So the recommended workflow is to
-**open a terminal in the sidebar yourself first** — the tool then works in that one
-(it picks the newest running terminal when `id` is omitted), and you can watch it
-work.
+**Open a terminal in the sidebar yourself first.** `run` and `read` then work in that
+one (the newest running terminal when you name no id), and you can watch what
+happens. If the session has no terminal at all, the tool opens one for itself: it is
+a normal shell for that session, but **it does not appear as a sidebar tab**, so open
+your own when you want to see or use it. Terminals also belong to the current DSH
+run — restarting DSH ends them.
 
-A terminal also belongs to **this DSH run**: restarting DSH ends the session's
-terminals with it, so the next call opens a fresh `dsh-agent` — the id a closed
-terminal burned stays burned only for that run.
+Three things to know before switching it on:
 
-Four things are worth knowing before switching it on:
+- **The terminal is read-only while the model works in it, and it stays read-only
+  afterwards**: click **「接管输入」** in that terminal to type again. If you are typing
+  when the model calls, the call is refused instead of landing in the middle of your
+  line.
+- **`read` returns the screen.** Anything that has scrolled away is gone, and
+  full-screen programs (`vim`, `htop`) come back as their raw screen.
+- **`run` needs a POSIX-style shell** (`sh`, `bash`, `zsh`). On `cmd.exe` or
+  PowerShell, use `input`.
 
-- **It takes the keyboard while it works.** Attaching to a terminal gives the
-  newest attachment exclusive input control, so your sidebar view is read-only for
-  the duration of a call — and if you are typing when the model calls, the call is
-  rejected rather than merged into your line. Every action detaches before it
-  returns, and the tests assert that. **Measured, and the part worth knowing
-  before you switch it on: detaching does not hand the keyboard back.** When the
-  tool lets go, the control slot is empty, your view keeps showing 「此页面当前只读」, and
-  you click **「接管输入」** to type again. The platform has no call that returns
-  input to the attachment it displaced, so the tool's result tells the model to say
-  this out loud instead of leaving you typing into nothing.
-- **`read` is the screen, not the log.** What comes back is the host's terminal
-  emulator viewport, so anything that has scrolled out of the buffer is gone, and
-  full-screen programs (`vim`, `htop`) return their escape-driven screen. Line-based
-  shell output is clean.
-- **`run` explains itself to the shell.** The command is wrapped in nonce markers
-  (`printf <start>; <your command>; printf <end>$?`), which is how the exit code and
-  the exact output range are recovered; a command that never returns is reported as
-  still running, and `interrupt` stops it. That wrapper needs a POSIX-style shell
-  (`sh`/`bash`/`zsh`); on `cmd.exe` or PowerShell, use `input`. The wrapped line is
-  visible in the terminal, which is inherent — someone watching that shell sees what
-  the model typed, and the markers are what makes the result exact.
-- **The workspace field is not the shell's directory.** What the controller reports
-  as a terminal's `cwd` is the *session's* workspace; on Windows that is a Windows
-  path, and a WSL shell launched with it starts in its own home (`/home/<user>`)
-  instead. Use the panel's 「WSL 终端启动路径」 if you want the sidebar terminal to
-  start somewhere specific.
-
-Commands typed into that terminal run as **you**, below the DSH sandbox, exactly as
-if you had typed them — which is why this ships off by default, behind the panel's
-terminal switch.
+Commands run as **you**, exactly as if you had typed them — and you see the command
+line appear in the terminal — which is why this ships off by default, behind the
+panel's terminal switch.
 
 ## Running privileged commands (`asRoot`)
 
-`sudo` cannot work from a tool call: it needs a password, and stdin is `/dev/null`
-unless you send one. WSL has its own answer — `wsl.exe -u root` needs no password
-(measured: it answers `uid=0` on a machine where `sudo -n` fails) — so the `wsl`
-tool exposes it as `asRoot: true`, gated by a switch in the panel
-(「管理员模式（root）」, off by default):
+WSL's root does not need a password, so a single call can run as root (that is
+`wsl -u root`). It is gated by a panel switch (「管理员模式（root）」, off by default):
 
 ```
 wsl({ command: 'apt-get install -y jq', description: 'install jq', asRoot: true })
 ```
 
-The authorisation is the switch, not the parameter: with it off, `asRoot: true` is
-**refused with that instruction** rather than quietly downgraded to your user
-account — a caller that asked for root and got a permission error would look for
-the cause in the wrong place. Every privileged result is marked
-(`[ran as root: wsl -u root]`) so a transcript says what happened, and the
-destructive-command guard applies independently: `rm -rf` still needs
-`allowDangerous: true`, as root or not.
+The switch is the authorisation, not the parameter: with it off, `asRoot: true` is
+**refused and told which switch to turn on**, never quietly downgraded to your user
+account. Every privileged result is marked (`[ran as root: wsl -u root]`), and the
+destructive-command guard still applies on top: `rm -rf` needs `allowDangerous: true`
+whether or not the call runs as root.
 
 ## Install
 
@@ -331,7 +294,7 @@ explanation.
 | `wsl-env` 能力体检 | registers the `wsl-env` tool |
 | `wsl-doctor` 项目体检 | registers `wsl-doctor` |
 | `wsl-bootstrap` 安装工具链 | registers `wsl-bootstrap`, which may install into the distribution. **Off by default**, and its `dryRun` still has to be turned off per call |
-| `wsl-term` 终端接入 | registers `wsl-term`, which reads and drives the sidebar terminal — and opens one when the session has none. **Off by default**: it types into a shell as you, and holds its input control while a call runs |
+| `wsl-term` 终端接入 | lets the model work in a terminal you have open, and open one for itself when the session has none (that one is not shown in the sidebar). **Off by default**: it runs commands as you, the terminal is read-only while it works, and you click 「接管输入」 afterwards |
 | 后台任务 | whether `wsl` accepts `runInBackground` |
 | 自动转换路径 | the default for the per-call `translatePaths` |
 | 默认跟随会话工作区 | start in the session's directory instead of `~` when `workdir` is omitted. **On by default**: with it off, every relative path an agent writes lands in the Linux home, which is invisible from Explorer and grows the WSL disk image |
@@ -606,7 +569,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 660 host checks against real WSL (shim for ctx.subprocess) + 136 client checks
+npm test          # 671 host checks against real WSL (shim for ctx.subprocess) + 141 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
