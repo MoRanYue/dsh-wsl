@@ -1674,6 +1674,37 @@ async function toolTests(tools, shim) {
       writeTerminalScrollback('plugins:\n  - id: terminal-controller\n    config: {}\n', '10').error)
     check('a patch without the row is refused',
       writeTerminalScrollback('plugins: []\n', '10').ok === false)
+    // "Ours" means a DIRECT child of `config:`. A deeper `scrollback:` belongs to a nested
+    // block — rewriting it would change another plugin's meaning, which is the exact
+    // mistake this writer exists to avoid.
+    const nested = [
+      'plugins:',
+      '  - id: terminal-controller',
+      '    config:',
+      '      shell:',
+      '        path: wsl.exe',
+      '        scrollback: 42',
+      '',
+    ].join('\n')
+    const nestedWrite = writeTerminalScrollback(nested, '5000')
+    check('a nested scrollback is not mistaken for the row setting', nestedWrite.ok === true, String(nestedWrite.error))
+    check('the nested key is left exactly as it was', nestedWrite.text.includes('        scrollback: 42'), nestedWrite.text)
+    check('and the row setting is added beside shell, not inside it',
+      nestedWrite.text.includes('\n      scrollback: 5000\n'), JSON.stringify(nestedWrite.text))
+    eq('the row now reads back as the new value', readTerminalScrollback(nestedWrite.text).value, 5000)
+    const twice = [
+      'plugins:',
+      '  - id: terminal-controller',
+      '    config:',
+      '      scrollback: 1000',
+      '      scrollback: 2000',
+      '      shell:',
+      '        path: wsl.exe',
+      '',
+    ].join('\n')
+    check('two settings at the same level are refused rather than guessed at',
+      writeTerminalScrollback(twice, '3000').ok === false, String(writeTerminalScrollback(twice, '3000').error))
+    eq('and that refusal left the text alone', writeTerminalScrollback(twice, '3000').text, twice)
 
     eq('a malformed body is a 400', (await call('POST', '{oops')).code, 400)
     eq('a body without a path field is a 400', (await call('POST', JSON.stringify({ nope: true }))).code, 400)
@@ -2543,6 +2574,26 @@ async function toolTests(tools, shim) {
   check('the client bundle the manifest points at ships',
     shipped.includes('lib') && existsSync(resolve(packageRoot, 'lib/client.js')),
     JSON.stringify(shipped))
+
+  // Every repository-relative target the docs point at has to exist, because a preview
+  // filename changes with every redesign and a missed reference is invisible until a user
+  // clicks it. The preview image itself is deliberately NOT in the tarball: `npm pack`
+  // also produces the asset the market installs, and the catalog renders screenshots from
+  // this repository over raw GitHub — so shipping the PNGs would only slow installs down.
+  console.log('\nrepository assets the docs reference')
+  const referenced = new Set()
+  for (const doc of ['README.md', 'README.zh-CN.md']) {
+    const text = readFileSync(join(packageRoot, doc), 'utf8')
+    for (const match of text.matchAll(/!\[[^\]]*\]\(\s*<?([^)\s>]+)/g)) referenced.add(match[1])
+    for (const match of text.matchAll(/\]\(\s*<?((?:\.\/)?assets\/[^)\s>]+)/g)) referenced.add(match[1])
+  }
+  const shots = JSON.parse(readFileSync(join(packageRoot, 'screenshots.json'), 'utf8'))
+  for (const shot of shots) referenced.add(shot)
+  check('the docs and screenshots.json point at at least one asset', referenced.size > 0, String(referenced.size))
+  check('screenshots.json ships (the catalog reads it)', shipped.includes('screenshots.json'), JSON.stringify(shipped))
+  for (const reference of referenced) {
+    check(`the referenced asset exists: ${reference}`, existsSync(resolve(packageRoot, reference)), reference)
+  }
 
   // The DSH floor the MARKET reads. dsh-market fetches `<name>/latest` from the
   // registry and compares `engines.dsh` (or `dsh.engines.dsh`) against the host
