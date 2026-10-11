@@ -37,6 +37,7 @@ import { createWslPathTool } from './lib/tools/wsl-path.js'
 import { createWslEnvTool } from './lib/tools/wsl-env.js'
 import { createWslDoctorTool } from './lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from './lib/tools/wsl-bootstrap.js'
+import { createWslTermTool } from './lib/tools/wsl-term.js'
 
 export const name = 'tool-wsl'
 export const inject = ['tools', 'subprocess']
@@ -95,6 +96,7 @@ export const Config = Schema?.object({
     env: Schema.boolean().default(true).description('注册 `wsl-env` 工具：汇总发行版、内核、systemd、cgroup、GPU 直通、docker 与挂载盘。').volatile(),
     doctor: Schema.boolean().default(true).description('注册 `wsl-doctor` 工具：对照项目清单与发行版实际能力，指出缺什么，以及哪些命令其实是 Windows 的。').volatile(),
     bootstrap: Schema.boolean().default(false).description('注册 `wsl-bootstrap` 工具：在发行版里补装缺失的工具链。默认关；打开后它以 root 执行固定配方，且调用方仍需显式 `dryRun: false`。').volatile(),
+    term: Schema.boolean().default(false).description('注册 `wsl-term` 工具：读写本会话侧边栏里的那个终端，必要时自行新开一个（会出现在侧边栏）。默认关；打开后模型可以在你看着的那个终端里执行命令，执行期间输入控制权在它手上。').volatile(),
   }).description('要注册哪些工具；这几项在重启 DSH 后生效。'),
   backgroundJobs: Schema.boolean().default(true).description('允许长任务以 `runInBackground` 后台执行，结果由内置 job 工具读取。').volatile(),
   translatePaths: Schema.boolean().default(true).description('命令中的 Windows 路径默认转为 `/mnt/...`。').volatile(),
@@ -614,6 +616,11 @@ export function apply(ctx, settings = {}) {
   // its switch is the user's decision to let this plugin add software to their
   // distribution.
   if (config.tools.bootstrap) ctx.tools.register(createWslBootstrapTool({ config, runner }))
+  // The terminal tool is off by default for the same reason: its ON position lets
+  // the model type into the terminal the user is looking at. It reads the
+  // `terminalController` service lazily, so a build without a sidebar terminal
+  // still mounts this plugin and reports that clearly instead of failing to load.
+  if (config.tools.term) ctx.tools.register(createWslTermTool({ ctx, config }))
 
   // ---------------------------------------------------------------- self info
   //

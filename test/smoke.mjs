@@ -41,6 +41,10 @@ import {
 } from '../lib/bootstrap.js'
 import { createWslDoctorTool } from '../lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from '../lib/tools/wsl-bootstrap.js'
+import {
+  autoTerminalIds, extractCommand, inputLine, markerPair, pickTerminal, renderTerminals, stripAnsi, wrapCommand,
+} from '../lib/terminal.js'
+import { createWslTermTool } from '../lib/tools/wsl-term.js'
 
 // One resolved configuration stands in for the mount the host would create.
 const CONFIG = resolveConfig({})
@@ -357,6 +361,83 @@ function makeStubRunner(answer = {}) {
   }
 }
 
+/**
+ * A `terminalController` stand-in.
+ *
+ * The real service yields a screen snapshot first and only then accepts input, so
+ * the stub does the same: `write` pushes the frames the shell would print, and the
+ * test builds them from the markers it finds in the written payload — which also
+ * checks that the tool's wrapper is parseable.
+ */
+function makeTerminalStub({ terminals = [], screen = '', onWrite, writeError = null, createError = null } = {}) {
+  const calls = { list: [], create: [], follow: [], write: [], close: [], detached: 0 }
+  const infos = [...terminals]
+  const queue = []
+  const waiters = []
+  const push = (frame) => {
+    const waiter = waiters.shift()
+    if (waiter !== undefined) waiter(frame)
+    else queue.push(frame)
+  }
+  const next = (signal) => new Promise((resolve) => {
+    if (queue.length > 0) return resolve(queue.shift())
+    const onAbort = () => resolve(null)
+    signal.addEventListener('abort', onAbort, { once: true })
+    waiters.push((frame) => {
+      signal.removeEventListener('abort', onAbort)
+      resolve(frame)
+    })
+  })
+  return {
+    calls,
+    infos,
+    list(sessionId) {
+      calls.list.push(sessionId)
+      return infos
+    },
+    async create(agent, request, signal) {
+      calls.create.push({ agentId: agent.id, id: request.id, cols: request.cols, rows: request.rows, signal })
+      if (typeof createError === 'function') {
+        const error = createError(request)
+        if (error !== null) throw error
+      }
+      const info = {
+        id: request.id, title: 'bash', shell: { name: 'bash', path: '/bin/bash', args: ['-i'] },
+        cwd: '/home/xiny', cols: request.cols, rows: request.rows, state: 'running', exitCode: null,
+      }
+      infos.push(info)
+      return info
+    },
+    follow(agent, id, attachmentId, signal) {
+      calls.follow.push({ agentId: agent.id, id, attachmentId })
+      const self = infos.find((info) => info.id === id)
+      return (async function* followFrames() {
+        try {
+          if (signal.aborted) return
+          yield { type: 'snapshot', sequence: 1, screen, info: self }
+          while (true) {
+            const frame = await next(signal)
+            if (frame === null || signal.aborted) return
+            yield frame
+          }
+        } finally {
+          calls.detached += 1
+        }
+      })()
+    },
+    async write(agent, id, attachmentId, data) {
+      if (writeError !== null) throw writeError
+      calls.write.push({ id, attachmentId, data })
+      if (typeof onWrite === 'function') for (const frame of onWrite(data) ?? []) push(frame)
+    },
+    async close(agent, id) {
+      calls.close.push(id)
+      const index = infos.findIndex((info) => info.id === id)
+      if (index >= 0) infos.splice(index, 1)
+    },
+  }
+}
+
 /** The probe output a distribution with python but no node produces. */
 const DOCTOR_PROBE_TEXT = [
   'file.package.json=1',
@@ -374,7 +455,7 @@ const DOCTOR_PROBE_TEXT = [
   'sudo.passwordless=0',
 ].join('\n')
 
-function makeCtx(shim, { jobs, shellEnv, settings, profileContext } = {}) {
+function makeCtx(shim, { jobs, shellEnv, settings, profileContext, terminalController } = {}) {
   const tools = {}
   const handlers = new Map()
   const routes = []
@@ -392,7 +473,8 @@ function makeCtx(shim, { jobs, shellEnv, settings, profileContext } = {}) {
     get: (name) => (name === 'jobs' ? jobs
       : name === 'shellEnv' ? shellEnv
         : name === 'profileContext' ? profileContext
-          : undefined),
+          : name === 'terminalController' ? terminalController
+            : undefined),
     // Event handlers, so a test can fire a live settings update. Kept off the tool
     // map's enumerable keys: those are asserted on with Object.keys.
     on: (event, callback) => { handlers.set(event, callback) },
@@ -896,10 +978,11 @@ async function unitTests() {
   eq('switches default to on', resolveConfig({}, {}).dangerGuard, true)
   eq('a non-boolean switch falls back instead of failing the mount',
     resolveConfig({}, { backgroundJobs: 'no' }).backgroundJobs, true)
-  // The installer is the one tool that must NOT be mounted without a decision, so
-  // its default is asserted here rather than left to the schema's word.
-  eq('the tool switches default to the read-only set on, installer off',
-    Object.values(resolveConfig({}, {}).tools).join(','), 'true,true,true,true,false')
+  // Both opt-in tools must NOT be mounted without a decision: the installer adds
+  // software, the terminal tool types into a shell the user is watching. Their
+  // defaults are asserted here rather than left to the schema's word.
+  eq('the tool switches default to the read-only set on, the two opt-in tools off',
+    Object.values(resolveConfig({}, {}).tools).join(','), 'true,true,true,true,false,false')
   eq('and root execution is off by default', resolveConfig({}, {}).allowRoot, false)
   eq('a partial tools object leaves the other switches alone',
     resolveConfig({}, { tools: { env: false } }).tools.env, false)
@@ -1184,6 +1267,63 @@ async function unitTests() {
   check('the install timeout is generous but finite', BOOTSTRAP_TIMEOUT_MS === 10 * 60 * 1000, String(BOOTSTRAP_TIMEOUT_MS))
 }
 
+// --- wsl-term: the text work behind the terminal tool ----------------------
+
+async function terminalUnitTests() {
+  console.log('\nwsl-term: text and selection helpers')
+
+  // A serialized xterm screen carries colors, cursor moves, an OSC title and the
+  // CRLF a PTY emits; a caller wants none of that.
+  const screen = '\u001b[?2004h\u001b]0;bash\u0007\u001b[1;32mxiny@host\u001b[0m:~/dir$ \u001b[Ke\u001b[1mcho hi\u001b[0m\r\nhi\r\n\u001b[?2004l'
+  eq('stripAnsi removes CSI, OSC and CR', stripAnsi(screen), 'xiny@host:~/dir$ echo hi\nhi\n')
+  eq('stripAnsi drops other control bytes', stripAnsi('a\u0007b\u0000c'), 'abc')
+  eq('stripAnsi tolerates a non-string', stripAnsi(undefined), '')
+
+  const marker = markerPair('abc123')
+  const wrapped = wrapCommand('echo hi', marker)
+  check('the wrapped command carries both markers with the nonce',
+    wrapped.includes(marker.start) && wrapped.includes(marker.end), wrapped)
+  check('the wrapped command keeps the caller\'s command verbatim', wrapped.includes('echo hi'), wrapped)
+  check('the wrapped command reports $? of the command, not of printf',
+    wrapped.indexOf('echo hi') < wrapped.indexOf('__dsh_term_rc=$?'), wrapped)
+  rejects('an empty command is refused before anything is typed', () => wrapCommand('  ', marker), /non-empty command/)
+
+  // The capture a real terminal produces: the echoed line, then the markers.
+  const capture = stripAnsi([
+    "\u001b[1;32m$ \u001b[0mprintf '%s\\n' '__DSH_TERM_START_abc123__'; echo hi; __dsh_term_rc=$?; printf '%s%s\\n' '__DSH_TERM_END_abc123:' \"$__dsh_term_rc\"\r",
+    '__DSH_TERM_START_abc123__\r\n',
+    'hi\r\n',
+    '__DSH_TERM_END_abc123:0\r\n',
+    'xiny@host:~/dir$ ',
+  ].join(''))
+  const extracted = extractCommand(capture, marker)
+  check('the command output is extracted between the markers', extracted.output === 'hi', JSON.stringify(extracted))
+  eq('and its exit code is read from the end marker', extracted.exitCode, 0)
+  check('a capture without the end marker is incomplete', extractCommand('__DSH_TERM_START_abc123__\r\nhi\r\n', marker).complete === false)
+  const failed = extractCommand(`${marker.start}\nnope\n${marker.end}1\n`, marker)
+  check('a non-zero exit code survives', failed.exitCode === 1 && failed.output === 'nope', JSON.stringify(failed))
+
+  const one = { id: 'a', state: 'running', title: 'bash' }
+  const two = { id: 'b', state: 'running', title: 'bash' }
+  const dead = { id: 'c', state: 'exited', exitCode: 0, title: 'bash' }
+  eq('an explicit id wins', pickTerminal([one, two], 'a')?.id, 'a')
+  eq('an unknown explicit id finds nothing', pickTerminal([one, two], 'zz'), null)
+  eq('with no id the newest running terminal is used', pickTerminal([one, dead, two], undefined)?.id, 'b')
+  eq('an exited terminal is still the last resort', pickTerminal([dead], undefined)?.id, 'c')
+  eq('no terminals at all picks nothing', pickTerminal([], undefined), null)
+  eq('autoTerminalIds prefers the stable name', autoTerminalIds([])[0], 'dsh-agent')
+  check('autoTerminalIds skips names already in use',
+    autoTerminalIds([{ id: 'dsh-agent' }])[0] === 'dsh-agent-2', JSON.stringify(autoTerminalIds([{ id: 'dsh-agent' }])))
+  check('the empty list explains how a terminal appears',
+    renderTerminals([], undefined)[0].includes('will open one'), renderTerminals([], undefined)[0])
+  const rendered = renderTerminals([{ id: 'x', state: 'running', title: 'WSL', shell: { name: 'bash' }, cwd: '/home/xiny', cols: 120, rows: 30 }], 'x').join('\n')
+  check('the list names the terminal, its shell, cwd, size and provenance',
+    rendered.includes('id=x') && rendered.includes('bash') && rendered.includes('/home/xiny') && rendered.includes('120x30') && rendered.includes('opened by this tool'), rendered)
+  check('a free keyboard is reported as free', inputLine({}).includes('free'), inputLine({}))
+  check('another attachment is named as the input holder',
+    inputLine({ controllerId: 'client-7' }).includes('client-7'), inputLine({ controllerId: 'client-7' }))
+}
+
 // --- tool-level tests ------------------------------------------------------
 
 async function toolTests(tools, shim) {
@@ -1273,15 +1413,20 @@ async function toolTests(tools, shim) {
   eq('the control mount rewrites it', rewrittenByDefault.stdout.trim(), '/mnt/c/keep/me')
 
   const wslOnlyTools = makeCtx(shim, {
-    settings: { tools: { wsl: true, path: false, env: false, doctor: false, bootstrap: false } },
+    settings: { tools: { wsl: true, path: false, env: false, doctor: false, bootstrap: false, term: false } },
   })
   eq('a tool switch removes exactly that tool', Object.keys(wslOnlyTools).sort().join(','), 'wsl')
   const allOffTools = makeCtx(shim, {
-    settings: { tools: { wsl: false, path: false, env: false, doctor: false, bootstrap: false } },
+    settings: { tools: { wsl: false, path: false, env: false, doctor: false, bootstrap: false, term: false } },
   })
-  eq('all five switches off register nothing', Object.keys(allOffTools).length, 0)
+  eq('all six switches off register nothing', Object.keys(allOffTools).length, 0)
   eq('the control mount registers the four read-only tools',
     Object.keys(tools).sort().join(','), 'wsl,wsl-doctor,wsl-env,wsl-path')
+  // Both opt-in tools are absent unless asked for: the installer because it adds
+  // software, the terminal tool because it types into a shell the user is watching.
+  const optInTools = makeCtx(shim, { settings: { tools: { bootstrap: true, term: true } } })
+  eq('each opt-in switch registers exactly its own tool',
+    Object.keys(optInTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-doctor,wsl-env,wsl-path,wsl-term')
 
   // A volatile field is written into the same object the loader handed `apply` and
   // then announced, so the behaviour switches must take effect with no remount. The
@@ -1963,6 +2108,142 @@ async function toolTests(tools, shim) {
     check(`${name}: every property is required`, tools[name].output.schema.required.slice().sort().join(',') === declared.join(','))
   }
 
+  // --- wsl-term ------------------------------------------------------------
+  //
+  // The terminal tool is the only thing here that types into a shell the user is
+  // looking at, so its tests are about the guarantees around that: the switch
+  // decides whether it exists at all, nothing is typed before the attachment
+  // proves it holds the keyboard, and the keyboard is handed back every time.
+  console.log('\nwsl-term: reading and driving the session terminal')
+  const termAgent = { id: 'session-1' }
+  const termInfoOf = (id) => ({
+    id, title: 'WSL', shell: { name: 'bash', path: '/bin/bash', args: ['-i'] },
+    cwd: '/home/xiny', cols: 120, rows: 30, state: 'running', exitCode: null,
+  })
+  const makeTermTool = (stub) => createWslTermTool({ ctx: { get: () => stub }, config: CONFIG })
+  const replyWithCommand = (data) => {
+    const nonce = /__DSH_TERM_START_(\w+)__/.exec(data)?.[1]
+    return [
+      { type: 'output', data: `__DSH_TERM_START_${nonce}__\r\n` },
+      { type: 'output', data: 'hi from the terminal\r\n' },
+      { type: 'output', data: `__DSH_TERM_END_${nonce}:0\r\n` },
+    ]
+  }
+
+  {
+    const stub = makeTerminalStub({
+      terminals: [{ ...termInfoOf('t1'), controllerId: 'client-1' }],
+    })
+    const listed = await makeTermTool(stub).execute({ action: 'list' }, { agent: termAgent })
+    check('list names the terminal and who holds its keyboard',
+      listed.summary.includes('id=t1') && listed.summary.includes('client-1'), listed.summary)
+    eq('list asks the controller for this very session', stub.calls.list[0], 'session-1')
+  }
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], screen: '\u001b[32mhello\u001b[0m\r\n$ ' })
+    const read = await makeTermTool(stub).execute({ action: 'read', timeoutMs: 40 }, { agent: termAgent })
+    check('read returns the screen without escape sequences',
+      read.summary.includes('hello') && !read.summary.includes('\u001b'), JSON.stringify(read.summary))
+    check('read says what the screen actually is (the viewport)', read.summary.includes('viewport'), read.summary)
+    eq('read detaches, handing the keyboard back', stub.calls.detached, 1)
+  }
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], onWrite: replyWithCommand })
+    const run = await makeTermTool(stub).execute({ action: 'run', command: 'echo hi from the terminal' }, { agent: termAgent })
+    check('run returns the command output and its exit code',
+      run.summary.includes('hi from the terminal') && run.summary.includes('exit code: 0'), run.summary)
+    check('run clears the pending input line before typing', stub.calls.write[0].data.startsWith('\u0015'), JSON.stringify(stub.calls.write[0].data.slice(0, 6)))
+    check('run types the marker-wrapped command into the terminal',
+      stub.calls.write[0].data.includes('__DSH_TERM_START_') && stub.calls.write[0].data.endsWith('\r'),
+      JSON.stringify(stub.calls.write[0].data.slice(0, 60)))
+    eq('run does not open a second terminal when one exists', stub.calls.create.length, 0)
+    eq('run detaches as well', stub.calls.detached, 1)
+  }
+  {
+    const stub = makeTerminalStub({ terminals: [], onWrite: replyWithCommand })
+    const run = await makeTermTool(stub).execute({ action: 'run', command: 'pwd' }, { agent: termAgent })
+    eq('with no terminal at all the tool opens one', stub.calls.create[0]?.id, 'dsh-agent')
+    eq('and drives the terminal it opened', stub.calls.follow[0]?.id, 'dsh-agent')
+    check('the summary says it opened one and that it is visible in the sidebar',
+      run.summary.includes('opened by this tool') && run.summary.includes('sidebar'), run.summary)
+    check('the opened terminal is described by the controller, not invented',
+      run.summary.includes('/home/xiny') && run.summary.includes('120x30'), run.summary)
+  }
+  {
+    const stub = makeTerminalStub({
+      terminals: [],
+      createError: (request) => (request.id === 'dsh-agent' ? new Error('Terminal was closed in this Session') : null),
+      onWrite: replyWithCommand,
+    })
+    await makeTermTool(stub).execute({ action: 'run', command: 'pwd' }, { agent: termAgent })
+    eq('an identity closed earlier falls through to the next name',
+      stub.calls.create.map((call) => call.id).join(','), 'dsh-agent,dsh-agent-2')
+  }
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], onWrite: () => [] })
+    const run = await makeTermTool(stub).execute({ action: 'run', command: 'sleep 99', timeoutMs: 60 }, { agent: termAgent })
+    check('a command that never returns is reported as still running',
+      run.summary.includes('still running after 60 ms'), run.summary)
+    check('and the caller is told how to stop it', run.summary.includes('interrupt'), run.summary)
+    eq('a timeout still hands the keyboard back', stub.calls.detached, 1)
+  }
+  {
+    const stub = makeTerminalStub({
+      terminals: [termInfoOf('t1')],
+      onWrite: () => [{ type: 'state', info: { ...termInfoOf('t1'), state: 'exited', exitCode: 130 } }],
+    })
+    const run = await makeTermTool(stub).execute({ action: 'run', command: 'exit' }, { agent: termAgent })
+    check('a shell that exits mid-command is reported as an exit, with its code',
+      run.summary.includes('did not return before the shell exited') && run.summary.includes('130'), run.summary)
+  }
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')] })
+    const input = await makeTermTool(stub).execute({ action: 'input', data: 'ls', submit: true }, { agent: termAgent })
+    eq('input sends the keystrokes with Enter', stub.calls.write[0].data, 'ls\r')
+    check('the summary echoes what was typed', input.summary.includes('"ls"'), input.summary)
+  }
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')] })
+    const interrupt = await makeTermTool(stub).execute({ action: 'interrupt' }, { agent: termAgent })
+    eq('interrupt sends Ctrl-C', stub.calls.write[0].data, '\u0003')
+    check('the summary says Ctrl-C was sent', interrupt.summary.includes('Ctrl-C'), interrupt.summary)
+  }
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')] })
+    const tool = makeTermTool(stub)
+    await rejects('close needs an explicit id', () => tool.execute({ action: 'close' }, { agent: termAgent }), /close needs an explicit/)
+    const closed = await tool.execute({ action: 'close', id: 't1' }, { agent: termAgent })
+    eq('close closes the terminal it was told to close', stub.calls.close[0], 't1')
+    check('the summary confirms it', closed.summary.includes('closed.'), closed.summary)
+  }
+  {
+    const stub = makeTerminalStub({
+      terminals: [termInfoOf('t1')],
+      writeError: { code: 'terminal/control-unavailable', message: 'Terminal input is controlled by another attachment' },
+    })
+    await rejects('a terminal someone else is typing into is reported, not fought over',
+      () => makeTermTool(stub).execute({ action: 'run', command: 'ls' }, { agent: termAgent }), /another attachment/)
+  }
+  await rejects('an unknown action is refused',
+    () => makeTermTool(makeTerminalStub()).execute({ action: 'nope' }, { agent: termAgent }), /unknown action/)
+  await rejects('run without a command is refused before attaching',
+    () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'run' }, { agent: termAgent }),
+    /non-empty command/)
+  await rejects('an unknown terminal id is refused',
+    () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'read', id: 'zz' }, { agent: termAgent }),
+    /no terminal with id/)
+  await rejects('a non-positive timeout is refused',
+    () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'run', command: 'ls', timeoutMs: -1 }, { agent: termAgent }),
+    /positive number/)
+  await rejects('input without keystrokes is refused',
+    () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'input' }, { agent: termAgent }),
+    /non-empty `data`/)
+  await rejects('a build without the terminal service says so instead of throwing a type error',
+    () => createWslTermTool({ ctx: { get: () => undefined }, config: CONFIG }).execute({ action: 'list' }, { agent: termAgent }),
+    /no terminalController service/)
+  await rejects('a call with no agent session is refused',
+    () => makeTermTool(makeTerminalStub()).execute({ action: 'list' }, {}), /owning agent session/)
+
   // The model pays for description + parameters in EVERY request, so the budget
   // is a real limit. It is asserted, not aspirational: a future edit that
   // re-bloats the catalog fails here instead of quietly costing tokens forever.
@@ -1972,6 +2253,10 @@ async function toolTests(tools, shim) {
   // added (three tools became five). The per-tool limit did NOT move: `wsl` gained
   // `asRoot` and still fits under 2500 because its prose was tightened to pay for
   // it. A future tool has to justify its own cost the same way.
+  //
+  // A sixth tool (`wsl-term`) made the all-on total 7025, so the opt-in ceiling is
+  // 7300: close enough that the next line of prose has to be paid for by trimming
+  // something, rather than absorbed by slack.
   console.log('\nmodel-facing catalog budget')
   let catalog = 0
   for (const [name, tool] of Object.entries(tools)) {
@@ -1980,11 +2265,28 @@ async function toolTests(tools, shim) {
     check(`${name}: catalog cost within budget`, cost <= 2_500, `${cost} chars (description ${tool.description.length} + parameters ${JSON.stringify(tool.parameters).length})`)
   }
   check('total catalog cost within budget', catalog <= 5_600, `${catalog} chars (~${Math.round(catalog / 4)} tokens)`)
+  // The two opt-in tools are absent from the default mount, so their cost is
+  // measured on a mount that switches them on: a tool that does not exist costs
+  // nothing, but an enabled one has to fit the same ceiling as the others.
+  let optInCatalog = 0
+  for (const [name, tool] of Object.entries(optInTools)) {
+    const cost = tool.description.length + JSON.stringify(tool.parameters).length
+    optInCatalog += cost
+    check(`${name}: catalog cost within budget with every switch on`, cost <= 2_500, `${cost} chars (description ${tool.description.length} + parameters ${JSON.stringify(tool.parameters).length})`)
+  }
+  check('total catalog cost with every tool switched on within budget', optInCatalog <= 7_300, `${optInCatalog} chars (~${Math.round(optInCatalog / 4)} tokens)`)
   // The installer's own description is the only place the model learns that a
   // second call with `dryRun: false` is what installs, so that phrase is load-bearing.
   check('the installer says a second call is what installs',
-    tools['wsl-bootstrap'] === undefined || tools['wsl-bootstrap'].description.includes('dryRun: false'),
-    tools['wsl-bootstrap']?.description ?? '(not mounted)')
+    optInTools['wsl-bootstrap'] === undefined || optInTools['wsl-bootstrap'].description.includes('dryRun: false'),
+    optInTools['wsl-bootstrap']?.description ?? '(not mounted)')
+  // The terminal tool's description is where the model learns that it may open a
+  // terminal and that it takes the keyboard while it works.
+  check('the terminal tool says it may open a terminal and takes the keyboard',
+    optInTools['wsl-term'] === undefined
+    || (optInTools['wsl-term'].description.includes('open one')
+      && optInTools['wsl-term'].description.includes('exclusive input control')),
+    optInTools['wsl-term']?.description ?? '(not mounted)')
 
   // The bundle patch must stay minimal: installing a tool plugin must not decide
   // which shell someone's terminals open. Pointing the desktop sidebar terminal at
@@ -2098,6 +2400,7 @@ try {
   check('the default mount registers the four read-only tools, not the installer',
     Object.keys(tools).sort().join(',') === 'wsl,wsl-doctor,wsl-env,wsl-path', Object.keys(tools).join(','))
   await unitTests()
+  await terminalUnitTests()
   await toolTests(tools, shim)
 } finally {
   try { rmSync(spillDir, { recursive: true, force: true }) } catch {}

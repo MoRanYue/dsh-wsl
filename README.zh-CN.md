@@ -15,7 +15,7 @@ Linux 原生 DSH：真实的 Linux 内核与 bash、退出码与信号、超时�
 
 ## 工具
 
-插件注册五个工具（后两个可单独关掉，其中 `wsl-bootstrap` **默认关**）：
+插件注册六个工具（后两个可单独关掉，`wsl-bootstrap` 与 `wsl-term` **都默认关**）：
 
 | 工具 | 用途 |
 |---|---|
@@ -24,6 +24,7 @@ Linux 原生 DSH：真实的 Linux 内核与 bash、退出码与信号、超时�
 | `wsl-env` | 汇总 WSL 环境（发行版、内核、CPU、内存、磁盘） |
 | `wsl-doctor` | 对照项目清单与发行版实际能力，指出缺什么——包括那些其实是 Windows 二进制的命令。只读 |
 | `wsl-bootstrap` | 按固定配方在发行版里补装缺失的工具链，先出计划再动手 |
+| `wsl-term` | 读写侧边栏里那个终端，而不是每次调用开一个全新 shell |
 
 ### `wsl`
 
@@ -141,6 +142,38 @@ run it for real with `dryRun: false`.
 所以第二次跑很便宜。步骤通过 `wsl -u root` 执行——为什么见下一节——某一步失败即停下并附上
 它的输出末尾。
 
+### `wsl-term`
+
+这里其他工具都是**每次调用开一个全新 shell**：这让它们可以安全并行、也容易推理，而且仍然是默认方式。
+侧边栏终端是另一种用法——它**就是你正在看的那个 shell**，带着你当前的目录、环境、历史，以及你做到一半的事。
+
+`wsl-term` 读写的就是它：
+
+```
+wsl-term({ action: "list" })                                  → 开了哪些终端，键盘在谁手里
+wsl-term({ action: "read" })                                  → 当前屏幕（视口）
+wsl-term({ action: "run", command: "make sta" })              → 在那个终端里执行，返回输出与退出码
+wsl-term({ action: "input", data: "ls", submit: true })       → 原始按键
+wsl-term({ action: "interrupt" })                             → Ctrl-C
+wsl-term({ action: "close", id: "…" })                        → 关闭你点名的那个终端
+```
+
+会话里一个终端都没有时，`read`/`run`/`input`/`interrupt` 会**自己开一个**（`dsh-agent`，120×30），
+让活有地方干——它会作为本会话的终端出现在侧边栏里，你能看着它跑。
+
+打开开关前有三件事值得知道：
+
+- **它工作时会接管键盘。** 附着到终端时，最新附着者获得**独占的输入控制权**，所以你的侧边栏视图在那次调用期间是只读的；
+  如果你正在打字，那次调用会被**拒绝**而不是和你那半行命令混在一起。每个动作返回前都会先脱离附着，测试里对此有断言。
+- **`read` 给的是屏幕，不是日志。** 返回的是宿主里那个终端模拟器的视口，已经滚出缓冲的内容拿不回来；
+  全屏程序（`vim`、`htop`）返回的是它们那套转义驱动的屏幕。行式的 shell 输出是干净的。
+- **`run` 会向 shell 解释自己。** 命令被非重复标记包起来（`printf <start>; <你的命令>; printf <end>$?`），
+  退出码与输出的精确范围就是这么取回来的；永不返回的命令会如实报成"还在跑"，用 `interrupt` 停它。
+  这层包装需要 POSIX 风格的 shell（`sh`/`bash`/`zsh`）；`cmd.exe` 或 PowerShell 下请用 `input`。
+
+在那个终端里敲的命令以**你的身份**、在 **DSH 沙箱之外**运行，和你自己敲完全一样——所以它默认关，
+藏在面板的「终端接入」开关后面。
+
 ## 以 root 执行（`asRoot`）
 
 `sudo` 在工具调用里根本用不了：它要密码，而除非你显式喂 stdin，stdin 就是 `/dev/null`。
@@ -217,6 +250,9 @@ DSH_SUBPROCESS_LOCAL=/path/to/dsh/node_modules npm run test:real
 | `wsl` 命令执行 | 是否注册 `wsl` 工具 |
 | `wsl-path` 路径转换 | 是否注册 `wsl-path` 工具 |
 | `wsl-env` 能力体检 | 是否注册 `wsl-env` 工具 |
+| `wsl-doctor` 项目体检 | 是否注册 `wsl-doctor` |
+| `wsl-bootstrap` 安装工具链 | 是否注册 `wsl-bootstrap`，它可能往发行版里装东西。**默认关**，且每次调用还得显式关掉 `dryRun` |
+| `wsl-term` 终端接入 | 是否注册 `wsl-term`，它读写侧边栏那个终端，没有终端时自己开一个。**默认关**：它以你的身份往那个 shell 里打字，且调用期间输入控制权归它 |
 | 后台任务 | `wsl` 是否接受 `runInBackground` |
 | 自动转换路径 | 每次调用的 `translatePaths` 默认值 |
 | 默认跟随会话工作区 | 未传 `workdir` 时从会话目录开始，而不是 `~`。**默认开**：关掉的话，agent 写的相对路径都会落进 Linux 家目录 —— 那儿在资源管理器里看不见，还会撑大 WSL 磁盘镜像 |
@@ -224,8 +260,6 @@ DSH_SUBPROCESS_LOCAL=/path/to/dsh/node_modules npm run test:real
 | WSL 终端启动路径 | 可选的侧边栏终端从哪个目录启动 —— 写进你 **profile patch** 里 `terminal-controller` 那一行的 `--cd <目录>`（见[可选：在侧边栏开一个 WSL 终端](#可选在侧边栏开一个-wsl-终端)）。留空则删掉该参数；当前值也是从这个文件读的 |
 | 危险命令守卫 | 危险命令是否必须显式 `allowDangerous` |
 | 管理员模式（root） | `wsl` 是否接受 `asRoot: true`（`wsl -u root`）。WSL 的 root 免密，所以这项开关就是授权本身；**默认关** |
-| wsl-doctor 项目体检 | 注册 `wsl-doctor` |
-| wsl-bootstrap 安装工具链 | 注册 `wsl-bootstrap`，它可能往发行版里装东西。**默认关**，且每次调用还得显式关掉 `dryRun` |
 
 面板改的是插件自己的配置，所以同样的值也可以手写进 profile patch（`- id: tool-wsl` 加 `config:`）
 或用环境变量设。优先级由 `lib/config.js` 定：**插件配置 > 环境变量 > 内置默认值**；开关停在默认值时
@@ -429,6 +463,7 @@ argv 包一层过 `ctx.sandbox`）和文件系统服务（`@deepseek-ai/dsh-fs-s
 | `lib/tools/*.js` | 工具定义（schema / execute / presentCall） |
 | `lib/doctor.js` | `wsl-doctor` 的项目探针：一段 shell、它的解析器与报告组装 |
 | `lib/bootstrap.js` | `wsl-bootstrap` 的配方、计划生成与结果渲染 |
+| `lib/terminal.js` | `wsl-term` 背后的文本与选择逻辑：去转义、命令标记、终端选择 |
 
 - `apply()` 解析配置并注册被启用的工具，每个都有 JSON-schema 参数定义、输出 schema、
   `render` 钩子与异步 `execute`。
@@ -468,7 +503,7 @@ argv 包一层过 `ctx.sandbox`）和文件系统服务（`@deepseek-ai/dsh-fs-s
 ### 测试
 
 ```sh
-npm test          # 591 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 133 项客户端检查
+npm test          # 660 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 136 项客户端检查
 npm run test:real # 同一套检查改跑真实 provider，外加 seam 事实套件
 ```
 

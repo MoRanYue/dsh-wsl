@@ -19,8 +19,8 @@ of the speed (see [Notes](#notes)).
 
 ## Tools
 
-The plugin registers five tools (the last two can be switched off independently,
-and `wsl-bootstrap` is OFF by default):
+The plugin registers six tools (the last two can be switched off independently, and
+both `wsl-bootstrap` and `wsl-term` are OFF by default):
 
 | Tool | Purpose |
 |---|---|
@@ -29,6 +29,7 @@ and `wsl-bootstrap` is OFF by default):
 | `wsl-env` | Summarize the WSL environment (distros, kernel, cpu, mem, disk). |
 | `wsl-doctor` | Compare what a project needs with what the distribution has — including commands that are really Windows binaries. Read-only. |
 | `wsl-bootstrap` | Install the missing toolchain inside the distribution, from a fixed recipe list, plan first. |
+| `wsl-term` | Read and drive the terminal the sidebar opened, instead of a fresh shell per call. |
 
 ### `wsl`
 
@@ -163,6 +164,50 @@ satisfied are skipped, so a second run is cheap. The steps run through
 `wsl -u root` — see the next section for why — and a failing step stops the run
 with the tail of its output.
 
+### `wsl-term`
+
+Every other tool here starts a **fresh shell per call**: that is what makes them
+safe to run in parallel and easy to reason about, and it stays the default. The
+sidebar terminal is the other way to work — it *is* a shell you are already
+looking at, with your current directory, your environment, your history and
+whatever you were in the middle of.
+
+`wsl-term` reads and drives that terminal:
+
+```
+wsl-term({ action: "list" })                                  → what is open, and who holds its keyboard
+wsl-term({ action: "read" })                                  → the current screen (viewport)
+wsl-term({ action: "run", command: "make sta" })              → runs it there, returns output + exit code
+wsl-term({ action: "input", data: "ls", submit: true })       → raw keystrokes
+wsl-term({ action: "interrupt" })                             → Ctrl-C
+wsl-term({ action: "close", id: "…" })                        → ends a terminal you name
+```
+
+When the session has no terminal at all, `read`/`run`/`input`/`interrupt` open one
+(`dsh-agent`, 120×30) so the work has somewhere to happen — it appears in the
+sidebar, where you can watch it.
+
+Three things are worth knowing before switching it on:
+
+- **It takes the keyboard while it works.** Attaching to a terminal gives the
+  newest attachment exclusive input control, so your sidebar view is read-only for
+  the duration of a call — and if you are typing when the model calls, the call is
+  rejected rather than merged into your line. Every action detaches before it
+  returns, and the tests assert that.
+- **`read` is the screen, not the log.** What comes back is the host's terminal
+  emulator viewport, so anything that has scrolled out of the buffer is gone, and
+  full-screen programs (`vim`, `htop`) return their escape-driven screen. Line-based
+  shell output is clean.
+- **`run` explains itself to the shell.** The command is wrapped in nonce markers
+  (`printf <start>; <your command>; printf <end>$?`), which is how the exit code and
+  the exact output range are recovered; a command that never returns is reported as
+  still running, and `interrupt` stops it. That wrapper needs a POSIX-style shell
+  (`sh`/`bash`/`zsh`); on `cmd.exe` or PowerShell, use `input`.
+
+Commands typed into that terminal run as **you**, below the DSH sandbox, exactly as
+if you had typed them — which is why this ships off by default, behind the panel's
+terminal switch.
+
 ## Running privileged commands (`asRoot`)
 
 `sudo` cannot work from a tool call: it needs a password, and stdin is `/dev/null`
@@ -259,6 +304,9 @@ explanation.
 | `wsl` 命令执行 | registers the `wsl` tool |
 | `wsl-path` 路径转换 | registers the `wsl-path` tool |
 | `wsl-env` 能力体检 | registers the `wsl-env` tool |
+| `wsl-doctor` 项目体检 | registers `wsl-doctor` |
+| `wsl-bootstrap` 安装工具链 | registers `wsl-bootstrap`, which may install into the distribution. **Off by default**, and its `dryRun` still has to be turned off per call |
+| `wsl-term` 终端接入 | registers `wsl-term`, which reads and drives the sidebar terminal — and opens one when the session has none. **Off by default**: it types into a shell as you, and holds its input control while a call runs |
 | 后台任务 | whether `wsl` accepts `runInBackground` |
 | 自动转换路径 | the default for the per-call `translatePaths` |
 | 默认跟随会话工作区 | start in the session's directory instead of `~` when `workdir` is omitted. **On by default**: with it off, every relative path an agent writes lands in the Linux home, which is invisible from Explorer and grows the WSL disk image |
@@ -266,8 +314,6 @@ explanation.
 | WSL 终端启动路径 | the optional sidebar terminal's startup directory — `--cd <dir>` on the `terminal-controller` row of your **profile patch** (see [Optional: a WSL terminal in the sidebar](#optional-a-wsl-terminal-in-the-sidebar)). Empty clears it, and the panel reads the current value from the same file |
 | 危险命令守卫 | whether a destructive command needs an explicit `allowDangerous` |
 | 管理员模式（root） | whether `wsl` accepts `asRoot: true` (`wsl -u root`). WSL's root needs no password, so this switch is the authorisation itself; **off by default** |
-| wsl-doctor 项目体检 | registers `wsl-doctor` |
-| wsl-bootstrap 安装工具链 | registers `wsl-bootstrap`, which may install into the distribution. **Off by default**, and its `dryRun` still has to be turned off per call |
 
 The panel edits the plugin's own configuration, so the same values can be written
 by hand (`- id: tool-wsl` with `config:` in a profile patch) or by environment
@@ -481,6 +527,7 @@ is split by concern:
 | `lib/tools/*.js` | The tool definitions (schema, execute, presentCall). |
 | `lib/doctor.js` | The project probe for `wsl-doctor`: one shell script, its parser, the report composer. |
 | `lib/bootstrap.js` | The recipes, plan builder and outcome rendering for `wsl-bootstrap`. |
+| `lib/terminal.js` | The text and selection work behind `wsl-term`: escape stripping, command markers, terminal picking. |
 
 - `apply()` resolves the configuration and registers the enabled tools, each with a
   JSON-schema parameter definition, an output schema, a `render` hook and an
@@ -530,7 +577,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 591 host checks against real WSL (shim for ctx.subprocess) + 133 client checks
+npm test          # 660 host checks against real WSL (shim for ctx.subprocess) + 136 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
