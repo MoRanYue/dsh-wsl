@@ -104,7 +104,7 @@ export const Config = Schema?.object({
     env: Schema.boolean().default(true).description('注册 `wsl-env` 工具：汇总发行版、内核、systemd、cgroup、GPU 直通、docker 与挂载盘。').volatile(),
     doctor: Schema.boolean().default(true).description('注册 `wsl-doctor` 工具：对照项目清单与发行版实际能力，指出缺什么，以及哪些命令其实是 Windows 的。').volatile(),
     bootstrap: Schema.boolean().default(false).description('注册 `wsl-bootstrap` 工具：在发行版里补装缺失的工具链。默认关；打开后它以 root 执行固定配方，且调用方仍需显式 `dryRun: false`。').volatile(),
-    term: Schema.boolean().default(false).description('注册 `wsl-term` 工具：读写本会话侧边栏里的那个终端，必要时自行新开一个（会出现在侧边栏）。默认关；打开后模型可以在你看着的那个终端里执行命令，执行期间输入控制权在它手上。').volatile(),
+    term: Schema.boolean().default(false).description('注册 `wsl-term` 工具：读写本会话侧边栏里的那个终端，必要时自行新开一个（**不一定会出现在侧边栏**，想看得见请自己先开一个）。默认关；打开后模型可以在你看着的那个终端里执行命令，执行期间输入控制权在它手上。').volatile(),
   }).description('要注册哪些工具；改动即时生效（面板开关一拨，工具就出现或消失，不需要重启）。'),
   backgroundJobs: Schema.boolean().default(true).description('允许长任务以 `runInBackground` 后台执行，结果由内置 job 工具读取。').volatile(),
   translatePaths: Schema.boolean().default(true).description('命令中的 Windows 路径默认转为 `/mnt/...`。').volatile(),
@@ -453,11 +453,30 @@ async function serveTerminalCwd(ctx, request, response) {
   }
   prunePatchBackups(file, backup)
 
+  /**
+   * Put the previous content back and describe what happened.
+   *
+   * `writeFileSync` truncates before it writes, so a failure part-way through (ENOSPC, EIO,
+   * a dropped network share) can leave the user's hand-written patch truncated — the same
+   * class of surprise the verify path already undoes, and it must not be left behind either.
+   * @param {string} reason - what the caller should be told first.
+   */
+  const restoreAndRefuse = (reason) => {
+    let restored = true
+    try {
+      writeFileSync(file, original, 'utf8')
+    } catch (error) {
+      console.error('dsh-wsl-tool: could not restore the profile patch', error)
+      restored = false
+    }
+    refused(`${reason}${restored ? '，已还原' : '，且还原失败，请从备份恢复'}`)
+  }
+
   try {
     writeFileSync(file, next.text, 'utf8')
   } catch (error) {
     console.warn('dsh-wsl-tool: writing the profile patch failed', error)
-    refused('写入 profile patch 失败')
+    restoreAndRefuse('写入 profile patch 失败')
     return
   }
 
@@ -479,14 +498,7 @@ async function serveTerminalCwd(ctx, request, response) {
     return
   }
   if (review.verdict === 'undo') {
-    let restored = true
-    try {
-      writeFileSync(file, original, 'utf8')
-    } catch (error) {
-      console.error('dsh-wsl-tool: could not restore the profile patch', error)
-      restored = false
-    }
-    refused(`写入校验失败（${review.error}）${restored ? '，已还原' : '，且还原失败，请从备份恢复'}`)
+    restoreAndRefuse(`写入校验失败（${review.error}）`)
     return
   }
 

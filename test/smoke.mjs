@@ -14,7 +14,7 @@
 
 import { spawn } from 'node:child_process'
 import {
-  appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync,
+  appendFileSync, chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -43,8 +43,8 @@ import {
 import { createWslDoctorTool } from '../lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from '../lib/tools/wsl-bootstrap.js'
 import {
-  autoTerminalIds, clipTail, describeSessionCwd, extractCommand, inputLine, markerPair, OPENED_TERMINAL_NOTE,
-  pickTerminal, renderTerminals, spillLine, stripAnsi, wrapCommand,
+  appendCapture, autoTerminalIds, clipTail, describeSessionCwd, extractCommand, inputLine, markerPair,
+  OPENED_TERMINAL_NOTE, pickTerminal, renderTerminals, spillLine, stripAnsi, wrapCommand,
 } from '../lib/terminal.js'
 import { createWslTermTool } from '../lib/tools/wsl-term.js'
 
@@ -371,7 +371,10 @@ function makeStubRunner(answer = {}) {
  * test builds them from the markers it finds in the written payload — which also
  * checks that the tool's wrapper is parseable.
  */
-function makeTerminalStub({ terminals = [], screen = '', onWrite, writeError = null, createError = null } = {}) {
+function makeTerminalStub({
+  terminals = [], screen = '', onWrite, writeError = null, createError = null,
+  noSnapshot = false, stallOnReturn = false,
+} = {}) {
   const calls = { list: [], create: [], follow: [], write: [], close: [], detached: 0 }
   const infos = [...terminals]
   const queue = []
@@ -416,7 +419,7 @@ function makeTerminalStub({ terminals = [], screen = '', onWrite, writeError = n
       return (async function* followFrames() {
         try {
           if (signal.aborted) return
-          yield { type: 'snapshot', sequence: 1, screen, info: self }
+          if (!noSnapshot) yield { type: 'snapshot', sequence: 1, screen, info: self }
           while (true) {
             const frame = await next(signal)
             if (frame === null || signal.aborted) return
@@ -424,6 +427,8 @@ function makeTerminalStub({ terminals = [], screen = '', onWrite, writeError = n
           }
         } finally {
           calls.detached += 1
+          // A transport that ignores the abort: the tool must not wait for it forever.
+          if (stallOnReturn) await new Promise(() => {})
         }
       })()
     },
@@ -877,6 +882,13 @@ async function unitTests() {
 
   console.log('\ndestructive guard')
   const bad = destructiveReason
+  // A redirect at command position 0 has no preceding character: requiring one let
+  // `> /dev/sda` through while ` > /dev/sda` was caught.
+  for (const command of ['> /dev/sda', '>/dev/sda', ' > /dev/sda', 'echo x > /dev/sda', 'cat a >> /dev/nvme0n1']) {
+    check(`a redirect onto a block device is caught: ${command}`,
+      bad(command) !== null, String(bad(command)))
+  }
+  check('and a normal redirect is not', bad('echo x > /tmp/log') === null, String(bad('echo x > /tmp/log')))
   for (const command of [
     'rm -rf /tmp/x',
     'rm -fr /tmp/x',
@@ -1369,6 +1381,21 @@ async function terminalUnitTests() {
     'full output (12 bytes): /tmp/x.log — read it')
   eq('a spill line without size or hint still names the file',
     spillLine({ locator: '/tmp/x.log' }), 'full output: /tmp/x.log')
+  // The tail must not begin on the low half of a surrogate pair: that is not text, and it
+  // would reach the transcript as a lone surrogate.
+  const clippedAstral = clipTail('🙂🙂🙂', 3)
+  const startsClean = !(clippedAstral.charCodeAt(clippedAstral.indexOf('\n') + 1) >= 0xdc00
+    && clippedAstral.charCodeAt(clippedAstral.indexOf('\n') + 1) <= 0xdfff)
+  check('clipping never starts on half a character', startsClean, JSON.stringify(clippedAstral))
+  // A chatty command needs a bounded capture, and the frame must be cleaned ONCE, not once
+  // per iteration over everything received so far.
+  const stepA = appendCapture('', '\u001b[31mred\u001b[0m', 100)
+  eq('the capture is colour-free', stepA.text, 'red')
+  eq('and nothing was dropped yet', stepA.dropped, 0)
+  const stepB = appendCapture(stepA.text, ' more', 8)
+  eq('past the ceiling the TAIL is kept', stepB.text, 'red more'.slice(-8), stepB.text)
+  eq('and the dropped count is explicit', stepB.dropped, stepA.text.length + ' more'.length - 8, String(stepB.dropped))
+  eq('an empty frame is harmless', appendCapture('x', undefined, 10).text, 'x')
 }
 
 // --- tool-level tests ------------------------------------------------------
@@ -1663,6 +1690,21 @@ async function toolTests(tools, shim) {
     check('an empty history length clears the key',
       clearedScroll.ok === true && clearedScroll.scrollback === null, JSON.stringify(clearedScroll))
     eq('the key is gone from the file', readTerminalScrollback(readFileSync(patchFile, 'utf8')).value, null)
+
+    // A write that cannot land must not leave the user's patch truncated: writeFileSync
+    // truncates before writing, so the handler restores the in-memory copy and says whether
+    // that worked. A read-only file is the cheapest way to reach that branch.
+    const beforeFailure = readFileSync(patchFile, 'utf8')
+    chmodSync(patchFile, 0o444)
+    try {
+      const failedWrite = JSON.parse((await call('POST', JSON.stringify({ path: '/mnt/d/locked' }))).body)
+      check('a write that cannot land is reported as a failure', failedWrite.ok === false, JSON.stringify(failedWrite))
+      check('and the answer says whether the file was restored',
+        /还原/.test(String(failedWrite.error)), String(failedWrite.error))
+      eq('the patch is exactly what it was', readFileSync(patchFile, 'utf8'), beforeFailure)
+    } finally {
+      chmodSync(patchFile, 0o644)
+    }
     // Pure rules behind those answers, so a failure names the rule rather than the route.
     eq('a negative history length is not a count', validateTerminalScrollback('-1').ok, false)
     eq('a fractional history length is not a count', validateTerminalScrollback('1.5').ok, false)
@@ -2445,6 +2487,51 @@ async function toolTests(tools, shim) {
     await rejects('a terminal someone else is typing into is reported, not fought over',
       () => makeTermTool(stub).execute({ action: 'run', command: 'ls' }, { agent: termAgent }), /another attachment/)
   }
+  // A refused call must leave nothing behind: no terminal opened, no keyboard taken.
+  {
+    const bare = makeTerminalStub({ terminals: [] })
+    await rejects('close without an id is refused', () => makeTermTool(bare).execute({ action: 'close' }, { agent: termAgent }),
+      /needs an explicit id/)
+    eq('and it did not open a terminal for a call that cannot run', bare.calls.create.length, 0)
+    const bare2 = makeTerminalStub({ terminals: [] })
+    await rejects('run without a command is refused', () => makeTermTool(bare2).execute({ action: 'run' }, { agent: termAgent }),
+      /non-empty command/)
+    eq('and that refusal opened nothing either', bare2.calls.create.length, 0)
+    const bare3 = makeTerminalStub({ terminals: [termInfoOf('t1')] })
+    await rejects('input without keystrokes is refused', () => makeTermTool(bare3).execute({ action: 'input' }, { agent: termAgent }),
+      /non-empty data/)
+    eq('and it never attached or wrote', bare3.calls.follow.length + bare3.calls.write.length, 0)
+  }
+  // One keystroke is the whole call: the tool must let go instead of holding the keyboard
+  // until the deadline (measured before the fix: 30 s for a single `input`).
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')] })
+    const started = Date.now()
+    const sent = await makeTermTool(stub).execute({ action: 'input', data: 'x', submit: true, timeoutMs: 3000 }, { agent: termAgent })
+    const elapsed = Date.now() - started
+    check('a keystroke call returns as soon as it has been sent', elapsed < 2500, `${elapsed} ms`)
+    check('and it reports the keystroke', sent.summary.includes('sent "x" with Enter'), sent.summary.slice(-120))
+    eq('the terminal was written once', stub.calls.write.length, 1)
+  }
+  // Nothing was typed if the deadline beats the first frame — saying otherwise is a lie the
+  // caller cannot detect.
+  {
+    for (const [action, args] of [['input', { data: 'x' }], ['interrupt', {}], ['run', { command: 'ls' }]]) {
+      const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], noSnapshot: true })
+      const result = await makeTermTool(stub).execute({ action, ...args, timeoutMs: 150 }, { agent: termAgent })
+      eq(`no snapshot means nothing was written for ${action}`, stub.calls.write.length, 0)
+      check(`and ${action} says nothing was sent`,
+        result.summary.includes('nothing was') || result.summary.includes('nothing was typed'), result.summary.slice(-200))
+    }
+  }
+  // A transport that ignores the abort must not hold the call open past its own deadline.
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], stallOnReturn: true })
+    const started = Date.now()
+    await makeTermTool(stub).execute({ action: 'interrupt', timeoutMs: 400 }, { agent: termAgent })
+    const elapsed = Date.now() - started
+    check('a stalled detach does not extend the call', elapsed < 4000, `${elapsed} ms`)
+  }
   await rejects('an unknown action is refused',
     () => makeTermTool(makeTerminalStub()).execute({ action: 'nope' }, { agent: termAgent }), /unknown action/)
   await rejects('run without a command is refused before attaching',
@@ -2473,7 +2560,7 @@ async function toolTests(tools, shim) {
     /positive number/)
   await rejects('input without keystrokes is refused',
     () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'input' }, { agent: termAgent }),
-    /non-empty `data`/)
+    /non-empty data/)
   await rejects('a build without the terminal service says so instead of throwing a type error',
     () => createWslTermTool({ ctx: { get: () => undefined }, config: CONFIG }).execute({ action: 'list' }, { agent: termAgent }),
     /no terminalController service/)
@@ -2584,8 +2671,15 @@ async function toolTests(tools, shim) {
   const referenced = new Set()
   for (const doc of ['README.md', 'README.zh-CN.md']) {
     const text = readFileSync(join(packageRoot, doc), 'utf8')
-    for (const match of text.matchAll(/!\[[^\]]*\]\(\s*<?([^)\s>]+)/g)) referenced.add(match[1])
-    for (const match of text.matchAll(/\]\(\s*<?((?:\.\/)?assets\/[^)\s>]+)/g)) referenced.add(match[1])
+    // Every markdown link/image target, not just images: a renamed file is a broken link
+    // wherever it appears. Remote targets (a badge, a website) and in-page anchors are not
+    // this repository's files and are skipped rather than required to exist.
+    for (const match of text.matchAll(/\]\(\s*<?([^)\s>]+)/g)) {
+      const target = match[1]
+      if (/^[a-z][a-z0-9+.-]*:/i.test(target)) continue
+      if (target.startsWith('#')) continue
+      referenced.add(target)
+    }
   }
   const shots = JSON.parse(readFileSync(join(packageRoot, 'screenshots.json'), 'utf8'))
   for (const shot of shots) referenced.add(shot)
@@ -2593,6 +2687,26 @@ async function toolTests(tools, shim) {
   check('screenshots.json ships (the catalog reads it)', shipped.includes('screenshots.json'), JSON.stringify(shipped))
   for (const reference of referenced) {
     check(`the referenced asset exists: ${reference}`, existsSync(resolve(packageRoot, reference)), reference)
+  }
+
+  // The two halves talk over strings neither can type-check: route paths, the config row id,
+  // and the info payload's key names. Each side's own suite asserts ITS literals, so a
+  // rename on one side would keep both green while the panel silently degrades. Compare the
+  // sources directly instead of trusting the pair of hand-written literals.
+  console.log('\nclient/host wire contract')
+  const hostSource = readFileSync(join(packageRoot, 'index.js'), 'utf8')
+  const clientSource = readFileSync(join(packageRoot, 'lib/client.js'), 'utf8')
+  const patchSource = readFileSync(join(packageRoot, 'cordis.patch.yml'), 'utf8')
+  for (const route of ['/dsh-wsl-tool/info', '/dsh-wsl-tool/terminal-cwd']) {
+    check(`both halves know the route ${route}`,
+      hostSource.includes(route) && clientSource.includes(route), route)
+  }
+  check('both halves agree on the config row id',
+    patchSource.includes('- id: tool-wsl') && clientSource.includes('tool-wsl'),
+    `patch=${patchSource.includes('- id: tool-wsl')} client=${clientSource.includes('tool-wsl')}`)
+  for (const key of ['defaultDistro', 'kernel', 'capabilities', 'commandTimeoutMs', 'version', 'repository']) {
+    check(`both halves name the payload field ${key}`,
+      hostSource.includes(key) && clientSource.includes(key), key)
   }
 
   // The DSH floor the MARKET reads. dsh-market fetches `<name>/latest` from the
@@ -2660,6 +2774,24 @@ try {
   await toolTests(tools, shim)
 } finally {
   try { rmSync(spillDir, { recursive: true, force: true }) } catch {}
+}
+
+// The documented counts are hand-written, and they drifted on almost every commit while the
+// terminal feature landed. The suite knows its own total, so it checks the docs instead of
+// trusting them. Compared AFTER the totals are final, so it does not change the number it
+// is checking, and it fails the run without pretending to be one more check.
+{
+  const total = passed + failures.length
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url))
+  const documented = []
+  for (const doc of ['README.md', 'README.zh-CN.md', 'SUPPORT.md']) {
+    const text = readFileSync(join(repoRoot, doc), 'utf8')
+    if (!text.includes(`${total} host checks`) && !text.includes(`${total} 项宿主检查`)) documented.push(doc)
+  }
+  if (documented.length > 0) {
+    console.log(`\nthe docs do not document the ${total} host checks this run executed: ${documented.join(', ')}`)
+    process.exitCode = 1
+  }
 }
 
 console.log(`\n${passed} passed, ${failures.length} failed`)

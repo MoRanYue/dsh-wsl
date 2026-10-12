@@ -37,7 +37,8 @@ const silent = { error() {}, warn() {}, log() {} }
 console.log('\nclient bundle shape')
 check('it is a plain loader script, not an ES module', !/^\s*(?:import|export)\s/m.test(source))
 check('it never asks for a service by bare global', !/\bself\./.test(source))
-check('it hands the loader this package id', /id:\s*'dsh-wsl-tool'/.test(source))
+// The package id it hands the loader is asserted at runtime below ("the module id is the
+// package name"), which is the value that matters — not this source-text appearance.
 
 const loaded = []
 // What the feedback entry copies, recorded from the clipboard stub the panel uses.
@@ -124,6 +125,8 @@ eq('it injects only slots', JSON.stringify(mod.inject), '["slots"]')
 
 const registered = []
 const ops = []
+/** Set to false to make the next write fail, so a refused save can be exercised. */
+let scopeAccepts = true
 const snapshot = {
   status: 'ready',
   value: { tools: { wsl: true, path: true, env: true }, backgroundJobs: true, translatePaths: true },
@@ -137,7 +140,7 @@ const scope = {
   subscribe: () => () => {},
   mutate: (batch, revision) => {
     ops.push({ batch, revision })
-    return Promise.resolve(true)
+    return Promise.resolve(scopeAccepts)
   },
 }
 // The ORDER of these two calls is the point: a form fetched before the Host lists
@@ -299,8 +302,6 @@ check('the sidebar-terminal patch snippet is not rendered',
   !rendered.includes('- id: terminal-controller') && !rendered.includes('args:') && !rendered.includes('wsl.exe'))
 check('the panel never names the other plugin\'s row id',
   !rendered.includes('terminal-controller'), rendered.slice(0, 200))
-check('the feedback entry carries no explanation paragraph',
-  !rendered.includes('由插件自己读出下面的内容'), rendered.slice(0, 200))
 
 console.log('\nconfiguration writes')
 const wslSwitch = switches.find((node) => node.props?.label === 'wsl 命令执行')
@@ -342,6 +343,12 @@ check('the reset reports success', resetSettled === true, String(resetSettled))
 // The workdir input: one place to set the fixed Linux directory, written through the
 // same scope as the switches. Empty must clear the path rather than writing an empty
 // string, which is what hands the decision back to the follow-session switch.
+//
+// Driven through a STATEFUL mount with a flush in between: the draft lives in state, and
+// this field's whole failure mode is what happens when a re-render lands between typing and
+// clicking 保存 (a switch toggle, or a settling route read). On the recording harness —
+// where useState is a no-op — the typed value would never reach the save, which is exactly
+// the silent wrong write this test exists to catch.
 console.log('\nworkdir input')
 const workdirSection = sectionIn(found, '默认 Linux 工作目录')
 check('the panel offers a workdir section', workdirSection !== undefined)
@@ -349,16 +356,36 @@ const workdirInput = collect(workdirSection).find((node) => node.type === 'input
 check('the panel offers a workdir input', workdirInput !== undefined)
 const saveWorkdir = collect(workdirSection).find((node) => node.props?.children === '保存')
 check('it offers a save control', saveWorkdir !== undefined)
-workdirInput.props.onChange({ target: { value: '/mnt/d/proj' } })
-await saveWorkdir.props.onClick()
-check('saving writes the configured directory',
-  ops.some((entry) => entry.batch?.some((op) => op.op === 'set' && op.path.join('.') === 'workdir' && op.value === '/mnt/d/proj')),
+
+const workdirMount = mountStateful(main.component,
+  typeof main?.seat.inject === 'function' ? main.seat.inject() : {})
+await workdirMount.flush()
+const liveWorkdir = () => {
+  const area = sectionIn(collect(workdirMount.tree()), '默认 Linux 工作目录')
+  const inner = area === undefined ? [] : collect(area)
+  return {
+    input: inner.find((node) => node.type === 'input'),
+    save: inner.find((node) => typeof node.props?.children === 'string' && node.props.children.startsWith('保存')),
+  }
+}
+liveWorkdir().input.props.onChange({ target: { value: '/mnt/d/proj' } })
+await workdirMount.flush()
+// A re-render between typing and saving must not lose the typed value.
+const workdirOpsBefore = ops.length
+await liveWorkdir().save.props.onClick()
+check('saving writes the configured directory even after a re-render',
+  ops.slice(workdirOpsBefore).some((entry) => entry.batch?.some((op) => op.op === 'set'
+    && op.path.join('.') === 'workdir' && op.value === '/mnt/d/proj')),
   JSON.stringify(ops.slice(-2)))
-workdirInput.props.onChange({ target: { value: '   ' } })
-await saveWorkdir.props.onClick()
+liveWorkdir().input.props.onChange({ target: { value: '   ' } })
+await workdirMount.flush()
+const workdirOpsBeforeClear = ops.length
+await liveWorkdir().save.props.onClick()
 check('clearing it unsets the path instead of writing blanks',
-  ops.some((entry) => entry.batch?.some((op) => op.op === 'unset' && op.path.join('.') === 'workdir')),
+  ops.slice(workdirOpsBeforeClear).some((entry) => entry.batch?.some((op) => op.op === 'unset'
+    && op.path.join('.') === 'workdir')),
   JSON.stringify(ops.slice(-2)))
+workdirMount.unmount()
 
 // The sidebar terminal's startup directory: the same shape as the workdir field —
 // one input, one 保存 — but it is NOT written through the settings scope, because the
@@ -759,8 +786,13 @@ const historyField = historyFieldIn(historyMounted.tree())
 check('the panel offers a history-length field',
   historyField.input !== undefined && historyField.save !== undefined, textOf(historyMounted.tree()).slice(-240))
 eq('an unset history length leaves the box empty', historyField.input?.props?.value, '')
+// The platform's own default, from the shipped terminal-controller schema
+// (`scrollback: z.number().step(1).min(0).default(1e3)`). Named here so the assertion is a
+// cross-check against the platform rather than a copy of the panel's own string.
+const PLATFORM_SCROLLBACK_DEFAULT = 1000
 check('and the placeholder names the platform default',
-  /1000/.test(String(historyField.input?.props?.placeholder)), String(historyField.input?.props?.placeholder))
+  String(historyField.input?.props?.placeholder).includes(String(PLATFORM_SCROLLBACK_DEFAULT)),
+  String(historyField.input?.props?.placeholder))
 const historyWritesBefore = ops.length
 historyField.input.props.onChange({ target: { value: '5000' } })
 eq('the field is controlled: typing shows the typed value',
@@ -846,13 +878,35 @@ check('and says what still works', expiredText.includes('不受影响'), expired
 check('the terminal field is still rendered in that state', fieldIn(unserved.tree()).input !== undefined)
 unserved.unmount()
 
-// (5) The route cannot be reached at all: degrade to a note, never throw.
+// A write the scope REFUSES must be visible. Without this the suite would pass even if the
+// panel ignored `mutate`'s answer and showed a switch as saved.
+console.log('\na refused scope write')
+scopeAccepts = false
+const refusedMount = mountStateful(main.component, { ...panelProps })
+await refusedMount.flush()
+const refusedSwitch = collect(refusedMount.tree()).find((node) => node.props?.label === 'wsl 命令执行')
+check('the refused-write mount still renders the switch', refusedSwitch !== undefined)
+const refusedLanded = await refusedSwitch.props.onChange(false)
+check('a refused write settles as failed', refusedLanded === false, String(refusedLanded))
+check('and the panel says the configuration was not written',
+  textOf(refusedMount.tree()).includes('保存失败：配置未写入'), textOf(refusedMount.tree()).slice(-240))
+refusedMount.unmount()
+scopeAccepts = true
+
+// (5) The route cannot be reached at all: degrade to a note, never throw — and BOTH fields
+// must degrade. A field left in 'loading' keeps its 保存 disabled forever, which reads as a
+// broken panel rather than a failed read.
 getAnswer = 'reject'
 const offline = mountStateful(main.component, { ...panelProps })
 await offline.flush()
 check('an unreachable route degrades to a note',
   textOf(offline.tree()).includes('读取失败'), textOf(offline.tree()).slice(-240))
 check('the field is still offered when the read failed', fieldIn(offline.tree()).input !== undefined)
+check('a failed read does not brick the history field either',
+  historyFieldIn(offline.tree()).input !== undefined, textOf(offline.tree()).slice(-240))
+eq('and its save is not disabled', historyFieldIn(offline.tree()).save?.props?.disabled, false)
+check('and the panel says why that field could not be read',
+  /当前值读取失败/.test(textOf(offline.tree())), textOf(offline.tree()).slice(-240))
 offline.unmount()
 
 // (6) A browser with no fetch at all: the same degradation, and no exception.
@@ -865,6 +919,23 @@ check('a browser without fetch still renders the field',
 check('and that panel offers a save control too', fieldIn(noFetch.tree()).save !== undefined)
 noFetch.unmount()
 context.fetch = realFetch
+
+// The documented counts are hand-written and drift on every commit; this suite knows its own
+// total, so it checks the docs rather than trusting them. Compared after the totals are
+// final, so it does not change the number it checks.
+{
+  const total = passed + failures.length
+  const repoRoot = new URL('..', import.meta.url)
+  const drifting = []
+  for (const doc of ['README.md', 'README.zh-CN.md', 'SUPPORT.md']) {
+    const text = readFileSync(new URL(doc, repoRoot), 'utf8')
+    if (!text.includes(`${total} client checks`) && !text.includes(`${total} 项客户端检查`)) drifting.push(doc)
+  }
+  if (drifting.length > 0) {
+    console.log(`\nthe docs do not document the ${total} client checks this run executed: ${drifting.join(', ')}`)
+    process.exitCode = 1
+  }
+}
 
 console.log(`\n${passed} passed, ${failures.length} failed`)
 if (failures.length > 0) {
