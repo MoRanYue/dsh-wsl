@@ -2529,23 +2529,27 @@ async function toolTests(tools, shim) {
       run.summary.includes('typed anyway') && run.summary.includes('exit code: 0'), run.summary)
   }
   {
-    // Frames must survive the readiness polls. The loop keeps exactly ONE `next()` in flight:
-    // an async generator queues concurrent requests FIFO and hands each yielded frame to the one
-    // at the head, so abandoning a request silently swallows a future frame — here, the command's
-    // own markers — and the call then waits out its whole deadline for a command that finished.
+    // Frames must survive the readiness polls. The loop keeps exactly ONE `next()` in flight: an
+    // async generator queues concurrent requests FIFO and hands each yielded frame to the one at
+    // the head, so abandoning a request silently swallows a future frame — here, the command's
+    // own markers — and the call then waits out its deadline for a command that already finished.
+    //
+    // The screen deliberately does NOT start as a prompt, so the gate holds the write and the loop
+    // really does poll: that is the state the abandoned requests came from.
     const spaced = makeTerminalStub({
       terminals: [termInfoOf('t1')],
-      screen: '\u001b[32mxiny@XINY9\u001b[0m:\u001b[1;34m/home\u001b[0m$ \u001b[K',
+      screen: 'wsl: still starting',
       onWrite: (data) => {
         const nonce = nonceOf(data)
         if (nonce === null) return []
-        // The markers arrive over time, not with the write, so several poll windows pass first.
-        setTimeout(() => spaced.pushFrame({ type: 'output', data: `${START_PREFIX}${nonce}\r\n` }), 300)
-        setTimeout(() => spaced.pushFrame({ type: 'output', data: 'spaced output\r\n' }), 620)
-        setTimeout(() => spaced.pushFrame({ type: 'output', data: `${END_PREFIX}${nonce}:0\r\n` }), 940)
+        setTimeout(() => spaced.pushFrame({ type: 'output', data: `${START_PREFIX}${nonce}\r\n` }), 200)
+        setTimeout(() => spaced.pushFrame({ type: 'output', data: 'spaced output\r\n' }), 500)
+        setTimeout(() => spaced.pushFrame({ type: 'output', data: `${END_PREFIX}${nonce}:0\r\n` }), 800)
         return []
       },
     })
+    // The prompt arrives while the gate is still holding the write, so polls have already happened.
+    setTimeout(() => spaced.pushFrame({ type: 'output', data: 'xiny@XINY9:/home$ ' }), 900)
     const run = await makeTermTool(spaced).execute(
       { action: 'run', command: 'echo spaced', timeoutMs: 6000 }, { agent: termAgent })
     check('frames that arrive across poll windows are all seen',
