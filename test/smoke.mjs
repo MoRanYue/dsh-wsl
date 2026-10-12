@@ -1318,37 +1318,45 @@ async function terminalUnitTests() {
   check('the helper is POSIX (no local, no $RANDOM)',
     !/\blocal\b/.test(definition) && !definition.includes('$RANDOM'), definition)
   check('the helper prints the exit code of the command, not of printf',
-    definition.indexOf('eval "$1"') < definition.indexOf('__dsh_r=$?'), definition)
+    definition.indexOf('eval "$2"') < definition.indexOf('__dsh_r=$?'), definition)
 
-  eq('a call is one short readable line', helperCall('make syn'), `${HELPER_NAME} 'make syn'`)
+  eq('a call is one short readable line, carrying its nonce',
+    helperCall('make syn', 'k3f9a2'), `${HELPER_NAME} k3f9a2 'make syn'`)
   eq('a single quote in the command is escaped, not broken',
-    helperCall("echo it's fine"), `${HELPER_NAME} 'echo it'\\''s fine'`)
-  rejects('an empty command is refused before anything is typed', () => helperCall('   '), /non-empty command/)
+    helperCall("echo it's fine", 'k3f9a2'), `${HELPER_NAME} k3f9a2 'echo it'\\''s fine'`)
+  rejects('an empty command is refused before anything is typed', () => helperCall('   ', 'k3f9a2'), /non-empty command/)
   rejects('a two-line command is refused (it would be submitted early)',
-    () => helperCall('echo a\necho b'), /single command line/)
+    () => helperCall('echo a\necho b', 'k3f9a2'), /single command line/)
+  rejects('a call without a nonce is refused', () => helperCall('ls', ''), /needs a nonce/)
 
-  // The capture a real terminal produces: the echoed call, then the markers with the
-  // helper's own nonce, which the parser reads back.
+  // The capture a real terminal produces — INCLUDING the echoed definition line, which itself
+  // contains the marker prefixes. This is the case that took the first live run out: a parser
+  // that searched for a bare prefix found the definition's echo and waited out its deadline.
+  const echoedDefinition = `${HELPER_NAME}() { printf '${START_PREFIX}%s\\n' "$1"; eval "$2"; __dsh_r=$?; printf '${END_PREFIX}%s:%s\\n' "$1" "$__dsh_r"; }\r\n`
   const capture = stripAnsi([
-    "\u001b[1;32m$ \u001b[0m__dsh_term_run 'echo hi'\r",
-    `${START_PREFIX}4242-1\r\n`,
+    "\u001b[1;32m$ \u001b[0m", echoedDefinition,
+    `xiny@host:~/dir$ ${HELPER_NAME} k3f9a2 'echo hi'\r`,
+    `${START_PREFIX}k3f9a2\r\n`,
     'hi\r\n',
-    `${END_PREFIX}4242-1:0\r\n`,
+    `${END_PREFIX}k3f9a2:0\r\n`,
     'xiny@host:~/dir$ ',
   ].join(''))
-  const extracted = extractHelperResult(capture)
+  const extracted = extractHelperResult(capture, 'k3f9a2')
+  check('the definition echo does not confuse the parser', extracted.complete, JSON.stringify(extracted.output?.slice(0, 40)))
   check('the command output is extracted between the helper markers', extracted.output === 'hi', JSON.stringify(extracted))
   eq('and its exit code is read from the end marker', extracted.exitCode, 0)
+  check('the same capture stays incomplete for another call\'s nonce',
+    extractHelperResult(capture, 'other1').complete === false)
   check('a capture without the end marker is incomplete',
-    extractHelperResult(`${START_PREFIX}4242-1\r\nhi\r\n`).complete === false)
-  const failed = extractHelperResult(`${START_PREFIX}4242-2\nnope\n${END_PREFIX}4242-2:1\n`)
+    extractHelperResult(`${START_PREFIX}k3f9a2\r\nhi\r\n`, 'k3f9a2').complete === false)
+  const failed = extractHelperResult(`${START_PREFIX}k3f9a2\nnope\n${END_PREFIX}k3f9a2:1\n`, 'k3f9a2')
   check('a non-zero exit code survives', failed.exitCode === 1 && failed.output === 'nope', JSON.stringify(failed))
-  // Two calls in the same terminal: the parser must not mix their regions up.
-  const twoCalls = `${START_PREFIX}7-1\naaa\n${END_PREFIX}7-1:0\n${START_PREFIX}7-2\nbbb\n${END_PREFIX}7-2:3\n`
-  const second = extractHelperResult(twoCalls.slice(twoCalls.indexOf(`${START_PREFIX}7-2`)))
-  check('a later call reads its own region', second.output === 'bbb' && second.exitCode === 3, JSON.stringify(second))
+  // Two calls in the same terminal: each nonce reads only its own region.
+  const twoCalls = `${START_PREFIX}a1\naaa\n${END_PREFIX}a1:0\n${START_PREFIX}b2\nbbb\n${END_PREFIX}b2:3\n`
+  check('a later call reads its own region',
+    extractHelperResult(twoCalls, 'b2').output === 'bbb' && extractHelperResult(twoCalls, 'b2').exitCode === 3)
   check('an unrelated capture is not complete',
-    extractHelperResult('xiny@host:~$ ls\nfile\n').complete === false)
+    extractHelperResult('xiny@host:~$ ls\nfile\n', 'k3f9a2').complete === false)
 
   const one = { id: 'a', state: 'running', title: 'bash' }
   const two = { id: 'b', state: 'running', title: 'bash' }
@@ -2329,14 +2337,24 @@ async function toolTests(tools, shim) {
     cwd: '/home/xiny', cols: 120, rows: 30, state: 'running', exitCode: null,
   })
   const makeTermTool = (stub) => createWslTermTool({ ctx: { get: () => stub }, config: CONFIG })
-  /** A shell that has the helper: it answers a call with the markers it would print. */
+  /** The nonce a call line carries, which is what its markers must use. */
+  const nonceOf = (data) => new RegExp(`${HELPER_NAME} ([0-9a-f]+) '`).exec(data)?.[1] ?? null
+  /**
+   * A shell that has the helper. It also echoes the definition line first, exactly as a real
+   * PTY does — that echo contains the marker prefixes, and it is what took the first live run
+   * out, so the stubs keep it in.
+   */
   const replyWithCommand = (data) => {
-    const call = new RegExp(`${HELPER_NAME} '`).exec(data)
-    if (call === null) return [] // the definition line: defining prints nothing
+    if (nonceOf(data) === null) {
+      return data.includes(`${HELPER_NAME}()`)
+        ? [{ type: 'output', data: `${(data.split('\r')[0] ?? '').replace('\u0015', '')}\r\n` }]
+        : []
+    }
+    const nonce = nonceOf(data)
     return [
-      { type: 'output', data: `${START_PREFIX}99-1\r\n` },
+      { type: 'output', data: `${START_PREFIX}${nonce}\r\n` },
       { type: 'output', data: 'hi from the terminal\r\n' },
-      { type: 'output', data: `${END_PREFIX}99-1:0\r\n` },
+      { type: 'output', data: `${END_PREFIX}${nonce}:0\r\n` },
     ]
   }
 
@@ -2366,7 +2384,8 @@ async function toolTests(tools, shim) {
     // The whole point of the helper: the FIRST write defines it once, and the line that runs
     // the command is short enough to read.
     check('run defines the helper once, then calls it with the command',
-      stub.calls.write[0].data.includes(`${HELPER_NAME}()`) && stub.calls.write[1].data.includes(`${HELPER_NAME} 'echo hi from the terminal'`),
+      stub.calls.write[0].data.includes(`${HELPER_NAME}()`)
+      && /__dsh_term_run [0-9a-f]{8} 'echo hi from the terminal'/.test(stub.calls.write[1].data),
       JSON.stringify(stub.calls.write.map((write) => write.data.slice(0, 44))))
     check('and both lines end with Enter',
       stub.calls.write[0].data.endsWith('\r') && stub.calls.write[1].data.endsWith('\r'),
@@ -2376,8 +2395,10 @@ async function toolTests(tools, shim) {
     check('a second run reuses the helper', again.summary.includes('exit code: 0'), again.summary.slice(-80))
     eq('and does not define it again',
       stub.calls.write.filter((write) => write.data.includes(`${HELPER_NAME}()`)).length, 1)
-    eq('the second call carries the second command',
-      stub.calls.write.at(-1).data.includes(`${HELPER_NAME} 'echo again'`), true)
+    check('the second call carries the second command with a fresh nonce',
+      /__dsh_term_run [0-9a-f]{8} 'echo again'/.test(stub.calls.write.at(-1).data)
+      && nonceOf(stub.calls.write.at(-1).data) !== nonceOf(stub.calls.write[1].data),
+      JSON.stringify(stub.calls.write.at(-1).data.slice(0, 44)))
     eq('run does not open a second terminal when one exists', stub.calls.create.length, 0)
     eq('run detaches as well', stub.calls.detached, 2)
     // Measured on a real sidebar terminal: after this tool detaches, the user's view
@@ -2417,7 +2438,7 @@ async function toolTests(tools, shim) {
     // nothing, so the deadline is what ends the call.
     const stub = makeTerminalStub({
       terminals: [termInfoOf('t1')],
-      onWrite: (data) => (data.includes(`${HELPER_NAME} '`) ? [{ type: 'output', data: `${START_PREFIX}99-1\r\n` }] : []),
+      onWrite: (data) => (nonceOf(data) !== null ? [{ type: 'output', data: `${START_PREFIX}${nonceOf(data)}\r\n` }] : []),
     })
     const run = await makeTermTool(stub).execute({ action: 'run', command: 'sleep 99', timeoutMs: 60 }, { agent: termAgent })
     check('a command that never returns is reported as still running',
@@ -2449,11 +2470,12 @@ async function toolTests(tools, shim) {
   // Long output: this is the case that produced the rule. A build log's answer is at
   // the bottom, so the tail comes back inline and the whole capture is filed.
   const longFrames = (data) => {
-    if (!data.includes(`${HELPER_NAME} '`)) return []
+    const nonce = nonceOf(data)
+    if (nonce === null) return []
     return [
-      { type: 'output', data: `${START_PREFIX}99-1\r\n` },
+      { type: 'output', data: `${START_PREFIX}${nonce}\r\n` },
       { type: 'output', data: `START-OF-LOG\r\n${'x'.repeat(25_000)}\r\nTHE-ACTUAL-ANSWER\r\n` },
-      { type: 'output', data: `${END_PREFIX}99-1:0\r\n` },
+      { type: 'output', data: `${END_PREFIX}${nonce}:0\r\n` },
     ]
   }
   const termCtx = (stub, spillStore) => ({
