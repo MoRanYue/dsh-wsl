@@ -2390,7 +2390,8 @@ async function toolTests(tools, shim) {
     id, title: 'WSL', shell: { name: 'bash', path: '/bin/bash', args: ['-i'] },
     cwd: '/home/xiny', cols: 120, rows: 30, state: 'running', exitCode: null,
   })
-  const makeTermTool = (stub, config = CONFIG) => createWslTermTool({ ctx: { get: () => stub }, config })
+  const makeTermTool = (stub, config = CONFIG, subtasks = null) =>
+    createWslTermTool({ ctx: { get: () => stub }, config, subtasks })
   /** The nonce a call line carries, which is what its markers must use. */
   const nonceOf = (data) => new RegExp(`${HELPER_NAME} ([0-9a-f]+) '`).exec(data)?.[1] ?? null
   /**
@@ -2841,6 +2842,62 @@ async function toolTests(tools, shim) {
   }
   await rejects('an unknown action is refused',
     () => makeTermTool(makeTerminalStub()).execute({ action: 'nope' }, { agent: termAgent }), /unknown action/)
+  // Every declared action must be an accepted one. `subtask-done` was declared in the schema
+  // enum and MISSING from the validator's own list, so the whole finish-a-record path was
+  // dead code that only failed at the moment the model used it. Driving the declared enum
+  // through the validator is what catches that class of bug.
+  {
+    const declared = makeTermTool(makeTerminalStub()).parameters.properties.action.enum
+    check('the tool declares the finish action', declared.includes('subtask-done'), JSON.stringify(declared))
+    for (const action of declared) {
+      const stub = makeTerminalStub({ terminals: [termInfoOf('t1')] })
+      let refused = null
+      try {
+        await makeTermTool(stub).execute({ action, timeoutMs: 120 }, { agent: termAgent })
+      } catch (error) {
+        refused = String(error?.message ?? error)
+      }
+      check(`\`${action}\` is accepted, not merely declared`,
+        refused === null || !/unknown action/.test(refused), `${action} refused: ${refused}`)
+    }
+  }
+  // The protocol end to end, through the tool: a run that names a subtask opens a record and
+  // logs its command, and `subtask-done` writes the result and decides the shell.
+  {
+    const log = createSubtaskLog()
+    const stub = makeTerminalStub({ terminals: [], onWrite: replyWithCommand })
+    const tool = makeTermTool(stub, CONFIG, log)
+    await tool.execute({ action: 'run', command: 'pwd', subtask: '检查重启后的子任务记录' }, { agent: termAgent })
+    const running = log.list('session-1')
+    check('a run that names a subtask opens a record for it',
+      running.total === 1 && running.running === 1 && running.entries[0].title === '检查重启后的子任务记录',
+      JSON.stringify(running))
+    check('and the command it ran is on that record',
+      running.entries[0].commands.map((entry) => entry.command).join('|') === 'pwd',
+      JSON.stringify(running.entries[0].commands))
+    let finished = null
+    let failure = null
+    try {
+      finished = await tool.execute(
+        { action: 'subtask-done', subtask: '检查重启后的子任务记录', result: '确认可用', keepTerminal: false },
+        { agent: termAgent })
+    } catch (error) {
+      failure = String(error?.message ?? error)
+    }
+    const done = log.list('session-1')
+    const entry = done.entries[0]
+    check('subtask-done closes the record with its result',
+      failure === null && done.running === 0 && entry?.result === '确认可用',
+      `${failure ?? ''} ${JSON.stringify(done)}`)
+    check('and keepTerminal:false closes the shell this tool opened',
+      entry !== undefined && projectSubtask(entry).terminal === 'closed' && stub.calls.close.includes(entry.terminalId),
+      `${entry === undefined ? 'no record' : JSON.stringify(projectSubtask(entry))} closes=${JSON.stringify(stub.calls.close)}`)
+    check('and the action reports what it recorded',
+      finished !== null && finished.summary.includes('确认可用'), String(finished?.summary ?? failure))
+  }
+  await rejects('subtask-done without the subtask name is refused',
+    () => makeTermTool(makeTerminalStub(), CONFIG, createSubtaskLog())
+      .execute({ action: 'subtask-done' }, { agent: termAgent }), /needs .?subtask/)
   await rejects('run without a command is refused before attaching',
     () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'run' }, { agent: termAgent }),
     /non-empty command/)
