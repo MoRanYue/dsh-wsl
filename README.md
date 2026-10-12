@@ -15,7 +15,7 @@ project kept on a Windows drive keeps **Windows** filesystem semantics — no PO
 permissions, case-insensitive names, no file-change notifications — at a fraction
 of the speed (see [Notes](#notes)).
 
-![The feature list and the left-sidebar switch panel](assets/market-preview-features-4.png)
+![What the plugin does, in order of importance](assets/market-preview-features-5.png)
 
 ## Tools
 
@@ -211,8 +211,7 @@ consent it needs, and from then on the model may join that terminal.
 Reach for it only when the work needs **one shell across several steps** — a long build worth
 watching go by, an interactive program, a directory or environment that has to persist. For
 everything self-contained the plain `wsl` tool is the better deal: a fresh shell per call runs
-in parallel, needs no terminal at all, and passes the dangerous-command guard, none of which is
-true here.
+in parallel, needs no terminal at all, and never takes the keyboard away from you.
 
 ## Running privileged commands (`asRoot`)
 
@@ -588,7 +587,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 800 host checks against real WSL (shim for ctx.subprocess) + 155 client checks
+npm test          # 804 host checks against real WSL (shim for ctx.subprocess) + 155 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

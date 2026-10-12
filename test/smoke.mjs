@@ -2360,7 +2360,7 @@ async function toolTests(tools, shim) {
     id, title: 'WSL', shell: { name: 'bash', path: '/bin/bash', args: ['-i'] },
     cwd: '/home/xiny', cols: 120, rows: 30, state: 'running', exitCode: null,
   })
-  const makeTermTool = (stub) => createWslTermTool({ ctx: { get: () => stub }, config: CONFIG })
+  const makeTermTool = (stub, config = CONFIG) => createWslTermTool({ ctx: { get: () => stub }, config })
   /** The nonce a call line carries, which is what its markers must use. */
   const nonceOf = (data) => new RegExp(`${HELPER_NAME} ([0-9a-f]+) '`).exec(data)?.[1] ?? null
   /**
@@ -2604,6 +2604,41 @@ async function toolTests(tools, shim) {
     const elapsed = Date.now() - started
     check('a cancelled call releases the terminal immediately',
       elapsed < 3000 && cancellable.calls.detached >= 1, `elapsed ${elapsed} ms, detached ${cancellable.calls.detached}`)
+  }
+  {
+    // The terminal path goes through the same dangerous-command guard as the one-shot path —
+    // a terminal is where a mistyped command lands in a shell the user is watching — and a
+    // refusal must not touch the terminal at all: no keystroke, nothing memorised.
+    const guarded = makeTerminalStub({ terminals: [termInfoOf('t1')] })
+    const guardedTool = makeTermTool(guarded)
+    await rejects('the terminal path refuses a destructive command', () => guardedTool.execute(
+      { action: 'run', command: 'rm -rf /tmp/dsh-wsl-term-guard' }, { agent: termAgent }),
+    /refused a destructive command/)
+    eq('and the refusal typed nothing into the terminal', guarded.calls.write.length, 0)
+
+    const allowedStub = makeTerminalStub({
+      terminals: [termInfoOf('t1')],
+      onWrite: (data) => (nonceOf(data) === null ? [] : [
+        { type: 'output', data: `${START_PREFIX}${nonceOf(data)}\r\n` },
+        { type: 'output', data: `${END_PREFIX}${nonceOf(data)}:0\r\n` },
+      ]),
+    })
+    const allowed = await makeTermTool(allowedStub).execute(
+      { action: 'run', command: 'rm -rf /tmp/dsh-wsl-term-guard', allowDangerous: true }, { agent: termAgent })
+    check('an intended destructive command passes with allowDangerous',
+      allowed.summary.includes('exit code: 0'), allowed.summary)
+
+    const unguardedStub = makeTerminalStub({
+      terminals: [termInfoOf('t1')],
+      onWrite: (data) => (nonceOf(data) === null ? [] : [
+        { type: 'output', data: `${START_PREFIX}${nonceOf(data)}\r\n` },
+        { type: 'output', data: `${END_PREFIX}${nonceOf(data)}:0\r\n` },
+      ]),
+    })
+    const unguarded = await makeTermTool(unguardedStub, { ...CONFIG, dangerGuard: false }).execute(
+      { action: 'run', command: 'rm -rf /tmp/dsh-wsl-term-guard' }, { agent: termAgent })
+    check('and the guard switch turns the refusal off here too',
+      unguarded.summary.includes('exit code: 0'), unguarded.summary)
   }
   {
     // A shell that has the helper and whose command hangs: the start marker arrives, then
@@ -2856,7 +2891,8 @@ async function toolTests(tools, shim) {
     || (tools['wsl-term'].description.includes('one is opened here')
       && tools['wsl-term'].description.includes('read-only')
       && tools['wsl-term'].description.includes('`close` it when the subtask is done')
-      && tools['wsl-term'].description.includes('plain `wsl` tool for anything self-contained')),
+      && tools['wsl-term'].description.includes('plain `wsl` tool is better')
+      && tools['wsl-term'].description.includes('dangerous-command guard')),
     tools['wsl-term']?.description ?? '(not mounted)')
 
   // The bundle patch must stay minimal: installing a tool plugin must not decide

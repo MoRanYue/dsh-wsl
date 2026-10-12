@@ -11,7 +11,7 @@ Linux 原生 DSH：真实的 Linux 内核与 bash、退出码与信号、超时�
 （见[沙箱边界](#沙箱边界)）；项目放在 Windows 盘上时仍是 **Windows** 的文件系统语义——没有 POSIX
 权限位、文件名大小写不敏感、收不到文件变更通知——速度也低一个数量级（见[注意事项](#注意事项)）。
 
-![功能清单与左侧栏开关面板](assets/market-preview-features-4.png)
+![功能一览，按重要性排列](assets/market-preview-features-5.png)
 
 ## 工具
 
@@ -175,7 +175,7 @@ wsl-term({ action: "close", id: "…" })                        → 关闭你点
 拿回来的是两个标记之间的输出，外加退出码。**这个工具没有开关**：你在侧边栏开一个终端，就是同意加入协作。
 
 它只在**需要同一个 shell 跨多步**时才值得用 —— 想看着它跑完的长构建、交互式程序、必须保留的目录或环境。
-自洽的命令交给 `wsl` 更划算：每次全新 shell、可以并行、根本不需要终端，而且经过危险命令守卫 —— 这几样长期终端都没有。
+自洽的命令交给 `wsl` 更划算：每次全新 shell、可以并行、根本不需要终端，也不会把键盘从你手里拿走。
 
 ## 以 root 执行（`asRoot`）
 
@@ -511,7 +511,7 @@ argv 包一层过 `ctx.sandbox`）和文件系统服务（`@deepseek-ai/dsh-fs-s
 ### 测试
 
 ```sh
-npm test          # 800 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 155 项客户端检查
+npm test          # 804 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 155 项客户端检查
 npm run test:real # 同一套检查改跑真实 provider，外加 seam 事实套件
 ```
 
