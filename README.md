@@ -19,7 +19,7 @@ project kept on a Windows drive keeps **Windows** filesystem semantics — no PO
 permissions, case-insensitive names, no file-change notifications — at a fraction
 of the speed (see [Notes](#notes)).
 
-![What the plugin does, in order of importance](assets/market-preview-features-7.png)
+![What the plugin does, in order of importance](assets/market-preview-features-8.png)
 
 ## Tools
 

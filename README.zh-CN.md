@@ -14,7 +14,7 @@ Linux 原生 DSH：真实的 Linux 内核与 bash、退出码与信号、超时�
 （见[沙箱边界](#沙箱边界)）；项目放在 Windows 盘上时仍是 **Windows** 的文件系统语义——没有 POSIX
 权限位、文件名大小写不敏感、收不到文件变更通知——速度也低一个数量级（见[注意事项](#注意事项)）。
 
-![功能一览，按重要性排列](assets/market-preview-features-7.png)
+![功能一览，按重要性排列](assets/market-preview-features-8.png)
 
 ## 工具
 

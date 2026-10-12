@@ -6,7 +6,9 @@
 <style>
   /* Black / grey / white only, and nothing decorative: this is the card a user sees in the
      plugin list and on the detail page, so every line answers "what does this do for me"
-     with no jargon and no colour doing the explaining. */
+     with no jargon and no colour doing the explaining.
+     The layout leads with the two ways of working and the collaboration mode, because that
+     is what a user has to understand first; the remaining capabilities sit below as a list. */
   :root {
     --bg: #0b0b0c;
     --card: #131315;
@@ -23,7 +25,7 @@
     background: var(--bg);
     color: var(--text);
     font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
-    padding: 42px 56px 34px;
+    padding: 44px 56px 34px;
     display: flex; flex-direction: column;
     -webkit-font-smoothing: antialiased;
   }
@@ -37,18 +39,32 @@
   h1 { font-size: 31px; font-weight: 650; letter-spacing: .4px; }
   .sub { color: var(--mid); font-size: 15px; margin-top: 6px; line-height: 1.45; }
 
-  /* Twelve capabilities do not fit in two columns without shrinking the type past
-     readability, so the card uses three columns of four rows and keeps the type sizes
-     of the previous design. */
-  .grid { margin-top: 24px; flex: 1; display: grid; grid-template-columns: repeat(3, 1fr); grid-auto-rows: 1fr; gap: 10px; }
+  .lead { color: var(--mid); font-size: 14.5px; margin-top: 28px; }
+
+  .modes { margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .mode {
+    border: 1px solid var(--line-soft); background: var(--card);
+    border-radius: 12px; padding: 20px 22px;
+  }
+  .mode h2 { font-size: 20px; font-weight: 640; letter-spacing: .2px; margin-top: 7px; }
+  .mode p { color: var(--dim); font-size: 14px; line-height: 1.55; margin-top: 8px; }
+  .tag { color: var(--faint); font-size: 12.5px; font-weight: 600; letter-spacing: 1px; }
+
+  .coop {
+    margin-top: 12px; border: 1px solid var(--line-soft); background: var(--card);
+    border-radius: 12px; padding: 18px 22px;
+  }
+  .coop h2 { font-size: 18px; font-weight: 640; letter-spacing: .2px; margin-top: 6px; }
+  .coop p { color: var(--dim); font-size: 14px; line-height: 1.55; margin-top: 7px; }
+
+  .more { margin-top: 20px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
   .item {
     border: 1px solid var(--line-soft); background: var(--card);
-    border-radius: 12px; padding: 15px 18px;
-    display: flex; flex-direction: column; justify-content: center;
+    border-radius: 12px; padding: 14px 17px;
   }
   .num { color: var(--faint); font-size: 12px; font-weight: 600; letter-spacing: 1px; }
-  .name { font-size: 16.5px; font-weight: 620; letter-spacing: .2px; margin-top: 4px; }
-  .say { color: var(--dim); font-size: 13.5px; line-height: 1.5; margin-top: 5px; }
+  .name { font-size: 15px; font-weight: 620; letter-spacing: .2px; margin-top: 4px; }
+  .say { color: var(--dim); font-size: 13px; line-height: 1.5; margin-top: 5px; }
 
   footer {
     margin-top: auto; border-top: 1px solid var(--line); padding-top: 14px;
@@ -66,64 +82,55 @@
     </div>
   </header>
 
-  <div class="grid">
+  <div class="lead">终端有两种工作方式，模型按任务自动选择：</div>
+
+  <div class="modes">
+    <div class="mode">
+      <div class="tag">多步任务</div>
+      <h2>长期终端</h2>
+      <p>同一件事共用一个会话，目录与环境保留；子任务记录显示在输入框上方，可展开查看每条命令与结果；结束后保留或关闭。</p>
+    </div>
+    <div class="mode">
+      <div class="tag">自洽命令</div>
+      <h2>一次性终端</h2>
+      <p>每次调用使用全新 shell，返回退出码与输出，可写入 stdin、可并行执行；长构建转为后台作业，随时读取或终止。</p>
+    </div>
+  </div>
+
+  <div class="coop">
+    <div class="tag">你打开的终端</div>
+    <h2>用户新建的终端可以协作</h2>
+    <p>你在侧边栏新建的终端，模型可直接在其中工作：命令与输出全程可见；工作期间终端只读，点击「接管输入」即可随时收回键盘。</p>
+  </div>
+
+  <div class="more">
     <div class="item">
       <div class="num">01</div>
-      <div class="name">执行 Linux 命令</div>
-      <div class="say">每条命令返回退出码与输出；可设超时，输出过长时只回结论，完整内容另存为文件。</div>
-    </div>
-    <div class="item">
-      <div class="num">02</div>
-      <div class="name">输入与后台作业</div>
-      <div class="say">可向命令写入 stdin；长构建转为后台作业，随时读取进度或终止。</div>
-    </div>
-    <div class="item">
-      <div class="num">03</div>
       <div class="name">路径互转</div>
       <div class="say">Windows 与 WSL 路径双向转换，不必手写路径前缀。</div>
     </div>
     <div class="item">
-      <div class="num">04</div>
+      <div class="num">02</div>
       <div class="name">环境体检</div>
       <div class="say">汇总发行版、内核、CPU、内存、磁盘与可用能力。</div>
     </div>
     <div class="item">
-      <div class="num">05</div>
+      <div class="num">03</div>
       <div class="name">项目体检</div>
       <div class="say">对照项目清单指出缺哪些工具，包括实际由 Windows 提供的命令。</div>
     </div>
     <div class="item">
-      <div class="num">06</div>
+      <div class="num">04</div>
       <div class="name">工具链补装</div>
       <div class="say">按固定配方补装缺失的工具链，先给出计划，确认后再安装。</div>
     </div>
     <div class="item">
-      <div class="num">07</div>
-      <div class="name">终端协作</div>
-      <div class="say">同一件事共用一个终端会话，命令与输出全程可见，工作期间终端只读。</div>
+      <div class="num">05</div>
+      <div class="name">超时与输出</div>
+      <div class="say">命令可设超时；输出过长时只回结论，完整内容另存为文件。</div>
     </div>
     <div class="item">
-      <div class="num">08</div>
-      <div class="name">键盘交接</div>
-      <div class="say">点击终端中的「接管输入」即可随时收回键盘，不会打断你正在输入的内容。</div>
-    </div>
-    <div class="item">
-      <div class="num">09</div>
-      <div class="name">子任务记录</div>
-      <div class="say">输入框上方列出本次对话的子任务，正在运行的置顶显示。</div>
-    </div>
-    <div class="item">
-      <div class="num">10</div>
-      <div class="name">任务详情</div>
-      <div class="say">展开任一条即见：终端的完整信息、最终结果、每条命令及其退出码。</div>
-    </div>
-    <div class="item">
-      <div class="num">11</div>
-      <div class="name">终端去留</div>
-      <div class="say">一件事结束后，终端可保留给下一步使用，也可随即关闭。</div>
-    </div>
-    <div class="item">
-      <div class="num">12</div>
+      <div class="num">06</div>
       <div class="name">安全与设置</div>
       <div class="say">删除、分区、关机等操作需明确同意；root 与其余选项集中在侧边栏一处。</div>
     </div>
