@@ -1370,6 +1370,13 @@ async function terminalUnitTests() {
   check('an empty screen is not ready', looksReady('') === false && looksReady(undefined) === false)
   check('a command still running is not ready', looksReady('$ make -B syn\ncompiling foo.c\n') === false)
   check('the last non-empty line is what counts', looksReady('busy\nxiny@host:~$ ') === true)
+  // The screen arrives as the emulator's own serialization, so its last line ends in an escape
+  // sequence. Missing that made every later `run` in a tool-created terminal wait out its whole
+  // deadline without typing — measured from a frame trace.
+  check('a prompt with terminal escapes still looks ready',
+    looksReady('\u001b[1;32mxiny@XINY9\u001b[0m:\u001b[1;34m/home\u001b[0m$ \u001b[K'))
+  check('a prompt after OSC and CRLF looks ready',
+    looksReady('\u001b]0;bash\u0007xiny@XINY9:/home$ \r\n'))
 
   const one = { id: 'a', state: 'running', title: 'bash' }
   const two = { id: 'b', state: 'running', title: 'bash' }
@@ -2485,6 +2492,41 @@ async function toolTests(tools, shim) {
     check('a shell that never shows a prompt gets nothing typed',
       run.summary.includes('nothing was typed'), run.summary)
     eq('and nothing was written to it', never.calls.write.length, 0)
+  }
+  {
+    // The failure this instrumentation was built for: ONE frame, and it is a real (escaped)
+    // serialized screen — and then the shell sends nothing more. The command must still be typed,
+    // because nothing here needs another frame to arrive.
+    const oneFrame = makeTerminalStub({
+      terminals: [termInfoOf('t1')],
+      screen: '',
+      onWrite: (data) => (nonceOf(data) === null ? [] : [
+        { type: 'output', data: `${START_PREFIX}${nonceOf(data)}\r\n` },
+        { type: 'output', data: 'typed anyway\r\n' },
+        { type: 'output', data: `${END_PREFIX}${nonceOf(data)}:0\r\n` },
+      ]),
+    })
+    // Override the snapshot with an escaped prompt, and send no output before the write.
+    const original = oneFrame.follow
+    oneFrame.follow = (agent, id, attachmentId, signal) => {
+      const inner = original.call(oneFrame, agent, id, attachmentId, signal)
+      return (async function* escaped() {
+        const first = await inner.next()
+        if (!first.done && first.value?.type === 'snapshot') {
+          yield { ...first.value, screen: '\u001b[1;32mxiny@XINY9\u001b[0m:\u001b[1;34m/home\u001b[0m$ \u001b[K' }
+        } else if (!first.done) {
+          yield first.value
+        }
+        for (;;) {
+          const next = await inner.next()
+          if (next.done) return
+          yield next.value
+        }
+      })()
+    }
+    const run = await makeTermTool(oneFrame).execute({ action: 'run', command: 'echo typed' }, { agent: termAgent })
+    check('a single escaped snapshot is enough to type the command',
+      run.summary.includes('typed anyway') && run.summary.includes('exit code: 0'), run.summary)
   }
   {
     // A shell that has the helper and whose command hangs: the start marker arrives, then
