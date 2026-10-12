@@ -938,6 +938,89 @@ check('and that panel offers a save control too', fieldIn(noFetch.tree()).save !
 noFetch.unmount()
 context.fetch = realFetch
 
+// --- the subtask dock above the composer -------------------------------------
+//
+// It reads the Host's subtask log and renders one line per subtask, with the commands behind
+// a click. Three states have to stay distinct: rows, a readable log with nothing in it (one
+// faint line, because a display that only appears after the first subtask reads as missing),
+// and a log that could not be read at all (silent — it must not claim there were none).
+console.log('\nthe subtask dock above the composer')
+const dock = registered.find((row) => row.seat.id === 'wsl-subtasks')
+check('it registers a row in the composer dock', dock !== undefined)
+eq('the row sits after the app\'s own dock entries', dock?.seat.order, 30)
+const dockFetch = context.fetch
+{
+  const payload = {
+    total: 2,
+    running: 1,
+    entries: [
+      {
+        id: '2', title: '跑通 sta 流程', status: 'running', result: null, terminal: 'attached',
+        terminalCreated: true, terminalId: 'dsh-agent',
+        terminalInfo: {
+          id: 'dsh-agent', title: 'WSL', shell: 'WSL', args: ['-d', 'Ubuntu-22.04', '-e', 'bash'],
+          cwd: 'D:\\DSHworkarea', cols: 120, rows: 30, state: 'running', stale: false,
+        },
+        commands: [{ command: 'make sta', exitCode: 0 }], finishedAt: null,
+      },
+      {
+        id: '1', title: '修终端就绪竞态', status: 'done', result: '已修', terminal: 'closed',
+        terminalCreated: true, terminalId: 'dsh-1', terminalInfo: null,
+        commands: [{ command: 'node test/smoke.mjs', exitCode: 0 }], finishedAt: 1,
+      },
+    ],
+  }
+  context.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({ sessions: { 'session-1': payload } }) })
+  const mounted = mountStateful(dock.component, { sessionId: 'session-1' })
+  eq('before the first answer it says nothing at all', textOf(mounted.tree()), '')
+  await mounted.flush()
+  const text = textOf(mounted.tree())
+  check('the dock names the running subtask', text.includes('跑通 sta 流程') && text.includes('运行中'), text)
+  check('and says how many this conversation ran', text.includes('共 2 个') && text.includes('运行 1'), text)
+  check('a finished subtask is marked done', text.includes('修终端就绪竞态') && text.includes('已结束·关闭'), text)
+  check('commands stay hidden until the subtask is opened',
+    !text.includes('make sta') && !text.includes('node test/smoke.mjs'), text)
+  const clickables = collect(mounted.tree()).filter((node) => typeof node.props?.onClick === 'function')
+  eq('one click target per subtask', clickables.length, 2)
+  clickables[0].props.onClick()
+  const opened = textOf(mounted.tree())
+  check('opening a subtask shows the command it ran', opened.includes('$ make sta') && opened.includes('→ 0'), opened)
+  check('and the whole terminal it ran in',
+    opened.includes('dsh-agent') && opened.includes('Ubuntu-22.04') && opened.includes('120x30'),
+    opened)
+  clickables[1].props.onClick()
+  const second = textOf(mounted.tree())
+  check('opening a finished subtask shows its result', second.includes('结果：已修'), second)
+  mounted.unmount()
+
+  // A readable log with nothing in it: one faint line, and no card around it.
+  context.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({ sessions: {} }) })
+  const empty = mountStateful(dock.component, { sessionId: 'session-1' })
+  await empty.flush()
+  eq('an empty log says so in one line', textOf(empty.tree()), '暂无子任务')
+  check('and that line is faint, with no container around it',
+    Number(empty.tree()?.props?.style?.opacity) < 0.8
+    && empty.tree()?.props?.style?.border === undefined
+    && empty.tree()?.props?.style?.background === undefined,
+    JSON.stringify(empty.tree()?.props?.style))
+  empty.unmount()
+
+  // A log that cannot be read: silent. Saying "no subtasks" here would be a lie.
+  context.fetch = () => Promise.reject(new Error('offline'))
+  const broken = mountStateful(dock.component, { sessionId: 'session-1' })
+  await broken.flush()
+  eq('a log that could not be read stays silent', textOf(broken.tree()), '')
+  broken.unmount()
+
+  // No session id at all (the dock mounted before the session resolved): also silent.
+  context.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({ sessions: { 'session-1': payload } }) })
+  const noSession = mountStateful(dock.component, {})
+  await noSession.flush()
+  eq('without a session it renders nothing', textOf(noSession.tree()), '')
+  noSession.unmount()
+}
+context.fetch = dockFetch
+
 // The documented counts are hand-written and drift on every commit; this suite knows its own
 // total, so it checks the docs rather than trusting them. Compared after the totals are
 // final, so it does not change the number it checks.
