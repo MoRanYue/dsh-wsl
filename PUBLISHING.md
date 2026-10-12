@@ -133,6 +133,19 @@ both that the entry stays relative and that it resolves.
    artifact, not just the metadata. Scripted requests to `npmjs.com`'s HTML hit a
    Cloudflare challenge; the registry API is the source of truth.
 
+   All of the above in one command, waiting for the run when it is still going:
+
+   ```sh
+   node scripts/verify-release.mjs 1.12.2              # waits for the tag's workflow
+   node scripts/verify-release.mjs 1.12.2 --no-wait    # check only
+   ```
+
+   It reports the release tag, the asset's size/sha256 and version, `dist-tags.latest`,
+   whether the version is on npm at all, and whether the asset and the npm tarball are
+   byte-identical — and exits non-zero on any mismatch, so it can gate a script. It needs
+   the same proxy the rest of the machine needs for `github.com` (see the header of the
+   script for the exact environment).
+
    Two things make a published release look unpublished, so rule them out before
    believing a negative:
 
