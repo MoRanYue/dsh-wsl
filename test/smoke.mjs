@@ -44,7 +44,7 @@ import { createWslDoctorTool } from '../lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from '../lib/tools/wsl-bootstrap.js'
 import {
   appendCapture, autoTerminalIds, clipTail, describeSessionCwd, END_PREFIX, extractHelperResult, HELPER_NAME,
-  helperCall, helperDefinition, inputLine, OPENED_TERMINAL_NOTE, pickTerminal, renderTerminals, spillLine,
+  helperCall, helperDefinition, inputLine, looksReady, OPENED_TERMINAL_NOTE, pickTerminal, renderTerminals, spillLine,
   START_PREFIX, stripAnsi,
 } from '../lib/terminal.js'
 import { createWslTermTool } from '../lib/tools/wsl-term.js'
@@ -373,7 +373,7 @@ function makeStubRunner(answer = {}) {
  * checks that the tool's wrapper is parseable.
  */
 function makeTerminalStub({
-  terminals = [], screen = '', onWrite, writeError = null, createError = null,
+  terminals = [], screen = '$ ', onWrite, writeError = null, createError = null,
   noSnapshot = false, stallOnReturn = false,
 } = {}) {
   const calls = { list: [], create: [], follow: [], write: [], close: [], detached: 0 }
@@ -397,6 +397,8 @@ function makeTerminalStub({
   return {
     calls,
     infos,
+    /** Push a frame as if it arrived from the host, for tests that need one later. */
+    pushFrame: push,
     list(sessionId) {
       calls.list.push(sessionId)
       return infos
@@ -1357,6 +1359,17 @@ async function terminalUnitTests() {
     extractHelperResult(twoCalls, 'b2').output === 'bbb' && extractHelperResult(twoCalls, 'b2').exitCode === 3)
   check('an unrelated capture is not complete',
     extractHelperResult('xiny@host:~$ ls\nfile\n', 'k3f9a2').complete === false)
+
+  // Readiness: a terminal created a moment ago is not ready to be typed into, and typing then
+  // loses the write (measured live: the definition vanished and the command answered
+  // "command not found").
+  check('a shell prompt looks ready', looksReady('xiny@host:~$ '))
+  check('a root prompt looks ready too', looksReady('root@host:/# '))
+  check('a shell that is still starting does not',
+    looksReady('wsl: localhost proxy is not mirrored into WSL.\n') === false)
+  check('an empty screen is not ready', looksReady('') === false && looksReady(undefined) === false)
+  check('a command still running is not ready', looksReady('$ make -B syn\ncompiling foo.c\n') === false)
+  check('the last non-empty line is what counts', looksReady('busy\nxiny@host:~$ ') === true)
 
   const one = { id: 'a', state: 'running', title: 'bash' }
   const two = { id: 'b', state: 'running', title: 'bash' }
@@ -2432,6 +2445,46 @@ async function toolTests(tools, shim) {
     await makeTermTool(stub).execute({ action: 'run', command: 'pwd' }, { agent: termAgent })
     eq('an identity closed earlier falls through to the next name',
       stub.calls.create.map((call) => call.id).join(','), 'dsh-agent,dsh-agent-2')
+  }
+  {
+    // A freshly created terminal: the first frames are the launcher's warning, the prompt comes
+    // later. Typing before it loses the write, so the tool waits — and then types.
+    const early = makeTerminalStub({
+      terminals: [termInfoOf('t1')],
+      screen: 'wsl: localhost proxy is not mirrored into WSL.\r\n',
+      onWrite: (data) => (nonceOf(data) === null ? [] : [
+        { type: 'output', data: `${START_PREFIX}${nonceOf(data)}\r\n` },
+        { type: 'output', data: 'after the prompt\r\n' },
+        { type: 'output', data: `${END_PREFIX}${nonceOf(data)}:0\r\n` },
+      ]),
+    })
+    // The prompt arrives while the tool is waiting for it.
+    const promptTimer = setTimeout(() => {
+      early.pushFrame({ type: 'output', data: 'xiny@host:~$ ' })
+    }, 60)
+    const run = await makeTermTool(early).execute({ action: 'run', command: 'echo hi', timeoutMs: 4000 }, { agent: termAgent })
+    clearTimeout(promptTimer)
+    check('a just-created shell is typed into only once its prompt is there',
+      run.summary.includes('after the prompt') && run.summary.includes('exit code: 0'), run.summary)
+    // The definition may already have been sent for this id by an earlier test (the ready set is
+    // per process), so what matters here is that the CALL was typed — and only after the prompt.
+    check('and the call was typed after that prompt',
+      early.calls.write.length >= 1
+      && early.calls.write.at(-1).data.includes(`${HELPER_NAME} `)
+      && early.calls.write.at(-1).data.includes("'echo hi'"),
+      JSON.stringify(early.calls.write.map((write) => write.data.slice(0, 30))))
+  }
+  {
+    // A shell that never becomes ready inside the call's own deadline: nothing is typed, and
+    // the result says exactly that rather than pretending.
+    const never = makeTerminalStub({
+      terminals: [termInfoOf('t1')],
+      screen: 'wsl: still starting\r\n',
+    })
+    const run = await makeTermTool(never).execute({ action: 'run', command: 'echo hi', timeoutMs: 120 }, { agent: termAgent })
+    check('a shell that never shows a prompt gets nothing typed',
+      run.summary.includes('nothing was typed'), run.summary)
+    eq('and nothing was written to it', never.calls.write.length, 0)
   }
   {
     // A shell that has the helper and whose command hangs: the start marker arrives, then
