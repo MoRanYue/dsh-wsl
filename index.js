@@ -104,7 +104,6 @@ export const Config = Schema?.object({
     env: Schema.boolean().default(true).description('注册 `wsl-env` 工具：汇总发行版、内核、systemd、cgroup、GPU 直通、docker 与挂载盘。').volatile(),
     doctor: Schema.boolean().default(true).description('注册 `wsl-doctor` 工具：对照项目清单与发行版实际能力，指出缺什么，以及哪些命令其实是 Windows 的。').volatile(),
     bootstrap: Schema.boolean().default(false).description('注册 `wsl-bootstrap` 工具：在发行版里补装缺失的工具链。默认关；打开后它以 root 执行固定配方，且调用方仍需显式 `dryRun: false`。').volatile(),
-    term: Schema.boolean().default(false).description('注册 `wsl-term` 工具：读写本会话侧边栏里的那个终端，必要时自行新开一个（**不一定会出现在侧边栏**，想看得见请自己先开一个）。默认关；打开后模型可以在你看着的那个终端里执行命令，执行期间输入控制权在它手上。').volatile(),
   }).description('要注册哪些工具；改动即时生效（面板开关一拨，工具就出现或消失，不需要重启）。'),
   backgroundJobs: Schema.boolean().default(true).description('允许长任务以 `runInBackground` 后台执行，结果由内置 job 工具读取。').volatile(),
   translatePaths: Schema.boolean().default(true).description('命令中的 Windows 路径默认转为 `/mnt/...`。').volatile(),
@@ -654,17 +653,20 @@ export function apply(ctx, settings = {}) {
     // The installer is NOT registered by default: turning on its switch is the
     // user's decision to let this plugin add software to their distribution.
     bootstrap: () => createWslBootstrapTool({ config, runner }),
-    // The terminal tool is off by default for the same reason: its ON position lets
-    // the model type into the terminal the user is looking at. It reads the
-    // `terminalController` service lazily, so a build without a sidebar terminal
-    // still mounts this plugin and reports that clearly instead of failing to load.
+    // The terminal tool has NO switch. Opening a terminal in the sidebar IS the
+    // consent: from then on the model may join that terminal, which is the whole
+    // point of the tool. It reads the `terminalController` service lazily, so a
+    // build without a sidebar terminal still mounts this plugin and reports that
+    // clearly instead of failing to load.
     term: () => createWslTermTool({ ctx, config }),
   }
+  // Tools with no switch of their own are always mounted.
+  const alwaysOn = new Set(['term'])
   /** name -> disposer for the tools currently mounted by this plugin. */
   const mountedTools = new Map()
   const syncTools = () => {
     for (const [name, factory] of Object.entries(toolFactories)) {
-      const wanted = config.tools[name] === true
+      const wanted = alwaysOn.has(name) || config.tools[name] === true
       const disposer = mountedTools.get(name)
       if (wanted && disposer === undefined) {
         try {

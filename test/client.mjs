@@ -229,16 +229,21 @@ const sectionIn = (nodes, title) => nodes.find((node) => node.type === 'section'
   && node.props.children[0].type === 'h3'
   && node.props.children[0].props?.children === title)
 const switches = found.filter((node) => node.type?.primitiveName === 'Switch')
-check('it renders one switch per switchable feature', switches.length === 11,
+check('it renders one switch per switchable feature', switches.length === 10,
   `found ${switches.length}; rendered: ${found.map((node) => String(node.type?.primitiveName ?? node.type)).join(',')}`)
 const labels = switches.map((node) => node.props?.label).filter((v) => typeof v === 'string')
 for (const expected of [
   'wsl 命令执行', 'wsl-path 路径转换', 'wsl-env 能力体检',
-  'wsl-doctor 项目体检', 'wsl-bootstrap 安装工具链', 'wsl-term 终端接入',
+  'wsl-doctor 项目体检', 'wsl-bootstrap 安装工具链',
   '后台任务', '自动转换路径', '默认跟随会话工作区', '危险命令守卫', '管理员模式（root）',
 ]) {
   check(`it labels the ${expected} row`, labels.includes(expected), labels.join(' | '))
 }
+// The terminal tool has no switch: a terminal the user opens is the consent it needs, so a
+// switch row here would be a second, redundant permission — and the face of the panel would
+// keep asking for something opening a terminal already decided.
+check('there is no switch row for the terminal tool',
+  !labels.includes('wsl-term 终端接入'), labels.join(' | '))
 // The explanation and the risky marker are siblings inside a row, not props of the
 // switch itself, so look for the text the panel actually renders.
 const texts = []
@@ -267,11 +272,10 @@ for (const jargon of ['`runInBackground`', '`translatePaths`', '`workdir`', '`as
 check('the destructive-guard switch warns in its own tooltip',
   switches.some((node) => node.props?.label === '危险命令守卫' && /有风险/.test(String(node.props?.title))),
   JSON.stringify(switches.map((node) => node.props?.title)))
-// Three rows authorise something on their ON position rather than removing it: the
-// installer adds software, root runs a call privileged, and the terminal tool types
-// into a shell the user is watching. All have to say so, with wording that is not
-// the guard's own (whose OFF position is the risk).
-const cautionRows = ['wsl-bootstrap 安装工具链', '管理员模式（root）', 'wsl-term 终端接入']
+// Two rows authorise something on their ON position rather than removing it: the
+// installer adds software and root runs a call privileged. Both have to say so, with
+// wording that is not the guard's own (whose OFF position is the risk).
+const cautionRows = ['wsl-bootstrap 安装工具链', '管理员模式（root）']
 for (const label of cautionRows) {
   const row = switches.find((node) => node.props?.label === label)
   check(`the ${label} switch is marked 打开需谨慎`, row?.props?.title?.includes('打开需谨慎') === true, String(row?.props?.title))
@@ -284,16 +288,21 @@ check('the panel says the installer is off unless the user turns it on',
   rendered.slice(0, 200))
 check('and it explains that root is the authorisation itself',
   rendered.includes('管理员模式（root）') && rendered.includes('这项开关就是授权本身'), rendered.slice(0, 200))
-// The terminal row is the only one whose ON position touches the user's own shell,
-// so the panel has to name all three consequences: the model works in the terminal
-// the user opened, that terminal is read-only while it does, and MEASURED, the
+// With no switch row, the terminal note is the only place the panel can say what joining
+// the user's terminal means, so it has to name all three consequences: the model works in
+// the terminal the user opened, that terminal is read-only while it does, and MEASURED, the
 // keyboard does not come back by itself — the user clicks 接管输入.
-check('the panel says the terminal row works in the user\'s terminal, that it goes read-only, and how to take input back',
-  switches.some((node) => node.props?.label === 'wsl-term 终端接入'
-    && String(node.props?.title).includes('接管输入')
-    && String(node.props?.title).includes('只读')
-    && String(node.props?.title).includes('以你的身份')),
-  JSON.stringify(switches.find((node) => node.props?.label === 'wsl-term 终端接入')?.props?.title))
+// (Flattened inline: `textOf` is defined further down, after this point in the file.)
+const terminalNote = collect(found).flatMap((node) => {
+  const kids = node.props?.children
+  if (typeof kids === 'string') return [kids]
+  return Array.isArray(kids) ? kids.filter((kid) => typeof kid === 'string') : []
+}).join('\n')
+check('the panel says the terminal tool works in the user\'s terminal, that it goes read-only, and how to take input back',
+  terminalNote.includes('模型也可以在里面工作')
+  && terminalNote.includes('只读')
+  && terminalNote.includes('接管输入'),
+  terminalNote.slice(0, 400))
 // The panel now OFFERS the sidebar terminal's startup directory (one field, one 保存),
 // but it still must not print the patch RECIPE: pointing a terminal at WSL is the
 // user's own opt-in to make in their patch layer, and this panel prints no YAML. The

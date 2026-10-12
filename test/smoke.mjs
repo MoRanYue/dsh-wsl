@@ -1010,11 +1010,15 @@ async function unitTests() {
   eq('switches default to on', resolveConfig({}, {}).dangerGuard, true)
   eq('a non-boolean switch falls back instead of failing the mount',
     resolveConfig({}, { backgroundJobs: 'no' }).backgroundJobs, true)
-  // Both opt-in tools must NOT be mounted without a decision: the installer adds
-  // software, the terminal tool types into a shell the user is watching. Their
-  // defaults are asserted here rather than left to the schema's word.
-  eq('the tool switches default to the read-only set on, the two opt-in tools off',
-    Object.values(resolveConfig({}, {}).tools).join(','), 'true,true,true,true,false,false')
+  // The installer must NOT be mounted without a decision: it adds software. Its default
+  // is asserted here rather than left to the schema's word. `wsl-term` has no switch at
+  // all — opening a terminal in the sidebar is the consent it needs — so it is not in
+  // this object and cannot be switched off.
+  eq('the tool switches default to the read-only set on and the installer off',
+    Object.values(resolveConfig({}, {}).tools).join(','), 'true,true,true,true,false')
+  check('and the terminal tool has no switch of its own',
+    resolveConfig({}, {}).tools.term === undefined
+    && resolveConfig({}, { tools: { term: false } }).tools.term === undefined)
   eq('and root execution is off by default', resolveConfig({}, {}).allowRoot, false)
   eq('a partial tools object leaves the other switches alone',
     resolveConfig({}, { tools: { env: false } }).tools.env, false)
@@ -1533,19 +1537,21 @@ async function toolTests(tools, shim) {
   eq('the control mount rewrites it', rewrittenByDefault.stdout.trim(), '/mnt/c/keep/me')
 
   const wslOnlyTools = makeCtx(shim, {
-    settings: { tools: { wsl: true, path: false, env: false, doctor: false, bootstrap: false, term: false } },
+    settings: { tools: { wsl: true, path: false, env: false, doctor: false, bootstrap: false } },
   })
-  eq('a tool switch removes exactly that tool', Object.keys(wslOnlyTools).sort().join(','), 'wsl')
+  eq('a tool switch removes exactly that tool, and the switchless terminal tool stays',
+    Object.keys(wslOnlyTools).sort().join(','), 'wsl,wsl-term')
   const allOffTools = makeCtx(shim, {
-    settings: { tools: { wsl: false, path: false, env: false, doctor: false, bootstrap: false, term: false } },
+    settings: { tools: { wsl: false, path: false, env: false, doctor: false, bootstrap: false } },
   })
-  eq('all six switches off register nothing', Object.keys(allOffTools).length, 0)
-  eq('the control mount registers the four read-only tools',
-    Object.keys(tools).sort().join(','), 'wsl,wsl-doctor,wsl-env,wsl-path')
-  // Both opt-in tools are absent unless asked for: the installer because it adds
-  // software, the terminal tool because it types into a shell the user is watching.
-  const optInTools = makeCtx(shim, { settings: { tools: { bootstrap: true, term: true } } })
-  eq('each opt-in switch registers exactly its own tool',
+  eq('with every switch off, only the switchless terminal tool remains',
+    Object.keys(allOffTools).sort().join(','), 'wsl-term')
+  eq('the control mount registers the four read-only tools and the terminal tool',
+    Object.keys(tools).sort().join(','), 'wsl,wsl-doctor,wsl-env,wsl-path,wsl-term')
+  // The installer is absent unless asked for: it adds software. The terminal tool is not
+  // optional and not switchable — a terminal the user opens is the consent it needs.
+  const optInTools = makeCtx(shim, { settings: { tools: { bootstrap: true } } })
+  eq('the installer switch registers exactly its own tool',
     Object.keys(optInTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-doctor,wsl-env,wsl-path,wsl-term')
 
   // A volatile field is written into the same object the loader handed `apply` and
@@ -1570,26 +1576,24 @@ async function toolTests(tools, shim) {
   // flipped, and a switch that only works after a restart reads as broken. Measured
   // in the wild: a user turned a tool switch on 24 seconds after starting the app
   // and the tool was still missing, because registration only ran at mount.
-  const switchableSettings = { tools: { wsl: true, path: true, env: true, doctor: true, bootstrap: false, term: false } }
+  const switchableSettings = { tools: { wsl: true, path: true, env: true, doctor: true, bootstrap: false } }
   const switchableTools = makeCtx(shim, { settings: switchableSettings })
   const fireToolUpdate = switchableTools.handlers?.get('loader/volatile-update')
   check('the plugin listens for volatile updates that add tools', typeof fireToolUpdate === 'function')
-  eq('the opt-in tools start absent',
-    Object.keys(switchableTools).sort().join(','), 'wsl,wsl-doctor,wsl-env,wsl-path')
-  switchableSettings.tools.term = true
+  eq('the installer starts absent while the terminal tool is already there',
+    Object.keys(switchableTools).sort().join(','), 'wsl,wsl-doctor,wsl-env,wsl-path,wsl-term')
   switchableSettings.tools.bootstrap = true
   if (typeof fireToolUpdate === 'function') fireToolUpdate()
   eq('turning a tool switch on registers its tool live, without a restart',
     Object.keys(switchableTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-doctor,wsl-env,wsl-path,wsl-term')
-  switchableSettings.tools.term = false
   switchableSettings.tools.doctor = false
   if (typeof fireToolUpdate === 'function') fireToolUpdate()
   eq('turning a tool switch off retires its tool live too',
-    Object.keys(switchableTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-env,wsl-path')
+    Object.keys(switchableTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-env,wsl-path,wsl-term')
   switchableSettings.tools.doctor = true
   if (typeof fireToolUpdate === 'function') fireToolUpdate()
   eq('and it can come back afterwards',
-    Object.keys(switchableTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-doctor,wsl-env,wsl-path')
+    Object.keys(switchableTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-doctor,wsl-env,wsl-path,wsl-term')
 
   // The panel's 「复制插件信息」 gets the version from here, so a release never has to
   // edit a string in the client half: the Host half reads its own manifest.
@@ -2815,9 +2819,12 @@ async function toolTests(tools, shim) {
   // `asRoot` and still fits under 2500 because its prose was tightened to pay for
   // it. A future tool has to justify its own cost the same way.
   //
-  // A sixth tool (`wsl-term`) made the all-on total 7025, so the opt-in ceiling is
-  // 7300: close enough that the next line of prose has to be paid for by trimming
-  // something, rather than absorbed by slack.
+  // The sixth tool (`wsl-term`) is always mounted now — it has no switch, because opening a
+  // terminal in the sidebar is the consent it needs — so its cost is in the DEFAULT total,
+  // not only in the all-on one. Its description also carries the one-shot-versus-terminal
+  // protocol, which is prose the model needs to choose correctly: 5600 -> 6600 for the
+  // default mount, 7300 -> 7700 with the installer on. Still tight enough that the next
+  // paragraph of prose has to be paid for by trimming something.
   console.log('\nmodel-facing catalog budget')
   let catalog = 0
   for (const [name, tool] of Object.entries(tools)) {
@@ -2825,29 +2832,32 @@ async function toolTests(tools, shim) {
     catalog += cost
     check(`${name}: catalog cost within budget`, cost <= 2_500, `${cost} chars (description ${tool.description.length} + parameters ${JSON.stringify(tool.parameters).length})`)
   }
-  check('total catalog cost within budget', catalog <= 5_600, `${catalog} chars (~${Math.round(catalog / 4)} tokens)`)
-  // The two opt-in tools are absent from the default mount, so their cost is
-  // measured on a mount that switches them on: a tool that does not exist costs
-  // nothing, but an enabled one has to fit the same ceiling as the others.
+  check('total catalog cost within budget', catalog <= 6_600, `${catalog} chars (~${Math.round(catalog / 4)} tokens)`)
+  // The installer is absent from the default mount, so its cost is measured on a mount that
+  // switches it on: a tool that does not exist costs nothing, but an enabled one has to fit
+  // the same ceiling as the others.
   let optInCatalog = 0
   for (const [name, tool] of Object.entries(optInTools)) {
     const cost = tool.description.length + JSON.stringify(tool.parameters).length
     optInCatalog += cost
     check(`${name}: catalog cost within budget with every switch on`, cost <= 2_500, `${cost} chars (description ${tool.description.length} + parameters ${JSON.stringify(tool.parameters).length})`)
   }
-  check('total catalog cost with every tool switched on within budget', optInCatalog <= 7_300, `${optInCatalog} chars (~${Math.round(optInCatalog / 4)} tokens)`)
+  check('total catalog cost with every tool switched on within budget', optInCatalog <= 7_700, `${optInCatalog} chars (~${Math.round(optInCatalog / 4)} tokens)`)
   // The installer's own description is the only place the model learns that a
   // second call with `dryRun: false` is what installs, so that phrase is load-bearing.
   check('the installer says a second call is what installs',
     optInTools['wsl-bootstrap'] === undefined || optInTools['wsl-bootstrap'].description.includes('dryRun: false'),
     optInTools['wsl-bootstrap']?.description ?? '(not mounted)')
-  // The terminal tool's description is where the model learns that it may open a
-  // terminal and that the user's view goes read-only while it works.
-  check('the terminal tool says it may open a terminal and that the view goes read-only',
-    optInTools['wsl-term'] === undefined
-    || (optInTools['wsl-term'].description.includes('one is opened here')
-      && optInTools['wsl-term'].description.includes('read-only')),
-    optInTools['wsl-term']?.description ?? '(not mounted)')
+  // The terminal tool's description is where the model learns when to reach for a terminal
+  // at all (as opposed to a fresh shell), that it may open one, that the user's view goes
+  // read-only while it works, and that a terminal it opened is closed when the subtask ends.
+  check('the terminal tool carries its protocol and the handover warning',
+    tools['wsl-term'] === undefined
+    || (tools['wsl-term'].description.includes('one is opened here')
+      && tools['wsl-term'].description.includes('read-only')
+      && tools['wsl-term'].description.includes('`close` it when the subtask is done')
+      && tools['wsl-term'].description.includes('plain `wsl` tool for anything self-contained')),
+    tools['wsl-term']?.description ?? '(not mounted)')
 
   // The bundle patch must stay minimal: installing a tool plugin must not decide
   // which shell someone's terminals open. Pointing the desktop sidebar terminal at
@@ -3005,8 +3015,8 @@ const jobs = makeJobs()
 console.log(`backend: ${useReal ? `real DSH provider (${modulesRoot})` : 'local shim'}`)
 try {
   const tools = makeCtx(shim, { jobs })
-  check('the default mount registers the four read-only tools, not the installer',
-    Object.keys(tools).sort().join(',') === 'wsl,wsl-doctor,wsl-env,wsl-path', Object.keys(tools).join(','))
+  check('the default mount registers the read-only tools and the terminal tool, not the installer',
+    Object.keys(tools).sort().join(',') === 'wsl,wsl-doctor,wsl-env,wsl-path,wsl-term', Object.keys(tools).join(','))
   await unitTests()
   await terminalUnitTests()
   await toolTests(tools, shim)

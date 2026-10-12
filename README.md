@@ -19,8 +19,8 @@ of the speed (see [Notes](#notes)).
 
 ## Tools
 
-The plugin registers six tools (the last two can be switched off independently, and
-both `wsl-bootstrap` and `wsl-term` are OFF by default):
+The plugin registers six tools (only `wsl-bootstrap` has a switch of its own, and it is
+OFF by default):
 
 | Tool | Purpose |
 |---|---|
@@ -205,7 +205,14 @@ Three things to know before switching it on:
 Commands run as **you**, exactly as if you had typed them — and you see each one as a short,
 readable line (`__dsh_term_run 'make syn'`), because the first command in a terminal defines
 that one-line helper there. What comes back is the output between its two markers, plus the
-exit code. That is why this ships off by default, behind the panel's terminal switch.
+exit code. **There is no switch for this tool**: opening a terminal in the sidebar is the
+consent it needs, and from then on the model may join that terminal.
+
+Reach for it only when the work needs **one shell across several steps** — a long build worth
+watching go by, an interactive program, a directory or environment that has to persist. For
+everything self-contained the plain `wsl` tool is the better deal: a fresh shell per call runs
+in parallel, needs no terminal at all, and passes the dangerous-command guard, none of which is
+true here.
 
 ## Running privileged commands (`asRoot`)
 
@@ -300,7 +307,6 @@ explanation.
 | `wsl-env` 能力体检 | registers the `wsl-env` tool |
 | `wsl-doctor` 项目体检 | registers `wsl-doctor` |
 | `wsl-bootstrap` 安装工具链 | registers `wsl-bootstrap`, which may install into the distribution. **Off by default**, and its `dryRun` still has to be turned off per call |
-| `wsl-term` 终端接入 | lets the model work in a terminal you have open, and open one for itself when the session has none (that one is not shown in the sidebar). **Off by default**: it runs commands as you, the terminal is read-only while it works, and you click 「接管输入」 afterwards |
 | 后台任务 | whether `wsl` accepts `runInBackground` |
 | 自动转换路径 | the default for the per-call `translatePaths` |
 | 默认跟随会话工作区 | start in the session's directory instead of `~` when `workdir` is omitted. **On by default**: with it off, every relative path an agent writes lands in the Linux home, which is invisible from Explorer and grows the WSL disk image |
@@ -582,7 +588,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 795 host checks against real WSL (shim for ctx.subprocess) + 156 client checks
+npm test          # 800 host checks against real WSL (shim for ctx.subprocess) + 155 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
