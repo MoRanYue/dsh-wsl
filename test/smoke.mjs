@@ -437,7 +437,7 @@ function makeTerminalStub({
     },
     async write(agent, id, attachmentId, data) {
       if (writeError !== null) throw writeError
-      calls.write.push({ id, attachmentId, data })
+      calls.write.push({ id, attachmentId, data, at: Date.now() })
       if (typeof onWrite === 'function') for (const frame of onWrite(data) ?? []) push(frame)
     },
     async close(agent, id) {
@@ -2527,6 +2527,75 @@ async function toolTests(tools, shim) {
     const run = await makeTermTool(oneFrame).execute({ action: 'run', command: 'echo typed' }, { agent: termAgent })
     check('a single escaped snapshot is enough to type the command',
       run.summary.includes('typed anyway') && run.summary.includes('exit code: 0'), run.summary)
+  }
+  {
+    // Frames must survive the readiness polls. The loop keeps exactly ONE `next()` in flight:
+    // an async generator queues concurrent requests FIFO and hands each yielded frame to the one
+    // at the head, so abandoning a request silently swallows a future frame — here, the command's
+    // own markers — and the call then waits out its whole deadline for a command that finished.
+    const spaced = makeTerminalStub({
+      terminals: [termInfoOf('t1')],
+      screen: '\u001b[32mxiny@XINY9\u001b[0m:\u001b[1;34m/home\u001b[0m$ \u001b[K',
+      onWrite: (data) => {
+        const nonce = nonceOf(data)
+        if (nonce === null) return []
+        // The markers arrive over time, not with the write, so several poll windows pass first.
+        setTimeout(() => spaced.pushFrame({ type: 'output', data: `${START_PREFIX}${nonce}\r\n` }), 300)
+        setTimeout(() => spaced.pushFrame({ type: 'output', data: 'spaced output\r\n' }), 620)
+        setTimeout(() => spaced.pushFrame({ type: 'output', data: `${END_PREFIX}${nonce}:0\r\n` }), 940)
+        return []
+      },
+    })
+    const run = await makeTermTool(spaced).execute(
+      { action: 'run', command: 'echo spaced', timeoutMs: 6000 }, { agent: termAgent })
+    check('frames that arrive across poll windows are all seen',
+      run.summary.includes('spaced output') && run.summary.includes('exit code: 0'), run.summary)
+  }
+  {
+    // The shell lost the helper, so this call re-sends the definition — and the definition's own
+    // echo contains `#DSH-START:`. Taking that echo for a marker would hide the accurate message
+    // AND skip the `helperReady` reset, so the next call would refuse to define it again.
+    const echoOnly = makeTerminalStub({
+      terminals: [termInfoOf('echo-scan')],
+      onWrite: (data) => [{ type: 'output', data: `\r\n${String(data).replace(/\u0015/g, '')}\r\n` }],
+    })
+    const tool = makeTermTool(echoOnly)
+    const first = await tool.execute({ action: 'run', command: 'make syn', timeoutMs: 4000 }, { agent: termAgent })
+    check('a definition echo containing the marker is not mistaken for one',
+      first.summary.includes('nothing ran'), first.summary)
+    const second = await tool.execute({ action: 'run', command: 'make syn', timeoutMs: 4000 }, { agent: termAgent })
+    void second
+    const definitions = echoOnly.calls.write.filter((write) => write.data.includes(`${HELPER_NAME}()`)).length
+    check('and the helper is defined again on the next call', definitions >= 2, String(definitions))
+  }
+  {
+    // A snapshot that lands after the readiness window must still be respected: window anchored to
+    // the snapshot, not to the call. The screen never becomes a prompt, so the write can only be
+    // released by the window itself — and it must not happen on the first frame after the window.
+    const late = makeTerminalStub({ terminals: [termInfoOf('t1')], noSnapshot: true, screen: '' })
+    const started = Date.now()
+    setTimeout(() => late.pushFrame({ type: 'snapshot', sequence: 1, screen: 'wsl: still starting' }), 1800)
+    setTimeout(() => late.pushFrame({ type: 'output', data: 'still no prompt here' }), 1900)
+    const run = await makeTermTool(late).execute(
+      { action: 'run', command: 'echo late', timeoutMs: 8000 }, { agent: termAgent })
+    const wroteAt = (late.calls.write.at(-1)?.at ?? 0) - started
+    check('a late snapshot still holds the write for its own readiness window',
+      wroteAt >= 3200, `wrote at ${wroteAt} ms (expected >= 3200)`)
+    void run
+  }
+  {
+    // A cancelled call must hand the keyboard back at once instead of holding the attachment
+    // until its own deadline.
+    const cancellable = makeTerminalStub({ terminals: [termInfoOf('t1')] })
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 150)
+    const started = Date.now()
+    await makeTermTool(cancellable).execute(
+      { action: 'run', command: 'sleep 999', timeoutMs: 6000 },
+      { agent: termAgent, signal: controller.signal })
+    const elapsed = Date.now() - started
+    check('a cancelled call releases the terminal immediately',
+      elapsed < 3000 && cancellable.calls.detached >= 1, `elapsed ${elapsed} ms, detached ${cancellable.calls.detached}`)
   }
   {
     // A shell that has the helper and whose command hangs: the start marker arrives, then

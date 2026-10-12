@@ -755,6 +755,15 @@ check('the panel says the change needs a restart', savedText.includes('重启 DS
 // reads, and the panel would look like it worked while nothing changed.
 eq('the terminal save writes the patch, not the settings scope', ops.length, settingsWritesBefore)
 
+// (2b) A saved value settles to what the Host stored, not to the raw text that was typed: the
+// field must not keep showing whitespace that was trimmed away, nor an empty box for a path
+// that is set.
+const padded = fieldIn(mounted.tree())
+padded.input.props.onChange({ target: { value: '  /mnt/d/padded  ' } })
+postAnswer = { ok: true, path: '/mnt/d/padded', error: null }
+await fieldIn(mounted.tree()).save.props.onClick()
+eq('a saved path settles to the stored value', fieldIn(mounted.tree()).input?.props?.value, '/mnt/d/padded')
+
 // (3) A refused save shows the Host's reason instead of pretending it worked.
 const retry = fieldIn(mounted.tree())
 retry.input.props.onChange({ target: { value: '/mnt/d/nowhere' } })
