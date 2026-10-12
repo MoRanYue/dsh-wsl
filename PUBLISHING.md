@@ -50,6 +50,22 @@ both that the entry stays relative and that it resolves.
    DSH_SUBPROCESS_LOCAL=/path/to/dsh/node_modules npm run test:real
    ```
 
+   **`test:real` silently SKIPS when `DSH_SUBPROCESS_LOCAL` is unset** — it prints one
+   `skipped:` line and exits 0, so a green chain is not evidence that it ran. Read the output
+   (or check for `REAL SEAM: all checks passed`), not just the exit code.
+
+   On the **desktop build** the modules it needs live inside `app.asar`, which is not a
+   directory Node can import from, and the profile's own `node_modules` holds only
+   `schemastery`/`cosmokit`. Extract the tree once and point the variable at it:
+
+   ```sh
+   # dsh/node_modules from the app bundle -> a real directory
+   node scripts/pull-asar-dir.mjs "$DSH_DESKTOP/resources/app.asar" /tmp/dsh-mods dsh/node_modules
+   DSH_SUBPROCESS_LOCAL=/tmp/dsh-mods/dsh/node_modules npm run test:real
+   ```
+
+   (Any extractor will do; the point is a `node_modules` containing `@deepseek-ai/*`.)
+
 2. Bump, sync, commit, tag, push:
 
    ```sh
