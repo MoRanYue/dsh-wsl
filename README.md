@@ -202,9 +202,10 @@ Three things to know before switching it on:
   bottom, so what comes back is the end of the output; the complete text is written
   to a file and the result names it.
 
-Commands run as **you**, exactly as if you had typed them — and you see the command
-line appear in the terminal — which is why this ships off by default, behind the
-panel's terminal switch.
+Commands run as **you**, exactly as if you had typed them — and you see each one as a short,
+readable line (`__dsh_term_run 'make syn'`), because the first command in a terminal defines
+that one-line helper there. What comes back is the output between its two markers, plus the
+exit code. That is why this ships off by default, behind the panel's terminal switch.
 
 ## Running privileged commands (`asRoot`)
 
@@ -581,7 +582,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 763 host checks against real WSL (shim for ctx.subprocess) + 155 client checks
+npm test          # 774 host checks against real WSL (shim for ctx.subprocess) + 155 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

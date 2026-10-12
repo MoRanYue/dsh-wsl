@@ -43,8 +43,9 @@ import {
 import { createWslDoctorTool } from '../lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from '../lib/tools/wsl-bootstrap.js'
 import {
-  appendCapture, autoTerminalIds, clipTail, describeSessionCwd, extractCommand, inputLine, markerPair,
-  OPENED_TERMINAL_NOTE, pickTerminal, renderTerminals, spillLine, stripAnsi, wrapCommand,
+  appendCapture, autoTerminalIds, clipTail, describeSessionCwd, END_PREFIX, extractHelperResult, HELPER_NAME,
+  helperCall, helperDefinition, inputLine, OPENED_TERMINAL_NOTE, pickTerminal, renderTerminals, spillLine,
+  START_PREFIX, stripAnsi,
 } from '../lib/terminal.js'
 import { createWslTermTool } from '../lib/tools/wsl-term.js'
 
@@ -1308,29 +1309,46 @@ async function terminalUnitTests() {
   eq('stripAnsi drops other control bytes', stripAnsi('a\u0007b\u0000c'), 'abc')
   eq('stripAnsi tolerates a non-string', stripAnsi(undefined), '')
 
-  const marker = markerPair('abc123')
-  const wrapped = wrapCommand('echo hi', marker)
-  check('the wrapped command carries both markers with the nonce',
-    wrapped.includes(marker.start) && wrapped.includes(marker.end), wrapped)
-  check('the wrapped command keeps the caller\'s command verbatim', wrapped.includes('echo hi'), wrapped)
-  check('the wrapped command reports $? of the command, not of printf',
-    wrapped.indexOf('echo hi') < wrapped.indexOf('__dsh_term_rc=$?'), wrapped)
-  rejects('an empty command is refused before anything is typed', () => wrapCommand('  ', marker), /non-empty command/)
+  // The helper is what keeps the line the USER reads readable: one short call per command
+  // instead of the markers spelled out around it.
+  const definition = helperDefinition()
+  check('the helper definition names the helper and both markers',
+    definition.startsWith(`${HELPER_NAME}()`) && definition.includes(START_PREFIX) && definition.includes(END_PREFIX),
+    definition.slice(0, 80))
+  check('the helper is POSIX (no local, no $RANDOM)',
+    !/\blocal\b/.test(definition) && !definition.includes('$RANDOM'), definition)
+  check('the helper prints the exit code of the command, not of printf',
+    definition.indexOf('eval "$1"') < definition.indexOf('__dsh_r=$?'), definition)
 
-  // The capture a real terminal produces: the echoed line, then the markers.
+  eq('a call is one short readable line', helperCall('make syn'), `${HELPER_NAME} 'make syn'`)
+  eq('a single quote in the command is escaped, not broken',
+    helperCall("echo it's fine"), `${HELPER_NAME} 'echo it'\\''s fine'`)
+  rejects('an empty command is refused before anything is typed', () => helperCall('   '), /non-empty command/)
+  rejects('a two-line command is refused (it would be submitted early)',
+    () => helperCall('echo a\necho b'), /single command line/)
+
+  // The capture a real terminal produces: the echoed call, then the markers with the
+  // helper's own nonce, which the parser reads back.
   const capture = stripAnsi([
-    "\u001b[1;32m$ \u001b[0mprintf '%s\\n' '__DSH_TERM_START_abc123__'; echo hi; __dsh_term_rc=$?; printf '%s%s\\n' '__DSH_TERM_END_abc123:' \"$__dsh_term_rc\"\r",
-    '__DSH_TERM_START_abc123__\r\n',
+    "\u001b[1;32m$ \u001b[0m__dsh_term_run 'echo hi'\r",
+    `${START_PREFIX}4242-1\r\n`,
     'hi\r\n',
-    '__DSH_TERM_END_abc123:0\r\n',
+    `${END_PREFIX}4242-1:0\r\n`,
     'xiny@host:~/dir$ ',
   ].join(''))
-  const extracted = extractCommand(capture, marker)
-  check('the command output is extracted between the markers', extracted.output === 'hi', JSON.stringify(extracted))
+  const extracted = extractHelperResult(capture)
+  check('the command output is extracted between the helper markers', extracted.output === 'hi', JSON.stringify(extracted))
   eq('and its exit code is read from the end marker', extracted.exitCode, 0)
-  check('a capture without the end marker is incomplete', extractCommand('__DSH_TERM_START_abc123__\r\nhi\r\n', marker).complete === false)
-  const failed = extractCommand(`${marker.start}\nnope\n${marker.end}1\n`, marker)
+  check('a capture without the end marker is incomplete',
+    extractHelperResult(`${START_PREFIX}4242-1\r\nhi\r\n`).complete === false)
+  const failed = extractHelperResult(`${START_PREFIX}4242-2\nnope\n${END_PREFIX}4242-2:1\n`)
   check('a non-zero exit code survives', failed.exitCode === 1 && failed.output === 'nope', JSON.stringify(failed))
+  // Two calls in the same terminal: the parser must not mix their regions up.
+  const twoCalls = `${START_PREFIX}7-1\naaa\n${END_PREFIX}7-1:0\n${START_PREFIX}7-2\nbbb\n${END_PREFIX}7-2:3\n`
+  const second = extractHelperResult(twoCalls.slice(twoCalls.indexOf(`${START_PREFIX}7-2`)))
+  check('a later call reads its own region', second.output === 'bbb' && second.exitCode === 3, JSON.stringify(second))
+  check('an unrelated capture is not complete',
+    extractHelperResult('xiny@host:~$ ls\nfile\n').complete === false)
 
   const one = { id: 'a', state: 'running', title: 'bash' }
   const two = { id: 'b', state: 'running', title: 'bash' }
@@ -2311,12 +2329,14 @@ async function toolTests(tools, shim) {
     cwd: '/home/xiny', cols: 120, rows: 30, state: 'running', exitCode: null,
   })
   const makeTermTool = (stub) => createWslTermTool({ ctx: { get: () => stub }, config: CONFIG })
+  /** A shell that has the helper: it answers a call with the markers it would print. */
   const replyWithCommand = (data) => {
-    const nonce = /__DSH_TERM_START_(\w+)__/.exec(data)?.[1]
+    const call = new RegExp(`${HELPER_NAME} '`).exec(data)
+    if (call === null) return [] // the definition line: defining prints nothing
     return [
-      { type: 'output', data: `__DSH_TERM_START_${nonce}__\r\n` },
+      { type: 'output', data: `${START_PREFIX}99-1\r\n` },
       { type: 'output', data: 'hi from the terminal\r\n' },
-      { type: 'output', data: `__DSH_TERM_END_${nonce}:0\r\n` },
+      { type: 'output', data: `${END_PREFIX}99-1:0\r\n` },
     ]
   }
 
@@ -2343,11 +2363,23 @@ async function toolTests(tools, shim) {
     check('run returns the command output and its exit code',
       run.summary.includes('hi from the terminal') && run.summary.includes('exit code: 0'), run.summary)
     check('run clears the pending input line before typing', stub.calls.write[0].data.startsWith('\u0015'), JSON.stringify(stub.calls.write[0].data.slice(0, 6)))
-    check('run types the marker-wrapped command into the terminal',
-      stub.calls.write[0].data.includes('__DSH_TERM_START_') && stub.calls.write[0].data.endsWith('\r'),
-      JSON.stringify(stub.calls.write[0].data.slice(0, 60)))
+    // The whole point of the helper: the FIRST write defines it once, and the line that runs
+    // the command is short enough to read.
+    check('run defines the helper once, then calls it with the command',
+      stub.calls.write[0].data.includes(`${HELPER_NAME}()`) && stub.calls.write[1].data.includes(`${HELPER_NAME} 'echo hi from the terminal'`),
+      JSON.stringify(stub.calls.write.map((write) => write.data.slice(0, 44))))
+    check('and both lines end with Enter',
+      stub.calls.write[0].data.endsWith('\r') && stub.calls.write[1].data.endsWith('\r'),
+      JSON.stringify(stub.calls.write.map((write) => write.data.slice(-2))))
+    // A second command in the same terminal reuses the definition rather than re-sending it.
+    const again = await makeTermTool(stub).execute({ action: 'run', command: 'echo again' }, { agent: termAgent })
+    check('a second run reuses the helper', again.summary.includes('exit code: 0'), again.summary.slice(-80))
+    eq('and does not define it again',
+      stub.calls.write.filter((write) => write.data.includes(`${HELPER_NAME}()`)).length, 1)
+    eq('the second call carries the second command',
+      stub.calls.write.at(-1).data.includes(`${HELPER_NAME} 'echo again'`), true)
     eq('run does not open a second terminal when one exists', stub.calls.create.length, 0)
-    eq('run detaches as well', stub.calls.detached, 1)
+    eq('run detaches as well', stub.calls.detached, 2)
     // Measured on a real sidebar terminal: after this tool detaches, the user's view
     // stays read-only until they click 接管输入, so the model must be told to say so.
     check('run tells the model the user has to take the input back',
@@ -2381,12 +2413,28 @@ async function toolTests(tools, shim) {
       stub.calls.create.map((call) => call.id).join(','), 'dsh-agent,dsh-agent-2')
   }
   {
-    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], onWrite: () => [] })
+    // A shell that has the helper and whose command hangs: the start marker arrives, then
+    // nothing, so the deadline is what ends the call.
+    const stub = makeTerminalStub({
+      terminals: [termInfoOf('t1')],
+      onWrite: (data) => (data.includes(`${HELPER_NAME} '`) ? [{ type: 'output', data: `${START_PREFIX}99-1\r\n` }] : []),
+    })
     const run = await makeTermTool(stub).execute({ action: 'run', command: 'sleep 99', timeoutMs: 60 }, { agent: termAgent })
     check('a command that never returns is reported as still running',
       run.summary.includes('still running after 60 ms'), run.summary)
     check('and the caller is told how to stop it', run.summary.includes('interrupt'), run.summary)
     eq('a timeout still hands the keyboard back', stub.calls.detached, 1)
+  }
+  {
+    // A shell WITHOUT the helper (a new shell in the same terminal, or `unset -f`): nothing
+    // ran, and saying so beats reporting a timeout for a command that never started.
+    const silent = makeTerminalStub({ terminals: [termInfoOf('fresh-1')], onWrite: () => [] })
+    const run = await createWslTermTool({ ctx: { get: () => silent }, config: CONFIG })
+      .execute({ action: 'run', command: 'echo hi', timeoutMs: 60 }, { agent: termAgent })
+    check('a shell without the helper is reported as "nothing ran"',
+      run.summary.includes('nothing ran') && run.summary.includes(HELPER_NAME), run.summary)
+    check('and the next call promises to define it again',
+      run.summary.includes('next `run` defines it again'), run.summary.slice(-200))
   }
   {
     const stub = makeTerminalStub({
@@ -2401,11 +2449,11 @@ async function toolTests(tools, shim) {
   // Long output: this is the case that produced the rule. A build log's answer is at
   // the bottom, so the tail comes back inline and the whole capture is filed.
   const longFrames = (data) => {
-    const nonce = /__DSH_TERM_START_(\w+)__/.exec(data)?.[1]
+    if (!data.includes(`${HELPER_NAME} '`)) return []
     return [
-      { type: 'output', data: `__DSH_TERM_START_${nonce}__\r\n` },
+      { type: 'output', data: `${START_PREFIX}99-1\r\n` },
       { type: 'output', data: `START-OF-LOG\r\n${'x'.repeat(25_000)}\r\nTHE-ACTUAL-ANSWER\r\n` },
-      { type: 'output', data: `__DSH_TERM_END_${nonce}:0\r\n` },
+      { type: 'output', data: `${END_PREFIX}99-1:0\r\n` },
     ]
   }
   const termCtx = (stub, spillStore) => ({
