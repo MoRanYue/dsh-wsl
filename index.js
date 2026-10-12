@@ -46,6 +46,7 @@ import { createWslEnvTool } from './lib/tools/wsl-env.js'
 import { createWslDoctorTool } from './lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from './lib/tools/wsl-bootstrap.js'
 import { createWslTermTool } from './lib/tools/wsl-term.js'
+import { createSubtaskLog, projectSubtask } from './lib/subtasks.js'
 
 export const name = 'tool-wsl'
 export const inject = ['tools', 'subprocess']
@@ -135,6 +136,8 @@ const INFO_ROUTE = '/dsh-wsl-tool/info'
  * `POST` -> `{ ok, path, error }`, body `{ path }`; `path: ''` removes the flag.
  */
 const TERMINAL_ROUTE = '/dsh-wsl-tool/terminal-cwd'
+/** What the client's dock row above the composer reads. */
+const SUBTASK_ROUTE = '/dsh-wsl-tool/subtasks'
 
 /** The profile patch layer this plugin reads and edits, under `DSH_PROFILE_DIR`. */
 const PATCH_FILE_NAME = 'cordis.patch.yml'
@@ -633,6 +636,10 @@ export function apply(ctx, settings = {}) {
   // volatile-update hook below can change it in place without remounting.
   const config = resolveConfig(process.env, settings)
   const runner = createRunner(ctx, config)
+  // One log for the whole run, one bucket per conversation: the terminal tool records into it
+  // and the client's dock row reads it back over the route below. It is in-memory on purpose —
+  // the terminals it describes disappear with this run too.
+  const subtasks = createSubtaskLog()
 
   // ------------------------------------------------------------- tool switches
   //
@@ -658,7 +665,7 @@ export function apply(ctx, settings = {}) {
     // point of the tool. It reads the `terminalController` service lazily, so a
     // build without a sidebar terminal still mounts this plugin and reports that
     // clearly instead of failing to load.
-    term: () => createWslTermTool({ ctx, config }),
+    term: () => createWslTermTool({ ctx, config, subtasks }),
   }
   // Tools with no switch of their own are always mounted.
   const alwaysOn = new Set(['term'])
@@ -732,6 +739,30 @@ export function apply(ctx, settings = {}) {
         }, 'dsh-wsl-tool: self-info route')
         publish(TERMINAL_ROUTE, (request, response) => serveTerminalCwd(ctx, request, response),
           'dsh-wsl-tool: terminal-cwd route')
+        // The client's dock row above the composer reads this: which terminal subtasks this
+        // conversation has, running first, with each one's result, commands and shell decision.
+        // Every conversation is returned and the client filters by its own session id, because
+        // this route has no session of its own.
+        publish(SUBTASK_ROUTE, (request, response) => {
+          if (request.method !== 'GET') {
+            response.writeHead(405, { allow: 'GET' })
+            response.end()
+            return
+          }
+          const sessions = {}
+          for (const [sessionId, log] of Object.entries(subtasks.snapshot())) {
+            sessions[sessionId] = {
+              total: log.total,
+              running: log.running,
+              entries: log.entries.map(projectSubtask),
+            }
+          }
+          response.writeHead(200, {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+          })
+          response.end(JSON.stringify({ sessions }))
+        }, 'dsh-wsl-tool: subtask route')
       })
     }
   } catch (error) {
