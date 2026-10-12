@@ -9,13 +9,17 @@ real Linux kernel and bash, exit codes and signals, timeouts, truncation with sp
 files, background jobs the built-in job tools read back, stdin, and automatic
 Windows/WSL path translation.
 
+It can also work the way you would, in a **terminal you can watch**: one shell per piece
+of work, every command visible as it is typed, a record of each piece above the composer,
+and the keyboard back in your hands with one click.
+
 Two limits are worth knowing before you rely on it. A `wsl` call runs below DSH's
 sandbox, so a file policy does not confine it (see [Sandboxing](#sandboxing)); and a
 project kept on a Windows drive keeps **Windows** filesystem semantics — no POSIX
 permissions, case-insensitive names, no file-change notifications — at a fraction
 of the speed (see [Notes](#notes)).
 
-![What the plugin does, in order of importance](assets/market-preview-features-5.png)
+![What the plugin does, in order of importance](assets/market-preview-terminal-6.png)
 
 ## Tools
 
@@ -29,7 +33,7 @@ OFF by default):
 | `wsl-env` | Summarize the WSL environment (distros, kernel, cpu, mem, disk). |
 | `wsl-doctor` | Compare what a project needs with what the distribution has — including commands that are really Windows binaries. Read-only. |
 | `wsl-bootstrap` | Install the missing toolchain inside the distribution, from a fixed recipe list, plan first. |
-| `wsl-term` | Read and drive the terminal the sidebar opened, instead of a fresh shell per call. |
+| `wsl-term` | Work in the session's terminal: one shell per piece of work, with a record of each above the composer. |
 
 ### `wsl`
 
@@ -164,31 +168,46 @@ runs as root; a failing step stops the run.
 ### `wsl-term`
 
 Every other tool here starts a **fresh shell per call**. That is what makes them
-safe to run in parallel, and it stays the default. The sidebar terminal is the other
-way to work: it is a shell you already have open, with your directory, your
-environment and your history.
+safe to run in parallel, and it stays the default. `wsl-term` is the other way
+round: **one shell for one piece of work**. It is for the jobs where the shell's own
+state is the point — a build worth watching, an interactive program, a directory or
+an environment that has to survive between steps.
 
 `wsl-term` works in that terminal:
 
 ```
 wsl-term({ action: "list" })                                  → which terminals are open
 wsl-term({ action: "read" })                                  → the current screen
-wsl-term({ action: "run", command: "make sta" })               → runs it there, returns output and exit code
+wsl-term({ action: "run", command: "make sta", subtask: "跑通 sta 流程" })
+                                                               → runs it there, returns output and exit code
 wsl-term({ action: "input", data: "ls", submit: true })        → raw keystrokes
 wsl-term({ action: "interrupt" })                              → Ctrl-C
 wsl-term({ action: "close", id: "…" })                         → ends a terminal you name
+wsl-term({ action: "subtask-done", subtask: "跑通 sta 流程", result: "三条连跑全通过" })
+                                                               → writes the result and decides the shell
 ```
 
-**Open a terminal in the sidebar yourself first.** `run` and `read` then work in that
-one (the newest running terminal when you name no id), and you can watch what
-happens. If the session has no terminal at all, the tool opens one for itself: it is
-a normal shell for that session, but **it does not appear as a sidebar tab**, so open
-your own when you want to see or use it. Terminals also belong to the current DSH
-run — restarting DSH ends them — and the app can re-create one under a **new id** when
-its tab is re-created, so an id from an earlier answer may no longer exist. The tool
-then falls back to the newest running terminal and says which one it used.
+#### Work is recorded as subtasks
 
-Three things to know before switching it on:
+Naming a `subtask` on `run` opens a record for that piece of work and logs every command
+it ran with its exit code. The dock above the composer lists those records — running ones
+first, then finished ones with their result — and clicking a row opens its detail: the
+terminal's full description, the result, and the commands. `subtask-done` writes the
+result and decides the shell: `keepTerminal: true` (the default) leaves it idle for a
+follow-up step, `false` closes a shell the tool opened. A terminal **you** opened is never
+closed this way, and `close` is the other way to end one. The records live in memory for
+the current DSH run — they describe this conversation's work, and a restart clears them
+along with the terminals.
+
+You do not have to open a terminal first. `run` and `read` work in the newest running
+terminal of this session, and you can watch what happens; if the session has none, the tool
+opens its own — a normal shell for that session, but **not a sidebar tab**, so open your own
+when you want to see or use it. Terminals belong to the current DSH run — restarting DSH
+ends them — and the app can re-create one under a **new id** when its tab is re-created, so
+an id from an earlier answer may no longer exist. The tool then falls back to the newest
+running terminal and says which one it used.
+
+Four things worth knowing:
 
 - **The terminal is read-only while the model works in it, and it stays read-only
   afterwards**: click **「接管输入」** in that terminal to type again. If you are typing
@@ -205,8 +224,10 @@ Three things to know before switching it on:
 Commands run as **you**, exactly as if you had typed them — and you see each one as a short,
 readable line (`__dsh_term_run 'make syn'`), because the first command in a terminal defines
 that one-line helper there. What comes back is the output between its two markers, plus the
-exit code. **There is no switch for this tool**: opening a terminal in the sidebar is the
-consent it needs, and from then on the model may join that terminal.
+exit code. **There is no switch for this tool**: it is always available, the terminal it
+works in is either yours or one it opened for this session, and every command it types is
+visible there. A destructive command still stops at the guard unless the caller says it is
+intended.
 
 Reach for it only when the work needs **one shell across several steps** — a long build worth
 watching go by, an interactive program, a directory or environment that has to persist. For

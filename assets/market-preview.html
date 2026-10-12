@@ -59,55 +59,55 @@
     <div class="mark">W</div>
     <div>
       <h1>WSL 工具</h1>
-      <div class="sub">让 DSH 直接用上你的 WSL：跑 Linux 命令、转换路径、体检环境，也能加入你打开的终端。</div>
+      <div class="sub">让 DSH 在你的 WSL 里干活：一个终端跨多步、命令全程可见、进度就在输入框上方。</div>
     </div>
   </header>
 
   <div class="grid">
     <div class="item">
       <div class="num">01</div>
-      <div class="name">执行 Linux 命令</div>
-      <div class="say">每条命令都给退出码、耗时和失败原因；输出太长只回结论，完整内容存成文件。</div>
+      <div class="name">一件事一个终端</div>
+      <div class="say">每件事给一个常驻 shell：目录、环境、历史都留着，不用每条命令重开。</div>
     </div>
     <div class="item">
       <div class="num">02</div>
-      <div class="name">长任务后台跑</div>
-      <div class="say">构建、综合、下载不用占着对话，随时回来看进度和结果。</div>
+      <div class="name">命令全程可见</div>
+      <div class="say">每条命令在终端里是一行短而可读的样子；拿回来的是输出和退出码。</div>
     </div>
     <div class="item">
       <div class="num">03</div>
-      <div class="name">路径互转</div>
-      <div class="say">Windows 路径和 WSL 路径来回换，不用自己拼 /mnt/…。</div>
+      <div class="name">键盘随时拿回</div>
+      <div class="say">模型工作期间终端只读；点「接管输入」，键盘立刻回到你手上。</div>
     </div>
     <div class="item">
       <div class="num">04</div>
-      <div class="name">环境体检</div>
-      <div class="say">一次说清这台机器能干什么、项目缺什么、哪些命令其实是 Windows 那边的。</div>
+      <div class="name">子任务看得见</div>
+      <div class="say">输入框上方列出本对话的子任务，正在运行的置顶，点开有结果和命令。</div>
     </div>
     <div class="item">
       <div class="num">05</div>
-      <div class="name">一起用终端</div>
-      <div class="say">你打开的终端，模型也能在里面干活：命令你看得见，工作期间终端只读。</div>
+      <div class="name">做完决定去留</div>
+      <div class="say">一件事收尾时，终端可以留着等你接着用，也可以直接收掉。</div>
     </div>
     <div class="item">
       <div class="num">06</div>
+      <div class="name">长输出不丢</div>
+      <div class="say">太长了只回结论，完整内容存成文件；跑太久的命令可以中断。</div>
+    </div>
+    <div class="item">
+      <div class="num">07</div>
       <div class="name">危险命令先拦一道</div>
       <div class="say">删除、分区、关机这类操作，要先明确同意才会执行。</div>
     </div>
     <div class="item">
-      <div class="num">07</div>
-      <div class="name">面板一处设置</div>
-      <div class="say">工作目录、超时、权限这些都收在侧边栏一处，改完即时生效。</div>
-    </div>
-    <div class="item">
       <div class="num">08</div>
-      <div class="name">可选：终端也开在 WSL 里</div>
-      <div class="say">想让侧边栏的新终端直接落在 WSL 里，按一页说明启用即可。</div>
+      <div class="name">自洽命令不必开终端</div>
+      <div class="say">一次性的命令走 <b>wsl</b>：全新 shell、可以并行、不占你的键盘。</div>
     </div>
   </div>
 
   <footer>
-    <span><strong>命令在你的 WSL 里以你的身份运行</strong>，不经过 DSH 的沙箱；终端协作结束后，点「接管输入」拿回键盘。</span>
+    <span><strong>命令在你的 WSL 里以你的身份运行</strong>，不经过 DSH 的沙箱；终端属于本次 DSH 运行，重启即结束。</span>
   </footer>
 </body>
 </html>

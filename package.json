@@ -1,7 +1,7 @@
 {
   "name": "dsh-wsl-tool",
-  "version": "1.12.2",
-  "description": "WSL tools for DSH: run Linux commands with real exit codes, timeouts and the full output saved to a file, keep long builds running in the background, convert paths, report what the machine can do, check a project's toolchain, and work alongside you in a terminal you open. Destructive commands need consent and root is one panel switch. Commands run as you inside WSL, below the DSH sandbox.",
+  "version": "1.12.3",
+  "description": "WSL tools for DSH: run Linux commands with exit codes, timeouts, full output in a file, background builds, path conversion, environment checks. It also works in a real terminal: one shell per piece of work, every command visible as it runs, a record of each piece above the composer, and the keyboard back to you on one click. Destructive commands need consent; root is a panel switch. Commands run as you in WSL, below the DSH sandbox.",
   "type": "module",
   "main": "index.js",
   "exports": {
