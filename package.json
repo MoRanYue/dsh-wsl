@@ -1,6 +1,6 @@
 {
   "name": "dsh-wsl-tool",
-  "version": "1.12.3",
+  "version": "1.12.4",
   "description": "WSL tools for DSH: Linux commands with exit codes, timeouts, stdin and output spill files; background jobs for long builds; path conversion; environment and project checks; install missing tools. Terminal: one session per piece of work, commands visible as they run, each subtask recorded above the composer, and the keyboard back on one click. Destructive commands need consent; root is a panel switch. Commands run as you, below the DSH sandbox.",
   "type": "module",
   "main": "index.js",
