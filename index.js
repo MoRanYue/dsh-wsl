@@ -750,11 +750,32 @@ export function apply(ctx, settings = {}) {
             return
           }
           const sessions = {}
+          // The terminal service is what keeps the row honest: an entry whose terminal no longer
+          // exists reads as closed, whatever the log last heard. Read once per session; its
+          // absence is not an error — the projection falls back to what the log recorded.
+          let controller = null
+          try {
+            controller = typeof ctx.get === 'function' ? ctx.get('terminalController') : null
+          } catch {
+            controller = null
+          }
           for (const [sessionId, log] of Object.entries(subtasks.snapshot())) {
+            let live = null
+            if (controller !== null && typeof controller.list === 'function') {
+              try {
+                live = controller.list(sessionId)
+              } catch {
+                live = null
+              }
+            }
+            const byId = new Map((Array.isArray(live) ? live : []).map((info) => [String(info?.id), info]))
+            const entries = log.entries.map((entry) => (entry.terminalId === null
+              ? projectSubtask(entry)
+              : projectSubtask(entry, byId.get(String(entry.terminalId)) ?? null)))
             sessions[sessionId] = {
               total: log.total,
-              running: log.running,
-              entries: log.entries.map(projectSubtask),
+              running: entries.filter((entry) => entry.status !== 'done').length,
+              entries,
             }
           }
           response.writeHead(200, {
