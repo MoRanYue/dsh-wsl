@@ -20,7 +20,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { apply } from '../index.js'
+import { apply, buildConfig } from '../index.js'
 import { resolveConfig } from '../lib/config.js'
 import { pickSchemaBuilder } from '../lib/schema.js'
 import { buildCdCommand, quotePath, shellQuote, windowsPathToWsl } from '../lib/paths.js'
@@ -375,9 +375,13 @@ function makeStubRunner(answer = {}) {
  */
 function makeTerminalStub({
   terminals = [], screen = '$ ', onWrite, writeError = null, createError = null,
-  noSnapshot = false, stallOnReturn = false,
+  noSnapshot = false, stallOnReturn = false, stallOnCreate = false, stallOnWrite = false,
+  stallOnClose = false,
 } = {}) {
   const calls = { list: [], create: [], follow: [], write: [], close: [], detached: 0 }
+  // Mutable, so a test can make ONE later call stop answering (the close that follows a finished
+  // subtask, say) without hanging the calls before it.
+  const stall = { create: stallOnCreate, write: stallOnWrite, close: stallOnClose }
   const infos = [...terminals]
   const queue = []
   const waiters = []
@@ -398,6 +402,7 @@ function makeTerminalStub({
   return {
     calls,
     infos,
+    stall,
     /** Push a frame as if it arrived from the host, for tests that need one later. */
     pushFrame: push,
     list(sessionId) {
@@ -406,6 +411,7 @@ function makeTerminalStub({
     },
     async create(agent, request, signal) {
       calls.create.push({ agentId: agent.id, id: request.id, cols: request.cols, rows: request.rows, signal })
+      if (stall.create) await new Promise(() => {})
       if (typeof createError === 'function') {
         const error = createError(request)
         if (error !== null) throw error
@@ -439,10 +445,12 @@ function makeTerminalStub({
     async write(agent, id, attachmentId, data) {
       if (writeError !== null) throw writeError
       calls.write.push({ id, attachmentId, data, at: Date.now() })
+      if (stall.write) await new Promise(() => {})
       if (typeof onWrite === 'function') for (const frame of onWrite(data) ?? []) push(frame)
     },
     async close(agent, id) {
       calls.close.push(id)
+      if (stall.close) await new Promise(() => {})
       const index = infos.findIndex((info) => info.id === id)
       if (index >= 0) infos.splice(index, 1)
     },
@@ -928,8 +936,32 @@ async function unitTests() {
     'shutdown -h now',
     'echo x > /dev/sda',
     ':(){ :|:& };:',
+    // Wrappers put the real command after their own option VALUES. `commandWord` skipped the
+    // wrapper and its flags but stopped on the value (`root`, `19`, `5`), so the tool that
+    // followed was never judged at all — every one of these was ALLOWED before the fix.
+    'sudo -u root mkfs.ext4 /dev/sdb1',
+    'sudo -u root shutdown -h now',
+    'sudo --user root poweroff',
+    'nice -n 19 reboot',
+    'timeout 5 reboot',
+    'xargs -I{} poweroff',
+    'xargs -0 rm -rf /tmp/x',
+    'sh -c "reboot"',
+    'bash -c "mkfs.ext4 /dev/sdb1"',
+    // `-i` is a flag, not a value option: skipping its "value" would hide the command after it.
+    'sudo -i reboot',
+    // Destructive forms the tables did not list at all.
+    'find / -delete',
+    'find . -name "*.o" -delete',
+    'truncate -s0 /dev/sda',
+    'mke2fs /dev/sda',
+    'git clean -fdx',
+    'git clean -fd',
+    'git clean --force',
+    'echo x > /dev/mapper/vg-lv',
+    'echo x >> /dev/dm-0',
   ]) {
-    check(`refuses ${JSON.stringify(command)}`, bad(command) !== null)
+    check(`refuses ${JSON.stringify(command)}`, bad(command) !== null, `reason: ${bad(command)}`)
   }
   for (const command of [
     'echo hello',
@@ -957,6 +989,21 @@ async function unitTests() {
     'echo "reboot" > /tmp/note.txt',
     'systemctl status ssh',
     'fdisk-preview --help',
+    // Quoted text that MENTIONS a destructive command is not one. Blanking literal quoted spans
+    // is what stops these from costing the caller an `allowDangerous` — all five were refused.
+    'grep -rn "rm -rf" docs/',
+    'git commit -m "fix rm -r"',
+    'echo "rm -rf node_modules"',
+    'npm rm -r foo',
+    'ls rm -r',
+    // A `git clean` that only reports, and a truncate that is not aimed at a device.
+    'git clean -n',
+    'git clean --dry-run',
+    'truncate -s0 /tmp/big.log',
+    'find . -name "*.tmp"',
+    // The duration is an operand, not the command.
+    'timeout 5 echo reboot',
+    'man mkfs.ext4',
   ]) {
     check(`allows ${JSON.stringify(command)}`, bad(command) === null, `reason: ${bad(command)}`)
   }
@@ -2895,6 +2942,164 @@ async function toolTests(tools, shim) {
     check('and the action reports what it recorded',
       finished !== null && finished.summary.includes('确认可用'), String(finished?.summary ?? failure))
   }
+  // A subtask can move between shells, and "this tool opened it" is what `subtask-done` reads
+  // before closing a shell — while the tool promises never to close one the USER opened. So
+  // joining the user's own terminal under the same subtask name must CLEAR that mark. Measured
+  // shape before the fix: the entry kept created=true while its terminalId became the user's
+  // terminal, and `subtask-done keepTerminal:false` closed the user's shell.
+  {
+    const log = createSubtaskLog()
+    const stub = makeTerminalStub({ terminals: [], onWrite: replyWithCommand })
+    const tool = makeTermTool(stub, CONFIG, log)
+    await tool.execute({ action: 'run', command: 'pwd', subtask: '同步交接单' }, { agent: termAgent })
+    const opened = log.list('session-1').entries[0]
+    check('a shell this tool opened is marked as its own',
+      opened?.terminalCreated === true && opened?.terminalId === 'dsh-agent',
+      JSON.stringify({ created: opened?.terminalCreated, id: opened?.terminalId }))
+    // The user opens their own terminal; the model joins it for the same subtask.
+    stub.infos.push(termInfoOf('user-term'))
+    await tool.execute({ action: 'run', command: 'ls', subtask: '同步交接单', id: 'user-term' }, { agent: termAgent })
+    const joined = log.list('session-1').entries[0]
+    check('joining a terminal the user opened moves the record onto it',
+      joined?.terminalId === 'user-term', JSON.stringify(joined?.terminalId))
+    check('and clears the "this tool opened it" mark',
+      joined?.terminalCreated === false, JSON.stringify({ created: joined?.terminalCreated, id: joined?.terminalId }))
+    const finished = await tool.execute(
+      { action: 'subtask-done', subtask: '同步交接单', result: 'done', keepTerminal: false },
+      { agent: termAgent })
+    check('subtask-done never closes a terminal the user opened',
+      !stub.calls.close.includes('user-term'), JSON.stringify(stub.calls.close))
+    check('and says it left that terminal alone',
+      typeof finished.summary === 'string' && finished.summary.includes('the user opened it'),
+      String(finished?.summary).slice(-160))
+  }
+  // Terminal ids are per Session, and a tool-opened terminal is named from a STABLE pool
+  // (`dsh-agent`, `dsh-agent-2`, …), so two conversations both get `dsh-agent` — in two
+  // different shells. The "this shell already has the helper" set is keyed by session +
+  // terminal; keyed by terminal id alone, the second conversation's first `run` skipped the
+  // definition line, typed a call into a shell that had never been given the helper, and
+  // reported "nothing ran" about a command that never executed. The stub below is faithful:
+  // it only knows the helper if THIS shell was told about it.
+  {
+    const shellThatOnlyKnowsWhatItWasTold = () => {
+      let defined = false
+      return (data) => {
+        if (nonceOf(data) === null) {
+          if (!data.includes(`${HELPER_NAME}()`)) return []
+          defined = true
+          return [{ type: 'output', data: `${(data.split('\r')[0] ?? '').replace('\u0015', '')}\r\n` }]
+        }
+        if (!defined) return [{ type: 'output', data: `bash: ${HELPER_NAME}: command not found\r\n` }]
+        const nonce = nonceOf(data)
+        return [
+          { type: 'output', data: `${START_PREFIX}${nonce}\r\n` },
+          { type: 'output', data: 'ran for real\r\n' },
+          { type: 'output', data: `${END_PREFIX}${nonce}:0\r\n` },
+        ]
+      }
+    }
+    const sessionA = { id: 'session-helper-a' }
+    const sessionB = { id: 'session-helper-b' }
+    const stubA = makeTerminalStub({ terminals: [], onWrite: shellThatOnlyKnowsWhatItWasTold() })
+    const stubB = makeTerminalStub({ terminals: [], onWrite: shellThatOnlyKnowsWhatItWasTold() })
+    const runA = await makeTermTool(stubA).execute({ action: 'run', command: 'pwd' }, { agent: sessionA })
+    const runB = await makeTermTool(stubB).execute({ action: 'run', command: 'pwd' }, { agent: sessionB })
+    check('both conversations get a tool-opened terminal named the same',
+      stubA.calls.create[0]?.id === 'dsh-agent' && stubB.calls.create[0]?.id === 'dsh-agent',
+      JSON.stringify([stubA.calls.create[0]?.id, stubB.calls.create[0]?.id]))
+    check('the first conversation defines the helper in its shell',
+      stubA.calls.write[0]?.data.includes(`${HELPER_NAME}()`),
+      JSON.stringify(stubA.calls.write.map((write) => write.data.slice(0, 40))))
+    check('the second conversation defines it in ITS shell too',
+      stubB.calls.write[0]?.data.includes(`${HELPER_NAME}()`),
+      JSON.stringify(stubB.calls.write.map((write) => write.data.slice(0, 40))))
+    check('and so its first run really executes',
+      runA.summary.includes('ran for real') && runB.summary.includes('ran for real'),
+      `${JSON.stringify(String(runA.summary).slice(-120))} | ${JSON.stringify(String(runB.summary).slice(-160))}`)
+  }
+  // A capture past its ceiling drops its HEAD, and this call's own start marker can be in what
+  // fell off. The command ran; calling that "this shell has no helper" is a wrong diagnosis of
+  // the shell — and it is why the `dropped === 0` guard exists. The deadline is short on
+  // purpose: the marker is gone, so the loop cannot see completion and must time out.
+  {
+    const spillStore = {
+      async saveText(input) {
+        return {
+          locator: '/spilled/wsl-term-run-output.log',
+          bytes: Buffer.byteLength(input.content, 'utf8'),
+          retrievalHint: 'read it back with the file tools',
+        }
+      },
+    }
+    const flooding = (data) => {
+      const nonce = nonceOf(data)
+      if (nonce === null) return []
+      return [
+        { type: 'output', data: `${START_PREFIX}${nonce}\r\n` },
+        { type: 'output', data: `${'y'.repeat(4_200_000)}\r\n` },
+        { type: 'output', data: `${END_PREFIX}${nonce}:0\r\n` },
+      ]
+    }
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], onWrite: flooding })
+    const run = await createWslTermTool({ ctx: termCtx(stub, spillStore), config: CONFIG })
+      .execute({ action: 'run', command: 'yes', timeoutMs: 1500 }, { agent: termAgent })
+    check('a capture that lost its head is not reported as a missing helper',
+      !String(run.summary).includes('nothing ran'), String(run.summary).slice(0, 220))
+    check('and it still admits the capture is partial',
+      /first \d+ characters were dropped/.test(String(run.summary)), String(run.summary).slice(-200))
+  }
+  // Every call that reaches the terminal service is bounded by the budget the caller gave the
+  // call. Measured shape before the fix: a controller that stopped answering held the tool open
+  // past its own `timeoutMs`, with the user's terminal still attached — and therefore read-only.
+  {
+    const started = Date.now()
+    let failure = null
+    try {
+      await makeTermTool(makeTerminalStub({ terminals: [], stallOnCreate: true }))
+        .execute({ action: 'run', command: 'pwd', timeoutMs: 300 }, { agent: termAgent })
+    } catch (error) {
+      failure = String(error?.message ?? error)
+    }
+    const elapsed = Date.now() - started
+    check('a create that never answers fails fast instead of hanging',
+      failure !== null && /did not answer/.test(failure), String(failure))
+    check('and it gives up on the call budget, not on the provider\'s patience',
+      elapsed < 3000, `${elapsed} ms`)
+  }
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')], stallOnWrite: true })
+    const started = Date.now()
+    let failure = null
+    try {
+      await makeTermTool(stub).execute({ action: 'input', data: 'x', timeoutMs: 300 }, { agent: termAgent })
+    } catch (error) {
+      failure = String(error?.message ?? error)
+    }
+    const elapsed = Date.now() - started
+    check('a write that never answers fails fast too',
+      failure !== null && /did not answer/.test(failure), String(failure))
+    check('and the keyboard is still handed back',
+      stub.calls.detached >= 1 && elapsed < 5000, `${elapsed} ms detached=${stub.calls.detached}`)
+  }
+  await rejects('an explicit close that never answers is reported, not waited out',
+    () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')], stallOnClose: true }))
+      .execute({ action: 'close', id: 't1', timeoutMs: 300 }, { agent: termAgent }),
+    /did not answer/)
+  {
+    // The close a `subtask-done` sends is a courtesy: the record is already finished, so a silent
+    // service has to be reported in the summary instead of turning that into a failed call.
+    const log = createSubtaskLog()
+    const stub = makeTerminalStub({ terminals: [], onWrite: replyWithCommand })
+    const tool = makeTermTool(stub, CONFIG, log)
+    await tool.execute({ action: 'run', command: 'pwd', subtask: '收尾' }, { agent: termAgent })
+    stub.stall.close = true
+    const finished = await tool.execute(
+      { action: 'subtask-done', subtask: '收尾', result: 'done', keepTerminal: false, timeoutMs: 300 },
+      { agent: termAgent })
+    check('a close that never answers does not fail a finished subtask',
+      String(finished.summary).includes('is done.') && /close request went unanswered/.test(String(finished.summary)),
+      String(finished.summary))
+  }
   await rejects('subtask-done without the subtask name is refused',
     () => makeTermTool(makeTerminalStub(), CONFIG, createSubtaskLog())
       .execute({ action: 'subtask-done' }, { agent: termAgent }), /needs .?subtask/)
@@ -3094,6 +3299,39 @@ async function toolTests(tools, shim) {
   // The optional half: it must address a real composed row by id, must not switch
   // that row off (that would take the terminal feature away rather than adjust it),
   // and must point at a shell that exists.
+  console.log('\nbuilding the Config schema cannot take the module down')
+  {
+    // A profile can carry an incompatible `@deepseek-ai/schemastery`. The builder used to be
+    // driven at module scope, outside the try that guards the import, so that threw during import
+    // and every tool disappeared — instead of the intended "no panel, tools still work".
+    const broken = { object() { throw new Error('incompatible builder') } }
+    check('a builder that cannot build yields no Config instead of throwing',
+      buildConfig(broken) === undefined)
+    check('no builder at all yields no Config',
+      buildConfig(null) === undefined && buildConfig(undefined) === undefined)
+    const chainable = () => {
+      const node = {
+        default: () => node,
+        description: () => node,
+        volatile: () => node,
+      }
+      return node
+    }
+    const usable = {
+      boolean: chainable,
+      string: chainable,
+      number: chainable,
+      // A real builder returns the schema from the top-level `.description(...)`; the stub returns
+      // a sentinel, so the test can see the whole chain was walked.
+      object: () => {
+        const node = chainable()
+        node.description = () => 'a schema'
+        return node
+      },
+    }
+    check('and a usable builder still produces the schema', buildConfig(usable) === 'a schema')
+  }
+
   console.log('\noptional sidebar-terminal patch')
   check('the manifest ships the extras directory', (manifest.files ?? []).includes('extras'), JSON.stringify(manifest.files))
   const extrasFile = resolve(packageRoot, 'extras/terminal-wsl.patch.yml')

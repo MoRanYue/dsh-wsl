@@ -503,9 +503,9 @@ takes effect on restart.
   therefore blind on a Windows drive. Keep a project under `/home` when it matters:
   it recovers real semantics, real watch events, and the speed above.
 - Destructive commands are refused unless the call passes `allowDangerous: true`:
-  - **any recursive delete** — `rm -r`, `rm -rf`, `rm -r -f`, `rm -R --force`, `rm --recursive` — because with stdin on `/dev/null` nothing prompts, so `rm -r tree` deletes silently. Each `rm` invocation is judged on its own command segment, so `rm a -f; rm b -r` cannot combine into a pass;
-  - `dd` onto a block device, `mkfs`, partitioning/wiping tools (`fdisk`, `parted`, `wipefs`, `mkswap`, …), power control (`shutdown`, `reboot`, `systemctl reboot`, …), redirection onto a block device, and fork bombs;
-  - the guard tolerates the ways a command word can be spelled (`sudo rm -r -f`, `bash -c "rm -rf /"`, `find . -exec rm -rf {} +`, `rm$IFS-rf`, `\rm -rf`, `$(which rm) -rf`) but matches device/power tools at **command position**, so inspecting them is fine: `man fdisk`, `grep -rn reboot /var/log/syslog` and `echo "the mkfs tool formats disks"` all run.
+  - **any recursive delete** — `rm -r`, `rm -rf`, `rm -r -f`, `rm -R --force`, `rm --recursive` — because with stdin on `/dev/null` nothing prompts, so `rm -r tree` deletes silently. Each `rm` invocation is judged on its own command segment, so `rm a -f; rm b -r` cannot combine into a pass; an `rm` that is an ARGUMENT is a mention, not an invocation, so `npm rm -r foo` and `ls rm -r` are left alone;
+  - `dd` onto a block device, `mkfs`/`mke2fs`, partitioning/wiping tools (`fdisk`, `parted`, `wipefs`, `mkswap`, …), `truncate` aimed at a device, `find … -delete`, a `git clean` that would remove rather than report, power control (`shutdown`, `reboot`, `systemctl reboot`, …), redirection onto a block device (SATA/NVMe/virtio, `md`, `dm-*`, LVM `mapper`), and fork bombs;
+  - the guard reads a wrapper's own option VALUES and a shell's `-c` script, so `sudo -u root mkfs.ext4 …`, `nice -n 19 reboot`, `timeout 5 reboot`, `xargs -I{} poweroff` and `sh -c "reboot"` are judged on the command they really run. Device/power tools are matched at **command position**, so inspecting them is fine: `man fdisk`, `grep -rn reboot /var/log/syslog` and `echo "the mkfs tool formats disks"` all run — and a quoted mention is not an invocation (`grep -rn "rm -rf" docs/`, `git commit -m "fix rm -r"`).
 - Repeated launcher noise is stripped from stderr: the localhost-proxy warning and procps' `screen size is bogus` line.
 - Uses `wsl.exe -e` (`--exec`) so quoting and `$VAR` expansion behave like a normal shell; the default `--` pass-through mangles single quotes and variables.
 
@@ -608,7 +608,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 826 host checks against real WSL (shim for ctx.subprocess) + 170 client checks
+npm test          # 876 host checks against real WSL (shim for ctx.subprocess) + 170 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

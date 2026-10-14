@@ -439,12 +439,17 @@ patch 层 —— 每次写入前先备份该文件，只重写终端那一行的
   - **任何递归删除**——`rm -r`、`rm -rf`、`rm -r -f`、`rm -R --force`、`rm --recursive`——
     因为 stdin 指向 `/dev/null` 时不会产生任何提示，`rm -r tree` 会静默删除整棵树。
     每次 `rm` 调用按其所在命令段单独判定，所以 `rm a -f; rm b -r` 不能靠拼接标志蒙过去；
-  - 往块设备 `dd`、`mkfs`、分区/擦除类工具（`fdisk`、`parted`、`wipefs`、`mkswap` …）、
-    电源控制（`shutdown`、`reboot`、`systemctl reboot` …）、重定向到块设备、fork 炸弹；
-  - 防护容忍命令词的各种写法（`sudo rm -r -f`、`bash -c "rm -rf /"`、
-    `find . -exec rm -rf {} +`、`rm$IFS-rf`、`\rm -rf`、`$(which rm) -rf`），但设备/电源类
-    工具只在**命令位置**匹配，因此查看它们是允许的：`man fdisk`、
-    `grep -rn reboot /var/log/syslog`、`echo "the mkfs tool formats disks"` 都能正常执行。
+    而作为**参数**出现的 `rm` 只是提及、不是调用，所以 `npm rm -r foo`、`ls rm -r` 照常放行；
+  - 往块设备 `dd`、`mkfs`/`mke2fs`、分区/擦除类工具（`fdisk`、`parted`、`wipefs`、`mkswap` …）、
+    对准设备的 `truncate`、`find … -delete`、会真删文件的 `git clean`、
+    电源控制（`shutdown`、`reboot`、`systemctl reboot` …）、重定向到块设备（SATA/NVMe/virtio、
+    `md`、`dm-*`、LVM 的 `mapper`）、fork 炸弹；
+  - 防护会读包装器自己的选项**取值**和 shell 的 `-c` 脚本，所以
+    `sudo -u root mkfs.ext4 …`、`nice -n 19 reboot`、`timeout 5 reboot`、
+    `xargs -I{} poweroff`、`sh -c "reboot"` 都按它们真正执行的命令判定；
+    设备/电源类工具只在**命令位置**匹配，因此查看它们是允许的：`man fdisk`、
+    `grep -rn reboot /var/log/syslog`、`echo "the mkfs tool formats disks"` 都能正常执行——
+    而引号里只是提到 `rm` 也不算调用（`grep -rn "rm -rf" docs/`、`git commit -m "fix rm -r"`）。
 - stderr 中重复出现的启动器噪声会被过滤：localhost 代理警告与 procps 的
   `screen size is bogus` 行。
 - 使用 `wsl.exe -e`（`--exec`），引号与 `$VAR` 展开行为与普通 shell 一致；
@@ -529,7 +534,7 @@ argv 包一层过 `ctx.sandbox`）和文件系统服务（`@deepseek-ai/dsh-fs-s
 ### 测试
 
 ```sh
-npm test          # 826 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 170 项客户端检查
+npm test          # 876 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 170 项客户端检查
 npm run test:real # 同一套检查改跑真实 provider，外加 seam 事实套件
 ```
 

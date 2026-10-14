@@ -77,7 +77,7 @@ if (Schema === null) {
 }
 
 /**
- * The plugin's own configuration.
+ * The plugin's own configuration, in one place, and the tolerance around building it.
  *
  * Every field is ALSO settable by hand in a profile patch
  * (`- id: tool-wsl` / `config:`) and by the environment, and `lib/config.js`
@@ -98,7 +98,27 @@ if (Schema === null) {
  * A volatile field must not sit inside another volatile one, so `tools` is a plain
  * object whose leaf switches are volatile, not a volatile object.
  */
-export const Config = Schema?.object({
+export function buildConfig(Schema) {
+  if (Schema === null || Schema === undefined) return undefined
+  try {
+    return defineConfig(Schema)
+  } catch (error) {
+    // A builder that is present but is not the one this plugin expects (an incompatible
+    // `@deepseek-ai/schemastery` in the profile) used to throw HERE, at module scope, during
+    // import — so all six tools disappeared instead of degrading to "no panel". Building the
+    // schema must never be the thing that decides whether a tool exists.
+    console.warn(
+      'dsh-wsl-tool: building the Config schema failed — the tools run on their defaults ' +
+      'and the sidebar panel will not offer the switches',
+      error,
+    )
+    return undefined
+  }
+}
+
+/** The schema itself, in one place; the builder is supplied by {@link buildConfig}. */
+function defineConfig(Schema) {
+  return Schema.object({
   tools: Schema.object({
     wsl: Schema.boolean().default(true).description('注册 `wsl` 工具：在 WSL 发行版中执行 Linux 命令。').volatile(),
     path: Schema.boolean().default(true).description('注册 `wsl-path` 工具：在 Windows 路径与 `/mnt/...` 之间互转。').volatile(),
@@ -114,7 +134,11 @@ export const Config = Schema?.object({
   allowRoot: Schema.boolean().default(false).description('允许 `wsl` 以 root 执行（`asRoot: true`）。WSL 的 root 免密，所以这项开关就是授权本身；默认关。').volatile(),
   distro: Schema.string().default('').description('固定使用的发行版；留空表示使用系统默认（也可用 `DSH_WSL_DISTRO`）。').volatile(),
   timeoutMs: Schema.number().default(0).description('默认命令超时（毫秒）；0 表示使用内置默认（也可用 `DSH_WSL_TIMEOUT_MS`）。').volatile(),
-}).description('dsh-wsl 的功能开关与默认值。')
+  }).description('dsh-wsl 的功能开关与默认值。')
+}
+
+/** The plugin's config, or `undefined` when no usable builder is available. */
+export const Config = buildConfig(Schema)
 
 /**
  * The read-only route the browser half fetches for 「复制插件信息」. Namespaced under
