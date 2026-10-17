@@ -46,6 +46,7 @@ import { createWslEnvTool } from './lib/tools/wsl-env.js'
 import { createWslDoctorTool } from './lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from './lib/tools/wsl-bootstrap.js'
 import { createWslTermTool } from './lib/tools/wsl-term.js'
+import { createTerminalTransport } from './lib/pty-transport.js'
 import { createSubtaskLog, projectSubtask } from './lib/subtasks.js'
 
 export const name = 'tool-wsl'
@@ -664,6 +665,19 @@ export function apply(ctx, settings = {}) {
   // and the client's dock row reads it back over the route below. It is in-memory on purpose —
   // the terminals it describes disappear with this run too.
   const subtasks = createSubtaskLog()
+  // ONE terminal transport for this mount: the tool drives it and the subtask route asks it
+  // whether a recorded terminal is still alive. Whichever generation the host offers is picked
+  // here — a `terminalController` with follow/write (browser terminals, the user can watch), or a
+  // PTY this plugin owns through `subprocess.spawnTerminal` (DSH 0.2.1, where a plugin can no
+  // longer join a browser terminal). Resolved once so both consumers agree on the answer, and a
+  // host that faults here must not stop the other five tools from mounting.
+  let terminalTransport = null
+  try {
+    terminalTransport = createTerminalTransport({ ctx, config })
+  } catch (error) {
+    console.warn('dsh-wsl-tool: no usable terminal transport', error)
+    terminalTransport = null
+  }
 
   // ------------------------------------------------------------- tool switches
   //
@@ -684,12 +698,11 @@ export function apply(ctx, settings = {}) {
     // The installer is NOT registered by default: turning on its switch is the
     // user's decision to let this plugin add software to their distribution.
     bootstrap: () => createWslBootstrapTool({ config, runner }),
-    // The terminal tool has NO switch. Opening a terminal in the sidebar IS the
-    // consent: from then on the model may join that terminal, which is the whole
-    // point of the tool. It reads the `terminalController` service lazily, so a
-    // build without a sidebar terminal still mounts this plugin and reports that
+    // The terminal tool has NO switch: driving a shell IS the thing it exists for, and on a build
+    // where the sidebar cannot be joined it opens its own shell instead. It reads the transport
+    // lazily, so a build with neither generation still mounts this plugin and reports that
     // clearly instead of failing to load.
-    term: () => createWslTermTool({ ctx, config, subtasks }),
+    term: () => createWslTermTool({ ctx, config, subtasks, transport: terminalTransport }),
   }
   // Tools with no switch of their own are always mounted.
   const alwaysOn = new Set(['term'])
@@ -774,15 +787,10 @@ export function apply(ctx, settings = {}) {
             return
           }
           const sessions = {}
-          // The terminal service is what keeps the row honest: an entry whose terminal no longer
+          // The transport is what keeps the row honest: an entry whose terminal no longer
           // exists reads as closed, whatever the log last heard. Read once per session; its
           // absence is not an error — the projection falls back to what the log recorded.
-          let controller = null
-          try {
-            controller = typeof ctx.get === 'function' ? ctx.get('terminalController') : null
-          } catch {
-            controller = null
-          }
+          const controller = terminalTransport
           for (const [sessionId, log] of Object.entries(subtasks.snapshot())) {
             let live = null
             if (controller !== null && typeof controller.list === 'function') {

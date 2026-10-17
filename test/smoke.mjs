@@ -3100,6 +3100,116 @@ async function toolTests(tools, shim) {
       String(finished.summary).includes('is done.') && /close request went unanswered/.test(String(finished.summary)),
       String(finished.summary))
   }
+  // DSH 0.2.1 replaced `terminalController.follow`/`write` with an attachment that reads the
+  // CALLER's Remote invocation uplink, which a plugin cannot supply — the tool died with
+  // `controller.follow is not a function` and every terminal action was unusable. The fix drives
+  // a PTY this plugin owns (`subprocess.spawnTerminal`) and wraps it in the same five calls.
+  // The stub below is a 0.2.1 host: the controller has the NEW api and no `follow`.
+  const makePtyHost = () => {
+    const calls = { writes: [], terminated: 0, spawn: [], shell: 0 }
+    let finished = false
+    let exitResolve
+    const done = new Promise((resolve) => { exitResolve = resolve })
+    const queue = []
+    const waiters = []
+    const push = (text) => {
+      const value = Buffer.from(String(text), 'utf8')
+      const waiter = waiters.shift()
+      if (waiter) waiter({ value, done: false })
+      else queue.push(value)
+    }
+    const output = {
+      [Symbol.asyncIterator]() {
+        return {
+          next() {
+            if (queue.length > 0) return Promise.resolve({ value: queue.shift(), done: false })
+            if (finished) return Promise.resolve({ value: undefined, done: true })
+            return new Promise((resolve) => waiters.push(resolve))
+          },
+        }
+      },
+    }
+    const handle = {
+      output,
+      done,
+      write(data) {
+        const text = String(data)
+        calls.writes.push(text)
+        if (text.includes(`${HELPER_NAME}()`)) {
+          // A real PTY echoes the definition line; that echo must not pass for a marker.
+          push(`${text.replace(/^\u0015/, '').split('\r')[0]}\r\n`)
+          return
+        }
+        const nonce = nonceOf(text)
+        if (nonce === null) return
+        push(`${START_PREFIX}${nonce}\r\n`)
+        push('pty output line\r\n')
+        push(`${END_PREFIX}${nonce}:1\r\n`)
+      },
+      async terminate() { calls.terminated += 1; finished = true; exitResolve({ exitCode: 0 }) },
+      async resize() {},
+      async inspectActivity() { return { state: 'idle', revision: 0 } },
+    }
+    const subprocess = {
+      resolveExecutable: async (name) => { calls.shell += 1; return `C:/Windows/System32/${name}` },
+      spawnTerminal: async (spec) => { calls.spawn.push(spec); return handle },
+    }
+    // A 0.2.1 controller: list/create/attach/close, and deliberately no follow/write.
+    const controller = { list: () => [], create: async () => {}, attach: () => {}, close: async () => {} }
+    const ctx = {
+      get: (name) => (name === 'subprocess' ? subprocess : name === 'terminalController' ? controller : undefined),
+    }
+    return { ctx, calls }
+  }
+  const makePtyTool = (host, subtasks = null) => createWslTermTool({ ctx: host.ctx, config: { ...CONFIG, distro: 'Ubuntu-22.04' }, subtasks })
+  // A session workspace the shell should start in, and the translation the launcher must use.
+  const ptyAgent = { id: 'session-pty', session: { header: { cwd: 'C:\\work\\proj' } } }
+  {
+    const host = makePtyHost()
+    const log = createSubtaskLog()
+    const tool = makePtyTool(host, log)
+    const run = await tool.execute({ action: 'run', command: 'pwd', subtask: '0.2.1 的终端' }, { agent: ptyAgent })
+    check('on a 0.2.1 host the tool drives its own PTY instead of dying on follow',
+      String(run.summary).includes('pty output line') && String(run.summary).includes('exit code: 1'),
+      String(run.summary))
+    check('and it starts the configured distribution in the session workspace',
+      JSON.stringify(host.calls.spawn[0]?.argv) === JSON.stringify([
+        'C:/Windows/System32/wsl.exe', '-d', 'Ubuntu-22.04', '--cd', '/mnt/c/work/proj', '-e', 'bash', '-l',
+      ]),
+      JSON.stringify(host.calls.spawn[0]?.argv))
+    check('and the header names that workspace',
+      String(run.summary).includes('/mnt/c/work/proj'), String(run.summary).slice(0, 220))
+    check('the helper is defined in that shell before the first call',
+      host.calls.writes[0]?.includes(`${HELPER_NAME}()`) && host.calls.writes.length >= 2,
+      JSON.stringify(host.calls.writes.map((write) => write.slice(0, 30))))
+    check('a private PTY says it is not in the sidebar',
+      String(run.summary).includes('does not appear in the sidebar'), String(run.summary).slice(0, 240))
+    check('the subtask is recorded on the PTY shell',
+      log.list('session-pty').entries[0]?.terminalId === 'dsh-agent' && log.list('session-pty').entries[0]?.terminalCreated === true,
+      JSON.stringify(log.list('session-pty').entries[0]?.terminalId))
+    const listed = await tool.execute({ action: 'list' }, { agent: ptyAgent })
+    check('list names the PTY shell it opened', String(listed.summary).includes('id=dsh-agent'), String(listed.summary))
+    const finished = await tool.execute(
+      { action: 'subtask-done', subtask: '0.2.1 的终端', result: 'done', keepTerminal: false }, { agent: ptyAgent })
+    check('keepTerminal:false kills the PTY',
+      host.calls.terminated === 1 && String(finished.summary).includes('closed'), String(finished.summary))
+  }
+  {
+    // Preference order: an old controller keeps the browser terminal (the user can watch it), so a
+    // host that still has `follow` must not be quietly downgraded to a private PTY.
+    const calls = []
+    const ctx = {
+      get: (name) => (name === 'subprocess'
+        ? { spawnTerminal: async () => { calls.push('spawn'); return null } }
+        : name === 'terminalController'
+          ? makeTerminalStub({ terminals: [termInfoOf('t1')], onWrite: replyWithCommand })
+          : undefined),
+    }
+    const run = await createWslTermTool({ ctx, config: CONFIG }).execute(
+      { action: 'run', command: 'pwd' }, { agent: termAgent })
+    check('a host that still speaks follow/write keeps the browser terminal',
+      calls.length === 0 && String(run.summary).includes('hi from the terminal'), String(run.summary).slice(-160))
+  }
   await rejects('subtask-done without the subtask name is refused',
     () => makeTermTool(makeTerminalStub(), CONFIG, createSubtaskLog())
       .execute({ action: 'subtask-done' }, { agent: termAgent }), /needs .?subtask/)
@@ -3130,9 +3240,9 @@ async function toolTests(tools, shim) {
   await rejects('input without keystrokes is refused',
     () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'input' }, { agent: termAgent }),
     /non-empty data/)
-  await rejects('a build without the terminal service says so instead of throwing a type error',
+  await rejects('a build without a drivable terminal says so instead of throwing a type error',
     () => createWslTermTool({ ctx: { get: () => undefined }, config: CONFIG }).execute({ action: 'list' }, { agent: termAgent }),
-    /no terminalController service/)
+    /no terminal this plugin can drive/)
   await rejects('a call with no agent session is refused',
     () => makeTermTool(makeTerminalStub()).execute({ action: 'list' }, {}), /owning agent session/)
 

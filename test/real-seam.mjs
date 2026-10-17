@@ -106,7 +106,9 @@ try {
     const started = await toolSet.wsl.execute({
       command: 'echo real-job-output', description: 'real background job', runInBackground: true,
     })
-    check('a background start returns a wsl-<n> job id', /^wsl-\d+$/.test(started.jobId ?? ''), String(started.jobId))
+    // The registry owns the id. 0.2.0 counted (`wsl-1`); 0.2.1 builds `kind-<16 hex>` from a
+    // UUID. Both spellings are fine — the checks below are about the registry, not the name.
+    check('a background start returns the registry job id', /^wsl-(?:\d+|[0-9a-f]{16})$/.test(started.jobId ?? ''), String(started.jobId))
 
     const snapshot = jobs.get(started.jobId)
     check('the real registry knows the job', snapshot?.kind === 'wsl', String(snapshot?.kind))
@@ -136,7 +138,7 @@ try {
       { command: 'echo owned-output', description: 'owned background job', runInBackground: true },
       ownedExec,
     )
-    check('an owned job starts against the real registry', /^wsl-\d+$/.test(owned.jobId ?? ''), String(owned.jobId))
+    check('an owned job starts against the real registry', /^wsl-(?:\d+|[0-9a-f]{16})$/.test(owned.jobId ?? ''), String(owned.jobId))
     check('the owning session can read its job', jobs.get(owned.jobId, OWNER)?.kind === 'wsl', String(owned.jobId))
     try {
       jobs.get(owned.jobId)

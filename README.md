@@ -187,6 +187,14 @@ wsl-term({ action: "subtask-done", subtask: "跑通 sta 流程", result: "三条
                                                                → writes the result and decides the shell
 ```
 
+**Which shell it drives depends on the DSH generation.** Up to DSH 0.2.0 the host
+exposes its browser terminals to plugins, so `wsl-term` joins the one you opened in the
+sidebar (or opens one); while it works there your view is read-only until you press
+接管输入. **DSH 0.2.1** replaced that API with an attachment only a Remote caller can
+open, which a plugin cannot supply, so `wsl-term` opens a **private WSL shell per
+subtask** instead: the same actions and the same records above the composer, but the
+shell does not appear in the sidebar and only the tool types into it.
+
 #### Work is recorded as subtasks
 
 Naming a `subtask` on `run` opens a record for that piece of work and logs every command
@@ -489,7 +497,7 @@ takes effect on restart.
 
   It is worth believing. Measured on the author's machine: a 128 MB sequential write
   ran at ~2.1 GB/s on ext4 against ~247 MB/s on `/mnt/d`, and creating 400 small
-  files took under 10 ms against 0.72 s (a later re-run: 884 vs 116 MB/s, and 13 ms
+  files took under 10 ms against 0.72 s (a later re-run: 885 vs 116 MB/s, and 13 ms
   against 745 ms — the ratios hold at roughly 8× and 50×).
 
   It is not only slower. `/mnt/<drive>` is a 9p (drvfs) mount, so it keeps **Windows**
@@ -608,7 +616,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 876 host checks against real WSL (shim for ctx.subprocess) + 170 client checks
+npm test          # 885 host checks against real WSL (shim for ctx.subprocess) + 170 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
