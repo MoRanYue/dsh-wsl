@@ -298,21 +298,24 @@ forever.
 ## Compatibility
 
 The manifest declares the DSH it needs — `"engines": { "dsh": ">=0.1.7-rc.2" }` —
-which is the floor this section documents. The plugin market reads that
-declaration from the published manifest and shows it as a requirement on the
-entry (`DSH >=0.1.7-rc.2`), warning before an install or update onto an older
-host; DSH itself ignores `engines`, so the declaration is advice, not a gate.
-The `-rc.2` is load-bearing: `>=0.1.7` alone excludes the `0.1.7-rc.2` release
-this line was verified on, and the market would then report the plugin as
-incompatible with its own verified host.
+which is the floor this section documents. Two readers act on that declaration:
+the plugin market shows it as a requirement on the entry (`DSH >=0.1.7-rc.2`) and
+warns before an install onto an older host, and the host's own install gate
+refuses a release whose declared range excludes the running DSH. Both evaluate
+prereleases, so `0.2.1-rc.2` is inside this range. The `-rc.2` is load-bearing:
+`>=0.1.7` alone excludes the `0.1.7-rc.2` release this line was verified on, and
+the market would then report the plugin as incompatible with its own verified
+host.
 
-Verified against DSH **0.1.7-rc.2** (earlier releases of this plugin were verified
-on 0.1.5-rc.2): the tool schemas
-pass DSH's own `assertSupportedJsonSchema`, the subprocess seam is exercised
-against the real provider rather than a shim, and the background-job path is
-checked against the real job registry, including the session-id ownership fence
-that 0.1.7 tightened. `test/real-seam.mjs` is that check and it re-verifies a host
-in about a minute, so point it at any DSH installation after an upgrade:
+Verified against DSH **0.2.1-rc.2** and **0.1.7-rc.2** (earlier releases of this
+plugin were verified on 0.1.5-rc.2): the tool schemas pass DSH's own
+`assertSupportedJsonSchema`, the subprocess seam is exercised against the real
+provider rather than a shim, and the background-job path is checked against the
+real job registry, including the session-id ownership fence that 0.1.7 tightened
+(0.2.1 hands out `kind-<16 hex>` job ids, so the check reads the registry's own
+id instead of assuming a shape). `test/real-seam.mjs` is that check and it
+re-verifies a host in about a minute, so point it at any DSH installation after
+an upgrade:
 
 ```sh
 DSH_SUBPROCESS_LOCAL=/path/to/dsh/node_modules npm run test:real
@@ -321,6 +324,12 @@ DSH_SUBPROCESS_LOCAL=/path/to/dsh/node_modules npm run test:real
 A background job is owned by the calling session (`owner: exec.agent.id`), which
 is what lets the model read it back with `job_output`/`job_kill` and what keeps
 other sessions out; an execution with no agent starts the job unowned.
+
+One behaviour differs by host generation. Up to 0.2.0 the terminal tool drives a
+browser terminal through `terminalController.follow`/`write`; 0.2.1 replaced
+those with an attachment only a Remote caller can open, so the same tool opens
+its own PTY through `subprocess.spawnTerminal` — same actions, same records above
+the composer, with a shell private to the tool.
 
 ## The WSL panel (left sidebar)
 

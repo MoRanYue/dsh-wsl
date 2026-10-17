@@ -246,14 +246,16 @@ wsl({ command: 'apt-get install -y jq', description: 'install jq', asRoot: true 
 ## 兼容性
 
 清单里声明了它需要的 DSH —— `"engines": { "dsh": ">=0.1.7-rc.2" }`，也就是本节记录的
-下限。插件市场会从已发布的清单读取这条声明，在条目上标成要求（`DSH >=0.1.7-rc.2`），并在
-装到更老的宿主上之前给出提醒；DSH 自身不读 `engines`，所以它是提示而不是门禁。那个
-`-rc.2` 不能省：只写 `>=0.1.7` 会把本条验证过的 `0.1.7-rc.2` 排除掉，市场于是会把插件
-判成与它自己验证过的宿主不兼容。
+下限。有两处会依据这条声明行动：插件市场把它在条目上标成要求（`DSH >=0.1.7-rc.2`），并在
+装到更老的宿主上之前给出提醒；宿主自己的安装门禁也会拒绝「声明的范围不含当前 DSH」的版本。
+两者都按 `includePrerelease` 判定，所以 `0.2.1-rc.2` 落在这个范围内。那个 `-rc.2` 不能省：
+只写 `>=0.1.7` 会把本条验证过的 `0.1.7-rc.2` 排除掉，市场于是会把插件判成与它自己验证过的
+宿主不兼容。
 
-已在 DSH **0.1.7-rc.2** 上验证（本插件的更早版本曾在 0.1.5-rc.2 上验证）：工具 schema 通过 DSH 自己的
-`assertSupportedJsonSchema`；subprocess 接缝是跑在**真实 provider** 上而非替身；后台任务
-路径跑在**真实 job 注册表**上，包含 0.1.7 收紧的「会话 id 属主围栏」。这套检查就是
+已在 DSH **0.2.1-rc.2** 与 **0.1.7-rc.2** 上验证（本插件的更早版本曾在 0.1.5-rc.2 上验证）：
+工具 schema 通过 DSH 自己的 `assertSupportedJsonSchema`；subprocess 接缝是跑在**真实 provider**
+上而非替身；后台任务路径跑在**真实 job 注册表**上，包含 0.1.7 收紧的「会话 id 属主围栏」
+（0.2.1 的 job id 变成 `kind-<16 hex>`，所以检查读注册表给的那个 id，而不是假定形状）。这套检查就是
 `test/real-seam.mjs`，约一分钟即可重验一个新宿主——升级后把它指向新的 DSH 安装即可：
 
 ```sh
@@ -263,6 +265,11 @@ DSH_SUBPROCESS_LOCAL=/path/to/dsh/node_modules npm run test:real
 后台任务由**调用方会话**持有（`owner: exec.agent.id`），这既是模型能用
 `job_output`/`job_kill` 读回它的依据，也是其他会话读不到它的围栏；exec 里没有 agent 时
 任务则是无主的。
+
+有一处行为随宿主代际不同。到 0.2.0 为止，终端工具通过 `terminalController.follow`/`write`
+驱动**浏览器终端**；0.2.1 把它们换成了只有 Remote 调用方能打开的附着方式，于是同一个工具改用
+`subprocess.spawnTerminal` 开一个**自己的 PTY**——动作相同、输入框上方的记录相同，只是这个
+shell 是工具私有的。
 
 ## 左侧栏的 WSL 面板
 
