@@ -41,13 +41,16 @@
 
   .lead { color: var(--mid); font-size: 14.5px; margin-top: 28px; }
 
-  .modes { margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  /* Both terminal modes live in ONE box: they are one decision (which shell a task
+     gets), and splitting them made the card look like two separate features. */
   .mode {
-    border: 1px solid var(--line-soft); background: var(--card);
-    border-radius: 12px; padding: 20px 22px;
+    margin-top: 12px; border: 1px solid var(--line-soft); background: var(--card);
+    border-radius: 12px; padding: 18px 22px;
   }
-  .mode h2 { font-size: 20px; font-weight: 640; letter-spacing: .2px; margin-top: 7px; }
-  .mode p { color: var(--dim); font-size: 14px; line-height: 1.55; margin-top: 8px; }
+  .mode h2 { font-size: 18px; font-weight: 640; letter-spacing: .2px; margin-top: 6px; }
+  .mode .split { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 26px; }
+  .mode h3 { font-size: 15px; font-weight: 620; letter-spacing: .2px; }
+  .mode p { color: var(--dim); font-size: 13.5px; line-height: 1.55; margin-top: 5px; }
   .tag { color: var(--faint); font-size: 12.5px; font-weight: 600; letter-spacing: 1px; }
 
   .coop {
@@ -91,18 +94,18 @@
     </div>
   </header>
 
-  <div class="lead">终端有两种工作方式，模型按任务自动选择：</div>
-
-  <div class="modes">
-    <div class="mode">
-      <div class="tag">多步任务</div>
-      <h2>长期终端</h2>
-      <p>同一件事共用一个会话，目录与环境保留；子任务记录显示在输入框上方，可展开查看每条命令与结果；结束后保留或关闭。</p>
-    </div>
-    <div class="mode">
-      <div class="tag">自洽命令</div>
-      <h2>一次性终端</h2>
-      <p>每次调用使用全新 shell，返回退出码与输出，可写入 stdin、可并行执行；长构建转为后台作业，随时读取或终止。</p>
+  <div class="mode">
+    <div class="tag">终端按任务自动选择</div>
+    <h2>两种工作方式，一个工作现场</h2>
+    <div class="split">
+      <div>
+        <h3>长期终端</h3>
+        <p>多步任务共用一个会话：目录与环境保留，子任务记录显示在输入框上方，可展开查看每条命令与结果；结束后保留或关闭。</p>
+      </div>
+      <div>
+        <h3>一次性终端</h3>
+        <p>自洽命令每次使用全新 shell：返回退出码与输出，可写 stdin、可并行；长构建转为后台作业，随时读取或终止。</p>
+      </div>
     </div>
   </div>
 
@@ -115,7 +118,7 @@
     <div class="coop">
       <div class="tag">WSL 终端里</div>
       <h2><code>dsh</code> 命令</h2>
-      <p>输入 <code>dsh "问题"</code>，话就进入指定的 DSH 会话：思考时间与回复流式回到终端；<code>dsh list/use/new/rm</code> 管理会话。</p>
+      <p>插件与 WSL 环境深度融合：同一个工作目录、同一段会话、同一套工具。终端里一句 <code>dsh "问题"</code> 就能接着做手头的事，思考与回复流式回到终端，不必切换窗口。</p>
     </div>
   </div>
 
