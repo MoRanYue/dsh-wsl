@@ -160,7 +160,6 @@ cmd_say() {
       '~ack') ;;
       '~r '*) ms=${line#'~r '}; printf '\033[2m⏱ 思考中… %d.%01ds\033[0m' $((ms / 1000)) $(((ms % 1000) / 100)); reason=1 ;;
       '~t '*) if [ "$reason" = 1 ]; then printf '\033[0m\n'; fi; reason=2 ;;
-      '~s '*) [ "$reason" = 1 ] || printf '\033[2m'; printf '%s' "${line#'~s '}" | base64 -d; reason=1 ;;
       '~a '*) if [ "$reason" = 1 ]; then printf '\033[0m\n'; fi; reason=2; printf '%s' "${line#'~a '}" | base64 -d ;;
       '~step '*) ;;
       '~p') ;;

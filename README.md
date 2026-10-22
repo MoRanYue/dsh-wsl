@@ -450,7 +450,7 @@ then a one-line summary (elapsed, steps, tokens). `Ctrl+C` stops waiting only; t
 turn keeps running in the client.
 
 The terminal is a second surface for that conversation: the text is forwarded verbatim,
-and the client streams the reply (reasoning included) back. When the conversation is
+and the client streams the reply back — a thinking timer, but no reasoning text. When
 already answering, the line is steered into the live turn instead of queueing, so the
 same agent reacts immediately and nothing is dropped.
 

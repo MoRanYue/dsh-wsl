@@ -3654,8 +3654,7 @@ async function channelUnitTests() {
     const chunkText = frames.filter((line) => line.startsWith('~a '))
       .map((line) => Buffer.from(line.slice(3), 'base64').toString('utf8')).join('')
     eq('answer chunks come back as raw text', chunkText, 'hello')
-    eq('reasoning chunks come back as raw text',
-      Buffer.from((frames.find((line) => line.startsWith('~s ')) ?? '~s ').slice(3), 'base64').toString('utf8'), 'why')
+    check('the reasoning text is not streamed to the terminal', !frames.some((line) => line.startsWith('~s ')), said.body)
     check('one step frame is sent', frames.some((line) => line.startsWith('~step ')), said.body)
     const endFrame = frames.find((line) => line.startsWith('~e ')) ?? ''
     const end = endFrame.split(' ')
