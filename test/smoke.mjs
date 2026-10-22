@@ -3734,7 +3734,7 @@ async function channelUnitTests() {
   const orderedCtx = {
     get(name) {
       return {
-        sessionController: { async list() { return orderedList } },
+        sessionController: { async list() { return { items: orderedList } } },
         workspaceRegistry: { archivedSessionIds: [], list: () => [{ title: 'w', path: 'D:\\w', sessionIds: orderedList.map((item) => item.sessionId) }] },
       }[name]
     },
