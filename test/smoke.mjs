@@ -3508,6 +3508,10 @@ async function channelUnitTests() {
   eq('titles read from a Map', titlesOf(new Map([['a', 'T']])).get('a'), 'T')
   eq('titles read from an array', titlesOf([{ id: 'a', title: 'T' }]).get('a'), 'T')
   eq('titles read from an object', titlesOf({ a: { title: 'T' } }).get('a'), 'T')
+  eq('titles read from settled results (the real sessionQuery shape)',
+    titlesOf([{ sessionId: 'a', status: 'fulfilled', value: { session: { id: 'a' }, title: 'T2' } }, { status: 'rejected', reason: new Error('x') }]).get('a'), 'T2')
+  const forkedRecord = sessionRecordOf({ header: { id: 'f', parentSession: 'p', origin: 'subagent' } })
+  eq('a session record exposes the fork fields the picker filters on', `${String(forkedRecord.parentSession)}|${String(forkedRecord.origin)}`, 'p|subagent')
 
   const home = mkdtempSync(join(tmpdir(), 'dsh-wsl-channel-'))
   const listeners = new Map()
@@ -3657,6 +3661,52 @@ async function channelUnitTests() {
     try { rmSync(home, { recursive: true, force: true }) } catch {}
   }
 
+  // What the picker (and `dsh list`) is allowed to show: top-level, unarchived, titled
+  // conversations, newest first, plus the configured session even while it has no title.
+  const registryForPicker = {
+    archivedSessionIds: ['archived-1'],
+    list: () => [{ title: '工作区', path: 'D:\\w', sessionIds: ['session-a', 'untitled-1', 'archived-1', 'sub-1'] }],
+  }
+  const queryForPicker = {
+    async listSessions() {
+      return [
+        { header: { id: 'session-a', cwd: 'D:\\w', createdAt: 5 } },
+        { header: { id: 'untitled-1', cwd: 'D:\\w', createdAt: 4 } },
+        { header: { id: 'archived-1', cwd: 'D:\\w', createdAt: 3 } },
+        { header: { id: 'sub-1', cwd: 'D:\\w', createdAt: 2, parentSession: 'session-a' } },
+        { header: { id: 'wsl', cwd: 'D:\\w', createdAt: 1 } },
+      ]
+    },
+    async readTitleSnapshots(ids) {
+      return ids.map((id) => (id === 'session-a'
+        ? { status: 'fulfilled', value: { session: { id }, title: '真正的会话' } }
+        : { status: 'rejected', reason: new Error('no title') }))
+    },
+  }
+  const filterCtx = {
+    get(name) { return { sessionQuery: queryForPicker, workspaceRegistry: registryForPicker }[name] },
+    on() { return () => {} },
+  }
+  const filtered = createChannel({ ctx: filterCtx, config: { channelEnabled: true, channelSession: 'wsl' }, env: { USERPROFILE: home } })
+  const filteredPort = (await filtered.start()).port
+  try {
+    const listed = await new Promise((done, fail) => {
+      const request = httpRequest({ host: '127.0.0.1', port: filteredPort, method: 'POST', path: '/list', headers: { 'content-type': 'text/plain', 'x-dsh-wsl-token': filtered.token } }, (response) => {
+        const chunks = []
+        response.on('data', (chunk) => chunks.push(chunk))
+        response.on('end', () => done(Buffer.concat(chunks).toString('utf8')))
+      })
+      request.on('error', fail)
+      request.end()
+    })
+    check('the list shows a real conversation by its title', listed.includes('真正的会话') && listed.includes('session-a'), listed)
+    check('untitled sessions stay out of the list', !listed.includes('untitled-1'), listed)
+    check('archived sessions stay out of the list', !listed.includes('archived-1'), listed)
+    check('forked or subagent sessions stay out of the list', !listed.includes('sub-1'), listed)
+    check('the configured session is listed even while it has no title', listed.includes('(当前会话，尚无标题)') && /wsl\t[^\n]*\t\*/.test(listed), listed)
+  } finally {
+    await filtered.stop()
+  }
   // A disabled channel answers, but refuses the turn; and a host without the session
   // controller reports that in words instead of throwing.
   const off = createChannel({ ctx, config: { channelEnabled: false }, env: { USERPROFILE: home } })
