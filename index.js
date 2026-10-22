@@ -927,11 +927,18 @@ export function apply(ctx, settings = {}) {
           } catch {
             requested = ''
           }
+          // A Windows path (the sidebar terminal accepts one) is translated to its /mnt/<drive>
+          // form so the browser can still walk it.
+          const windowsPath = /^([A-Za-z]):[\\/](.*)$/.exec(requested.trim())
+          if (windowsPath !== null) {
+            requested = `/mnt/${windowsPath[1].toLowerCase()}/${windowsPath[2].replace(/\\/g, '/')}`
+          }
           let payload
           try {
             const script = [
               'P="$1"',
-              'case "$P" in "~") P="$HOME" ;; "~/"*) P="$HOME/${P#~/}" ;; esac',
+              // `${P#~/}` would not strip here: the pattern's `~/` is tilde-expanded first.
+              'case "$P" in "~") P="$HOME" ;; "~/"*) P="$HOME/${P:2}" ;; esac',
               'if [ -z "$P" ]; then P="$HOME"; fi',
               'if [ ! -d "$P" ]; then printf "NODIR\\n"; exit 3; fi',
               'cd "$P" || exit 4',

@@ -26,7 +26,7 @@ import { resolveConfig } from '../lib/config.js'
 import { pickSchemaBuilder } from '../lib/schema.js'
 import { buildCdCommand, quotePath, shellQuote, windowsPathToWsl } from '../lib/paths.js'
 import { destructiveReason } from '../lib/guard.js'
-import { channelSessionOf, createChannel, sessionRecordOf, titlesOf } from '../lib/channel.js'
+import { channelSessionOf, createChannel, firstUserLine, sessionRecordOf, titlesOf } from '../lib/channel.js'
 import { cleanStderr, formatResult, normalizeExitCode, streamFacts } from '../lib/result.js'
 import { assertLauncherReachable, collectForwardEnv, resolveDistro, sessionCwdOf } from '../lib/runner.js'
 import { capabilityLines, launcherSummary, parseFacts, workspaceLine } from '../lib/diagnostics.js'
@@ -3512,6 +3512,16 @@ async function channelUnitTests() {
   eq('titles read from a Map', titlesOf(new Map([['a', 'T']])).get('a'), 'T')
   eq('titles read from an array', titlesOf([{ id: 'a', title: 'T' }]).get('a'), 'T')
   eq('titles read from an object', titlesOf({ a: { title: 'T' } }).get('a'), 'T')
+  eq('firstUserLine reads the first user sentence as a label', firstUserLine([
+    { type: 'user/message', data: { source: { kind: 'agent-instructions' }, content: [{ type: 'text', text: 'system prompt' }] } },
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '  帮我看看当前目录  ' }] } },
+  ]), '帮我看看当前目录')
+  eq('firstUserLine skips injected instructions when nothing else is there', firstUserLine([
+    { type: 'user/message', data: { source: { kind: 'agent-instructions' }, content: [{ type: 'text', text: 'system prompt' }] } },
+  ]), '')
+  eq('firstUserLine shortens a long first message', firstUserLine([
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'x'.repeat(60) }] } },
+  ]), 'x'.repeat(28) + '…')
   eq('titles read a title snapshot object (the real value shape)',
     titlesOf([{ sessionId: 'a', status: 'fulfilled', value: { session: { id: 'a' }, title: { title: 'T3' } } }]).get('a'), 'T3')
   eq('titles read from settled results (the real sessionQuery shape)',
