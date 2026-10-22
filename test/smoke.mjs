@@ -3577,7 +3577,8 @@ async function channelUnitTests() {
   const config = { channelEnabled: true, channelSession: 'wsl' }
   const channel = createChannel({ ctx, config, wsl, env: { USERPROFILE: home } })
   const { port, host } = await channel.start()
-  const stateFile = join(home, '.dsh', 'dsh-wsl', 'channel.json')
+  // The state file lives under the profile's local app data, not in the plugin checkout.
+  const stateFile = channel.stateFile
   const call = (method, path, body, headers = {}) => new Promise((done, fail) => {
     const request = httpRequest({ host: '127.0.0.1', port, method, path, headers }, (response) => {
       const chunks = []
@@ -3649,10 +3650,10 @@ async function channelUnitTests() {
 
     const installed = await channel.install()
     eq('install succeeds with a working wsl runner', installed.ok, true)
-    const shim = readFileSync(join(home, '.dsh', 'dsh-wsl', 'dsh.sh'), 'utf8')
+    const shim = readFileSync(join(dirname(channel.stateFile), 'dsh.sh'), 'utf8')
     check('the installed shim has its config path filled in',
       shim.includes('/mnt/') && !shim.includes('__CHANNEL_CONFIG__'), 'the placeholder survived')
-    check('the installed shim points at the state file', shim.includes('/.dsh/dsh-wsl/channel.json'), shim.slice(0, 400))
+    check('the installed shim points at the state file', shim.includes('/dsh-wsl/channel.json') && !shim.includes('.dsh/dsh-wsl/channel.json'), shim.slice(0, 400))
     check('the install command copies and marks the shim executable',
       (wslCalls[wslCalls.length - 1] ?? []).join(' ').includes('install -m 0755'), JSON.stringify(wslCalls[wslCalls.length - 1]))
 
