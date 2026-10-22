@@ -48,6 +48,8 @@ import { createWslBootstrapTool } from './lib/tools/wsl-bootstrap.js'
 import { createWslTermTool } from './lib/tools/wsl-term.js'
 import { createTerminalTransport } from './lib/pty-transport.js'
 import { createSubtaskLog, projectSubtask } from './lib/subtasks.js'
+import { createChannel } from './lib/channel.js'
+import { execFile } from 'node:child_process'
 
 export const name = 'tool-wsl'
 export const inject = ['tools', 'subprocess']
@@ -133,6 +135,8 @@ function defineConfig(Schema) {
   workdir: Schema.string().default('').description('未传 `workdir` 时使用的固定 Linux 目录（如 `/mnt/d/project`），优先于「跟随会话工作区」；留空表示不指定。').volatile(),
   dangerGuard: Schema.boolean().default(true).description('危险命令（删除、分区、关机等）需显式 `allowDangerous` 才放行；关闭后模型可直接执行。').volatile(),
   allowRoot: Schema.boolean().default(false).description('允许 `wsl` 以 root 执行（`asRoot: true`）。WSL 的 root 免密，所以这项开关就是授权本身；默认关。').volatile(),
+  channelEnabled: Schema.boolean().default(false).description('启用 WSL 通道：在 WSL 终端里用 `dsh "问题"` 把话发进指定会话，回复流式回到终端。默认关。').volatile(),
+  channelSession: Schema.string().default('wsl').description('WSL 通道默认使用的会话 id；终端里的 `dsh use <id>` 可以临时切换。').volatile(),
   distro: Schema.string().default('').description('固定使用的发行版；留空表示使用系统默认（也可用 `DSH_WSL_DISTRO`）。').volatile(),
   timeoutMs: Schema.number().default(0).description('默认命令超时（毫秒）；0 表示使用内置默认（也可用 `DSH_WSL_TIMEOUT_MS`）。').volatile(),
   }).description('dsh-wsl 的功能开关与默认值。')
@@ -161,6 +165,14 @@ const INFO_ROUTE = '/dsh-wsl-tool/info'
  * `POST` -> `{ ok, path, error }`, body `{ path }`; `path: ''` removes the flag.
  */
 const TERMINAL_ROUTE = '/dsh-wsl-tool/terminal-cwd'
+
+/**
+ * The panel's WSL-channel facts and its one install action (`index.js` publishes them
+ * beside the other routes; the `dsh` CLI inside WSL never uses these — it talks to the
+ * channel's own server with the token from `channel.json`).
+ */
+const CHANNEL_STATE_ROUTE = '/dsh-wsl-tool/channel'
+const CHANNEL_INSTALL_ROUTE = '/dsh-wsl-tool/channel-install'
 /** What the client's dock row above the composer reads. */
 const SUBTASK_ROUTE = '/dsh-wsl-tool/subtasks'
 
@@ -731,6 +743,46 @@ export function apply(ctx, settings = {}) {
   }
   syncTools()
 
+  // ------------------------------------------------------------ WSL channel
+  //
+  // The `dsh` shim inside WSL talks to this small server, not to the plugin's web
+  // routes: those bind 127.0.0.1, which under WSL2 NAT is the WSL side itself. The
+  // channel therefore listens on the address WSL uses as its default gateway (the
+  // Windows host) and authenticates every request with a per-mount token. It is
+  // optional and defensive: a failure here must not take the tools down, and a host
+  // without `wsl.exe` simply reports "channel unavailable" in the panel.
+  const runWslHost = (argv, distro) => new Promise((resolve) => {
+    const args = typeof distro === 'string' && distro !== '' ? ['-d', distro, ...argv] : argv
+    execFile('wsl.exe', args, {
+      timeout: 30000,
+      windowsHide: true,
+      encoding: 'utf8',
+      env: { ...process.env, WSL_UTF8: '1' },
+    }, (error, stdout, stderr) => {
+      resolve({
+        code: error === null ? 0 : (typeof error.code === 'number' ? error.code : 1),
+        stdout: typeof stdout === 'string' ? stdout : '',
+        stderr: typeof stderr === 'string' && stderr !== '' ? stderr : (error?.message ?? ''),
+      })
+    })
+  })
+  let channel = null
+  try {
+    channel = createChannel({ ctx, config, wsl: (argv) => runWslHost(argv, config.distro) })
+    // Lazy on purpose: a disabled channel must not bind a port or spawn wsl.exe. Turning
+    // the switch on (or a mount that already has it on) starts it; the panel's install
+    // action starts it too, because the shim needs the port and token it writes.
+    channel.refresh().catch((error) => {
+      console.warn('dsh-wsl-tool: the WSL channel server did not start', error)
+    })
+    if (typeof ctx.effect === 'function') {
+      ctx.effect(() => () => { channel.stop() }, 'dsh-wsl-tool: WSL channel server')
+    }
+  } catch (error) {
+    console.warn('dsh-wsl-tool: the WSL channel is unavailable', error)
+    channel = null
+  }
+
   // ---------------------------------------------------------------- self info
   //
   // The panel's 「复制插件信息」 needs facts this half already has and the browser
@@ -816,6 +868,53 @@ export function apply(ctx, settings = {}) {
           })
           response.end(JSON.stringify({ sessions }))
         }, 'dsh-wsl-tool: subtask route')
+        // The panel's WSL-channel block. State is read by the browser (same origin); the
+        // install action writes the shim into the distro and is the only write here, so it
+        // demands a JSON content type — a cross-site form cannot send that without a
+        // preflight this server never approves.
+        publish(CHANNEL_STATE_ROUTE, async (request, response) => {
+          if (request.method !== 'GET') {
+            response.writeHead(405, { allow: 'GET' })
+            response.end()
+            return
+          }
+          let payload
+          try {
+            payload = channel === null
+              ? { available: false, enabled: false, shim: { installed: false } }
+              : { available: true, ...(await channel.panelState()) }
+          } catch (error) {
+            payload = { available: false, enabled: false, error: String(error?.message ?? error) }
+          }
+          answerJson(response, 200, payload)
+        }, 'dsh-wsl-tool: channel state route')
+        publish(CHANNEL_INSTALL_ROUTE, async (request, response) => {
+          if (request.method !== 'POST') {
+            response.writeHead(405, { allow: 'POST' })
+            response.end()
+            return
+          }
+          const type = String(requestHeader(request, 'content-type') ?? '').toLowerCase()
+          if (!type.startsWith('application/json')) {
+            answerJson(response, 415, { ok: false, detail: 'content-type must be application/json' })
+            return
+          }
+          try {
+            await readJsonBody(request)
+          } catch {
+            answerJson(response, 400, { ok: false, detail: 'the body is not valid JSON' })
+            return
+          }
+          if (channel === null) {
+            answerJson(response, 503, { ok: false, detail: 'the WSL channel is unavailable in this host' })
+            return
+          }
+          try {
+            answerJson(response, 200, await channel.install())
+          } catch (error) {
+            answerJson(response, 500, { ok: false, detail: String(error?.message ?? error) })
+          }
+        }, 'dsh-wsl-tool: channel install route')
       })
     }
   } catch (error) {
@@ -832,6 +931,11 @@ export function apply(ctx, settings = {}) {
       try {
         Object.assign(config, resolveConfig(process.env, settings))
         syncTools()
+        // The channel advertises `enabled` and the default session in its state file, so a
+        // switch flip has to rewrite it; a channel whose first bind failed gets one more try.
+        channel?.refresh().catch((error) => {
+          console.warn('dsh-wsl-tool: refreshing the WSL channel failed', error)
+        })
       } catch (error) {
         console.error('dsh-wsl-tool: applying a live settings change failed', error)
       }

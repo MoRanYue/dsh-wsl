@@ -19,7 +19,7 @@ project kept on a Windows drive keeps **Windows** filesystem semantics — no PO
 permissions, case-insensitive names, no file-change notifications — at a fraction
 of the speed (see [Notes](#notes)).
 
-![What the plugin does, in order of importance](assets/market-preview-features-8.png)
+![What the plugin does, in order of importance](assets/market-preview-features-9.png)
 
 ## Tools
 
@@ -435,6 +435,37 @@ choose rather than a fixed large value. Same write rules and the same next-start
 - An id-targeted patch replaces that row's whole config, so restate anything else
   you had set on it (terminal limits, scrollback, a custom `shellCandidates` list).
 
+## The `dsh` command inside WSL
+
+The desktop app can be reached from a WSL prompt:
+
+```sh
+dsh "帮我把 nemu 的编译错误修掉"
+```
+
+The text goes into the DSH conversation the panel designates — the client shows the
+same message and the same reply, live — and the terminal streams the turn back: a
+thinking marker with its latency, the reasoning as the model produces it, the answer,
+then a one-line summary (elapsed, steps, tokens). `Ctrl+C` stops waiting only; the
+turn keeps running in the client.
+
+| command | does |
+|---|---|
+| `dsh "问题"` | send to the current session and stream the reply |
+| `dsh <id> "问题"` | send to that session |
+| `dsh list` | sessions, newest first; `*` marks the current one |
+| `dsh new <id>` | create a session (it appears in the client) and switch to it |
+| `dsh use <id>` | switch the current session |
+| `dsh rm <id>` | archive a session — the client's own reversible remove |
+| `dsh status` | current session and channel state |
+
+Set it up once in the panel: turn on **启用 WSL 通道**, set the session id, and click
+**安装 dsh 命令**; the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
+server to the address WSL uses as its default gateway, on a random port, and demands
+the token it generated at mount on every request. The desktop has to be running, and
+the designated conversation is ordinary: the channel admits a normal user message, so
+the same reply appears in the client.
+
 ## `wsl` parameters
 
 | Param | Required | Type | Notes |
@@ -625,7 +656,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 885 host checks against real WSL (shim for ctx.subprocess) + 170 client checks
+npm test          # 937 host checks against real WSL (shim for ctx.subprocess) + 171 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

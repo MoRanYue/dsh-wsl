@@ -229,13 +229,14 @@ const sectionIn = (nodes, title) => nodes.find((node) => node.type === 'section'
   && node.props.children[0].type === 'h3'
   && node.props.children[0].props?.children === title)
 const switches = found.filter((node) => node.type?.primitiveName === 'Switch')
-check('it renders one switch per switchable feature', switches.length === 10,
+check('it renders one switch per switchable feature', switches.length === 11,
   `found ${switches.length}; rendered: ${found.map((node) => String(node.type?.primitiveName ?? node.type)).join(',')}`)
 const labels = switches.map((node) => node.props?.label).filter((v) => typeof v === 'string')
 for (const expected of [
   'wsl 命令执行', 'wsl-path 路径转换', 'wsl-env 能力体检',
   'wsl-doctor 项目体检', 'wsl-bootstrap 安装工具链',
   '后台任务', '自动转换路径', '默认跟随会话工作区', '危险命令守卫', '管理员模式（root）',
+  '启用 WSL 通道',
 ]) {
   check(`it labels the ${expected} row`, labels.includes(expected), labels.join(' | '))
 }

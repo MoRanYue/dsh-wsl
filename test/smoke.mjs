@@ -13,6 +13,7 @@
 // behind a hand-written imitation.
 
 import { spawn } from 'node:child_process'
+import { request as httpRequest } from 'node:http'
 import {
   appendFileSync, chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
@@ -25,6 +26,7 @@ import { resolveConfig } from '../lib/config.js'
 import { pickSchemaBuilder } from '../lib/schema.js'
 import { buildCdCommand, quotePath, shellQuote, windowsPathToWsl } from '../lib/paths.js'
 import { destructiveReason } from '../lib/guard.js'
+import { channelSessionOf, createChannel, sessionRecordOf, titlesOf } from '../lib/channel.js'
 import { cleanStderr, formatResult, normalizeExitCode, streamFacts } from '../lib/result.js'
 import { assertLauncherReachable, collectForwardEnv, resolveDistro, sessionCwdOf } from '../lib/runner.js'
 import { capabilityLines, launcherSummary, parseFacts, workspaceLine } from '../lib/diagnostics.js'
@@ -1675,7 +1677,19 @@ async function toolTests(tools, shim) {
       done.entries.some((entry) => entry.terminalCreated === false))
     check("the other conversation stays empty", log.list("s2").total === 0)
   }
-  eq('the plugin publishes exactly its three routes', tools.routes.length, 3)
+  // Three original routes plus the two WSL-channel routes (state for the panel, install
+  // for the shim). The channel's own server is separate and is not a plugin route.
+  eq('the plugin publishes its five routes', tools.routes.length, 5)
+  const channelStateRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/channel')
+  const channelInstallRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/channel-install')
+  check('the channel state route is namespaced', channelStateRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
+  check('the channel install route is namespaced', channelInstallRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
+  eq('the channel state route matches exactly', channelStateRoute?.kind, 'exact')
+  eq('the channel state route is read-only', await (async () => {
+    const probe = { writeHead(code, headers) { this.code = code; this.headers = headers }, end(body) { this.body = body } }
+    await channelStateRoute.handler({ method: 'POST', headers: {} }, probe)
+    return probe.code
+  })(), 405)
   const infoRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/info')
   const terminalRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/terminal-cwd')
   check('the self-info route is namespaced', infoRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
@@ -3471,6 +3485,216 @@ async function toolTests(tools, shim) {
   )
 }
 
+// --- WSL channel (host half) ----------------------------------------------
+
+/**
+ * Drive `lib/channel.js` against fake host services: a real HTTP server on loopback, the
+ * real state file and the real frame protocol. What cannot be faked here is the DSH client
+ * itself, so the checks assert the contract the shim relies on — auth, frame order, base64
+ * chunks, the end line — rather than what the GUI paints.
+ */
+async function channelUnitTests() {
+  eq('the channel session defaults to wsl', channelSessionOf({}), 'wsl')
+  eq('a blank channel session falls back to wsl', channelSessionOf({ channelSession: '   ' }), 'wsl')
+  eq('a configured channel session is trimmed', channelSessionOf({ channelSession: '  work  ' }), 'work')
+
+  const headerRecord = sessionRecordOf({ header: { id: 'a', cwd: 'D:\\x', createdAt: 5 } })
+  eq('a session record reads the header',
+    `${headerRecord.id}|${headerRecord.cwd}|${String(headerRecord.createdAt)}`, 'a|D:\\x|5')
+  eq('a session record reads the nested session', sessionRecordOf({ session: { id: 'b' } }).id, 'b')
+  eq('an unreadable session record becomes empty', sessionRecordOf({ nope: 1 }).id, '')
+  eq('titles read from a Map', titlesOf(new Map([['a', 'T']])).get('a'), 'T')
+  eq('titles read from an array', titlesOf([{ id: 'a', title: 'T' }]).get('a'), 'T')
+  eq('titles read from an object', titlesOf({ a: { title: 'T' } }).get('a'), 'T')
+
+  const home = mkdtempSync(join(tmpdir(), 'dsh-wsl-channel-'))
+  const listeners = new Map()
+  const calls = []
+  const sessions = new Map([
+    ['session-a', { id: 'session-a', cwd: 'D:\\work', createdAt: 3 }],
+    ['wsl', { id: 'wsl', cwd: 'D:\\work', createdAt: 2 }],
+  ])
+  const emit = (name, ...args) => { for (const fn of listeners.get(name) ?? []) fn(...args) }
+  const services = {
+    sessionController: {
+      async prompt(request) {
+        calls.push(['prompt', request])
+        const id = request.sessionId
+        setTimeout(() => {
+          emit('agent/assistant-stream', { agent: { session: { id } }, frame: { type: 'start' } })
+          emit('agent/assistant-stream', { agent: { session: { id } }, frame: { type: 'chunk', chunk: { type: 'reasoning-delta', text: 'why' } } })
+          emit('agent/assistant-stream', { agent: { session: { id } }, frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'he' } } })
+          emit('agent/assistant-stream', { agent: { session: { id } }, frame: { type: 'chunk', chunk: { type: 'text-delta', text: 'llo' } } })
+        }, 5)
+        setTimeout(() => {
+          emit('session/event', { id }, { type: 'step/start', data: { turn: 1, step: 1 } })
+          emit('session/event', { id }, {
+            type: 'assistant/message',
+            data: { message: { content: [{ type: 'text', text: 'hello' }] }, usage: { inputTokens: 9, outputTokens: 2 } },
+          })
+          emit('session/event', { id }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+        }, 25)
+        return { accepted: true }
+      },
+      async create(request) {
+        calls.push(['create', request])
+        return { sessionId: request.sessionId ?? 'minted' }
+      },
+    },
+    sessionQuery: {
+      async listSessions() { return [...sessions.values()] },
+      async readTitleSnapshots(ids) { return new Map(ids.map((id) => [id, `title of ${id}`])) },
+    },
+    workspaceController: {
+      async archiveSession(request) { calls.push(['archive', request]); return {} },
+    },
+    agents: { get(id) { return id === 'open-1' ? { id } : undefined } },
+  }
+  const ctx = {
+    get(name) { return services[name] },
+    on(name, fn) {
+      if (!listeners.has(name)) listeners.set(name, new Set())
+      listeners.get(name).add(fn)
+      return () => listeners.get(name)?.delete(fn)
+    },
+  }
+  const wslCalls = []
+  const wsl = async (argv) => {
+    wslCalls.push(argv)
+    // Answer the route probe with nothing: a fake address would force a bind to an interface
+    // CI does not have, and the fallback path is what must be proven here.
+    if (argv.join(' ').includes(' route ')) return { code: 0, stdout: '', stderr: '' }
+    return { code: 0, stdout: '/home/xiny/.local/bin/dsh\n', stderr: '' }
+  }
+  const config = { channelEnabled: true, channelSession: 'wsl' }
+  const channel = createChannel({ ctx, config, wsl, env: { USERPROFILE: home } })
+  const { port, host } = await channel.start()
+  const stateFile = join(home, '.dsh', 'dsh-wsl', 'channel.json')
+  const call = (method, path, body, headers = {}) => new Promise((done, fail) => {
+    const request = httpRequest({ host: '127.0.0.1', port, method, path, headers }, (response) => {
+      const chunks = []
+      response.on('data', (chunk) => chunks.push(chunk))
+      response.on('end', () => done({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+    })
+    request.on('error', fail)
+    if (body !== undefined) request.write(body)
+    request.end()
+  })
+  try {
+    check('the channel binds a real port', port > 0, String(port))
+    check('the channel asks WSL for the host address',
+      wslCalls.some((argv) => argv.join(' ').includes(' route ')), JSON.stringify(wslCalls))
+    eq('it falls back to every interface when WSL cannot answer', host, '0.0.0.0')
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'))
+    eq('the state file advertises the port', state.port, port)
+    eq('the state file advertises the session', state.sessionId, 'wsl')
+    eq('the state file carries a 64-char token', state.token.length, 64)
+    eq('the token is this channel instance\'s', state.token, channel.token)
+
+    const stateLine = await call('GET', '/state')
+    check('the state route answers the shim', stateLine.body.includes('enabled=1') && stateLine.body.includes(`port=${String(port)}`), stateLine.body)
+
+    const denied = await call('POST', '/say', 'hi', { 'content-type': 'text/plain' })
+    eq('a request without the token is refused', denied.status, 401)
+    const wrong = await call('POST', '/say', 'hi', { 'content-type': 'text/plain', 'x-dsh-wsl-token': 'x'.repeat(64) })
+    eq('a request with a wrong token is refused', wrong.status, 401)
+
+    const said = await call('POST', '/say', 'hi', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('the say route answers 200', said.status, 200)
+    const frames = said.body.split('\n').filter((line) => line !== '')
+    eq('the first frame acknowledges the request', frames[0], '~ack')
+    check('the turn reports when reasoning started', /^~r \d+$/.test(frames.find((line) => line.startsWith('~r')) ?? ''), said.body)
+    check('the turn reports when text started', /^~t \d+$/.test(frames.find((line) => line.startsWith('~t')) ?? ''), said.body)
+    const chunkText = frames.filter((line) => line.startsWith('~a '))
+      .map((line) => Buffer.from(line.slice(3), 'base64').toString('utf8')).join('')
+    eq('answer chunks come back as raw text', chunkText, 'hello')
+    eq('reasoning chunks come back as raw text',
+      Buffer.from((frames.find((line) => line.startsWith('~s ')) ?? '~s ').slice(3), 'base64').toString('utf8'), 'why')
+    check('one step frame is sent', frames.some((line) => line.startsWith('~step ')), said.body)
+    const endFrame = frames.find((line) => line.startsWith('~e ')) ?? ''
+    const end = endFrame.split(' ')
+    eq('the end frame reports success', end[1], '1')
+    eq('the end frame counts the steps', end[3], '1')
+    eq('the end frame carries the usage', `${end[4]}/${end[5]}`, '9/2')
+    eq('the end frame names the reason', Buffer.from(end.slice(6).join(' '), 'base64').toString('utf8'), 'completed')
+    const prompted = calls.find((entry) => entry[0] === 'prompt')
+    eq('the prompt goes through the client session controller', prompted?.[1]?.sessionId, 'wsl')
+    eq('the prompt carries the raw text', prompted?.[1]?.content?.[0]?.text, 'hi')
+    check('the prompt carries a request id', typeof prompted?.[1]?.requestId === 'string' && prompted[1].requestId !== '')
+
+    const listed = await call('POST', '/list', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    check('the list route returns tab-separated sessions',
+      listed.body.includes('session-a\t') && listed.body.includes('title of session-a'), listed.body)
+    check('the list route marks the current session', /wsl\t[^\n]*\t2\t\*/.test(listed.body), listed.body)
+
+    const created = await call('POST', '/new', 'brand-new', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('a new session is created', created.body.trim(), 'ok\tbrand-new')
+    const createCall = calls.find((entry) => entry[0] === 'create')
+    eq('the new session takes the newest session\'s directory', createCall?.[1]?.cwd, 'D:\\work')
+
+    const openRm = await call('POST', '/rm', 'open-1', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('a session open in DSH is not archived', openRm.status, 409)
+    const closedRm = await call('POST', '/rm', 'session-a', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('a closed session is archived', closedRm.body.trim(), 'ok\tsession-a')
+    eq('the archive goes through the workspace controller',
+      calls.filter((entry) => entry[0] === 'archive').length, 1)
+
+    const installed = await channel.install()
+    eq('install succeeds with a working wsl runner', installed.ok, true)
+    const shim = readFileSync(join(home, '.dsh', 'dsh-wsl', 'dsh.sh'), 'utf8')
+    check('the installed shim has its config path filled in',
+      shim.includes('/mnt/') && !shim.includes('__CHANNEL_CONFIG__'), 'the placeholder survived')
+    check('the installed shim points at the state file', shim.includes('/.dsh/dsh-wsl/channel.json'), shim.slice(0, 400))
+    check('the install command copies and marks the shim executable',
+      (wslCalls[wslCalls.length - 1] ?? []).join(' ').includes('install -m 0755'), JSON.stringify(wslCalls[wslCalls.length - 1]))
+
+    const refuseInstall = await createChannel({ ctx, config: { channelEnabled: false } }).install()
+    eq('install without a wsl runner is refused', refuseInstall.ok, false)
+  } finally {
+    await channel.stop()
+    try { rmSync(home, { recursive: true, force: true }) } catch {}
+  }
+
+  // A disabled channel answers, but refuses the turn; and a host without the session
+  // controller reports that in words instead of throwing.
+  const off = createChannel({ ctx, config: { channelEnabled: false }, env: { USERPROFILE: home } })
+  const offPort = (await off.start()).port
+  try {
+    const disabled = await new Promise((done, fail) => {
+      const request = httpRequest({ host: '127.0.0.1', port: offPort, method: 'POST', path: '/say', headers: { 'content-type': 'text/plain', 'x-dsh-wsl-token': off.token } }, (response) => {
+        const chunks = []
+        response.on('data', (chunk) => chunks.push(chunk))
+        response.on('end', () => done({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+      })
+      request.on('error', fail)
+      request.write('hi')
+      request.end()
+    })
+    eq('a disabled channel refuses the turn', disabled.status, 409)
+  } finally {
+    await off.stop()
+  }
+  const bare = createChannel({ ctx: { get: () => undefined, on: () => () => {} }, config: { channelEnabled: true }, env: { USERPROFILE: home } })
+  const barePort = (await bare.start()).port
+  try {
+    const refused = await new Promise((done, fail) => {
+      const request = httpRequest({ host: '127.0.0.1', port: barePort, method: 'POST', path: '/say', headers: { 'content-type': 'text/plain', 'x-dsh-wsl-token': bare.token } }, (response) => {
+        const chunks = []
+        response.on('data', (chunk) => chunks.push(chunk))
+        response.on('end', () => done({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+      })
+      request.on('error', fail)
+      request.write('hi')
+      request.end()
+    })
+    eq('a host without the session controller refuses in words', refused.status, 501)
+    check('the refusal names what is missing', refused.body.includes('sessionController'), refused.body)
+  } finally {
+    await bare.stop()
+    try { rmSync(home, { recursive: true, force: true }) } catch {}
+  }
+}
+
 // --- main ------------------------------------------------------------------
 
 const modulesRoot = process.env.DSH_SUBPROCESS_LOCAL
@@ -3490,6 +3714,7 @@ try {
     Object.keys(tools).sort().join(',') === 'wsl,wsl-doctor,wsl-env,wsl-path,wsl-term', Object.keys(tools).join(','))
   await unitTests()
   await terminalUnitTests()
+  await channelUnitTests()
   await toolTests(tools, shim)
 } finally {
   try { rmSync(spillDir, { recursive: true, force: true }) } catch {}

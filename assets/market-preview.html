@@ -56,6 +56,15 @@
   }
   .coop h2 { font-size: 18px; font-weight: 640; letter-spacing: .2px; margin-top: 6px; }
   .coop p { color: var(--dim); font-size: 14px; line-height: 1.55; margin-top: 7px; }
+  /* Two ways to reach a conversation: the terminal you opened, and the dsh command
+     typed in WSL. They sit side by side so the card stays inside 800px. */
+  .pairs { margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .pairs .coop { margin-top: 0; }
+  .coop code {
+    font-family: "Cascadia Mono", Consolas, "Courier New", monospace; font-size: 12.5px;
+    color: var(--mid); background: #0f0f11; border: 1px solid var(--line-soft);
+    border-radius: 5px; padding: 1px 5px; white-space: nowrap;
+  }
 
   .more { margin-top: 20px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
   .item {
@@ -97,10 +106,17 @@
     </div>
   </div>
 
-  <div class="coop">
-    <div class="tag">你打开的终端</div>
-    <h2>用户新建的终端可以协作</h2>
-    <p>你在侧边栏新建的终端，模型可直接在其中工作：命令与输出全程可见；工作期间终端只读，点击「接管输入」即可随时收回键盘。</p>
+  <div class="pairs">
+    <div class="coop">
+      <div class="tag">你打开的终端</div>
+      <h2>用户新建的终端可以协作</h2>
+      <p>你在侧边栏新建的终端，模型可直接在其中工作：命令与输出全程可见；工作期间终端只读，点击「接管输入」即可随时收回键盘。</p>
+    </div>
+    <div class="coop">
+      <div class="tag">WSL 终端里</div>
+      <h2><code>dsh</code> 命令</h2>
+      <p>输入 <code>dsh "问题"</code>，话就进入指定的 DSH 会话：思考时间与回复流式回到终端；<code>dsh list/use/new/rm</code> 管理会话。</p>
+    </div>
   </div>
 
   <div class="more">
