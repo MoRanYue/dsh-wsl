@@ -3508,8 +3508,10 @@ async function channelUnitTests() {
   eq('titles read from a Map', titlesOf(new Map([['a', 'T']])).get('a'), 'T')
   eq('titles read from an array', titlesOf([{ id: 'a', title: 'T' }]).get('a'), 'T')
   eq('titles read from an object', titlesOf({ a: { title: 'T' } }).get('a'), 'T')
+  eq('titles read a title snapshot object (the real value shape)',
+    titlesOf([{ sessionId: 'a', status: 'fulfilled', value: { session: { id: 'a' }, title: { title: 'T3' } } }]).get('a'), 'T3')
   eq('titles read from settled results (the real sessionQuery shape)',
-    titlesOf([{ sessionId: 'a', status: 'fulfilled', value: { session: { id: 'a' }, title: 'T2' } }, { status: 'rejected', reason: new Error('x') }]).get('a'), 'T2')
+    titlesOf([{ sessionId: 'a', status: 'fulfilled', value: { session: { id: 'a' }, title: { title: 'T2' } } }, { status: 'rejected', reason: new Error('x') }]).get('a'), 'T2')
   const forkedRecord = sessionRecordOf({ header: { id: 'f', parentSession: 'p', origin: 'subagent' } })
   eq('a session record exposes the fork fields the picker filters on', `${String(forkedRecord.parentSession)}|${String(forkedRecord.origin)}`, 'p|subagent')
 
@@ -3665,7 +3667,7 @@ async function channelUnitTests() {
   // conversations, newest first, plus the configured session even while it has no title.
   const registryForPicker = {
     archivedSessionIds: ['archived-1'],
-    list: () => [{ title: '工作区', path: 'D:\\w', sessionIds: ['session-a', 'untitled-1', 'archived-1', 'sub-1'] }],
+    list: () => [{ title: '工作区', path: 'D:\\w', sessionIds: ['session-a', 'untitled-1', 'archived-1', 'sub-1', 'wsl'] }],
   }
   const queryForPicker = {
     async listSessions() {
@@ -3700,10 +3702,10 @@ async function channelUnitTests() {
       request.end()
     })
     check('the list shows a real conversation by its title', listed.includes('真正的会话') && listed.includes('session-a'), listed)
-    check('untitled sessions stay out of the list', !listed.includes('untitled-1'), listed)
+    check('sessions without a title are still listed', listed.includes('untitled-1'), listed)
     check('archived sessions stay out of the list', !listed.includes('archived-1'), listed)
     check('forked or subagent sessions stay out of the list', !listed.includes('sub-1'), listed)
-    check('the configured session is listed even while it has no title', listed.includes('(当前会话，尚无标题)') && /wsl\t[^\n]*\t\*/.test(listed), listed)
+    check('the configured session is marked in the list', /wsl\t[^\n]*\t\*/.test(listed), listed)
   } finally {
     await filtered.stop()
   }
