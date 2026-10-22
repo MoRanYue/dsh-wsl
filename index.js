@@ -173,6 +173,7 @@ const TERMINAL_ROUTE = '/dsh-wsl-tool/terminal-cwd'
  */
 const CHANNEL_STATE_ROUTE = '/dsh-wsl-tool/channel'
 const CHANNEL_INSTALL_ROUTE = '/dsh-wsl-tool/channel-install'
+const CHANNEL_NEW_ROUTE = '/dsh-wsl-tool/channel-new'
 /** What the client's dock row above the composer reads. */
 const SUBTASK_ROUTE = '/dsh-wsl-tool/subtasks'
 
@@ -915,6 +916,37 @@ export function apply(ctx, settings = {}) {
             answerJson(response, 500, { ok: false, detail: String(error?.message ?? error) })
           }
         }, 'dsh-wsl-tool: channel install route')
+        // Create a session from the panel's picker, so a fresh profile can adopt the
+        // feature without guessing an id. Same JSON-only rule as the install route.
+        publish(CHANNEL_NEW_ROUTE, async (request, response) => {
+          if (request.method !== 'POST') {
+            response.writeHead(405, { allow: 'POST' })
+            response.end()
+            return
+          }
+          const type = String(requestHeader(request, 'content-type') ?? '').toLowerCase()
+          if (!type.startsWith('application/json')) {
+            answerJson(response, 415, { ok: false, detail: 'content-type must be application/json' })
+            return
+          }
+          let body
+          try {
+            body = await readJsonBody(request)
+          } catch {
+            answerJson(response, 400, { ok: false, detail: 'the body is not valid JSON' })
+            return
+          }
+          if (channel === null) {
+            answerJson(response, 503, { ok: false, detail: 'the WSL channel is unavailable in this host' })
+            return
+          }
+          try {
+            const result = await channel.createSession(typeof body?.sessionId === 'string' ? body.sessionId.trim() : '')
+            answerJson(response, 200, result)
+          } catch (error) {
+            answerJson(response, 500, { ok: false, detail: String(error?.message ?? error) })
+          }
+        }, 'dsh-wsl-tool: channel new-session route')
       })
     }
   } catch (error) {

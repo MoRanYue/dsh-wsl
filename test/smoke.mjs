@@ -1677,13 +1677,15 @@ async function toolTests(tools, shim) {
       done.entries.some((entry) => entry.terminalCreated === false))
     check("the other conversation stays empty", log.list("s2").total === 0)
   }
-  // Three original routes plus the two WSL-channel routes (state for the panel, install
-  // for the shim). The channel's own server is separate and is not a plugin route.
-  eq('the plugin publishes its five routes', tools.routes.length, 5)
+  // Three original routes plus three WSL-channel routes: state for the panel, install for
+  // the shim, and the picker's create-a-session action. The channel's own server is
+  eq('the plugin publishes its six routes', tools.routes.length, 6)
   const channelStateRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/channel')
   const channelInstallRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/channel-install')
+  const channelNewRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/channel-new')
   check('the channel state route is namespaced', channelStateRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
   check('the channel install route is namespaced', channelInstallRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
+  check('the channel new-session route is namespaced', channelNewRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
   eq('the channel state route matches exactly', channelStateRoute?.kind, 'exact')
   eq('the channel state route is read-only', await (async () => {
     const probe = { writeHead(code, headers) { this.code = code; this.headers = headers }, end(body) { this.body = body } }

@@ -459,8 +459,7 @@ turn keeps running in the client.
 | `dsh rm <id>` | archive a session — the client's own reversible remove |
 | `dsh status` | current session and channel state |
 
-Set it up once in the panel: turn on **启用 WSL 通道**, set the session id, and click
-**安装 dsh 命令**; the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
+Set it up once in the panel: turn on **启用 dsh 命令**, pick the conversation from the list (or create one right there), and click **安装 dsh 命令**; the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
 server to the address WSL uses as its default gateway, on a random port, and demands
 the token it generated at mount on every request. The desktop has to be running, and
 the designated conversation is ordinary: the channel admits a normal user message, so
@@ -656,7 +655,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 937 host checks against real WSL (shim for ctx.subprocess) + 171 client checks
+npm test          # 938 host checks against real WSL (shim for ctx.subprocess) + 171 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

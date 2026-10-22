@@ -236,7 +236,7 @@ for (const expected of [
   'wsl 命令执行', 'wsl-path 路径转换', 'wsl-env 能力体检',
   'wsl-doctor 项目体检', 'wsl-bootstrap 安装工具链',
   '后台任务', '自动转换路径', '默认跟随会话工作区', '危险命令守卫', '管理员模式（root）',
-  '启用 WSL 通道',
+  '启用 dsh 命令',
 ]) {
   check(`it labels the ${expected} row`, labels.includes(expected), labels.join(' | '))
 }
