@@ -1,7 +1,7 @@
 {
   "name": "dsh-wsl-tool",
-  "version": "1.12.8",
-  "description": "Linux-native DSH, extended to WSL. Commands run on a real kernel: exit codes, signals, timeouts. One long-lived shell for multi-step work, a clean one for everything else; subtasks stay visible above the composer. Your own terminal stays in the loop — commands in view, keyboard one click away. Path conversion, environment checks, background jobs; destructive commands ask first. Runs as you, inside the DSH sandbox.",
+  "version": "1.12.9",
+  "description": "Linux-native DSH, extended to WSL. Commands run on a real kernel: exit codes, signals, timeouts. One long-lived shell for multi-step work, a clean one for everything else; subtasks stay visible above the composer. Your own terminal stays in the loop — commands in view, keyboard one click away. Path conversion, environment checks, background jobs; destructive commands ask first. Runs as you, below the DSH sandbox (it does not confine it); the in-view terminal exists up to DSH 0.2.0.",
   "type": "module",
   "main": "index.js",
   "exports": {
