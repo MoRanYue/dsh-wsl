@@ -26,7 +26,7 @@ import { resolveConfig } from '../lib/config.js'
 import { pickSchemaBuilder } from '../lib/schema.js'
 import { buildCdCommand, quotePath, shellQuote, windowsPathToWsl } from '../lib/paths.js'
 import { destructiveReason } from '../lib/guard.js'
-import { channelSessionOf, createChannel, firstUserLine, sessionRecordOf, titlesOf } from '../lib/channel.js'
+import { SAY_PREFIX, channelSessionOf, createChannel, firstUserLine, sessionRecordOf, titlesOf } from '../lib/channel.js'
 import { cleanStderr, formatResult, normalizeExitCode, streamFacts } from '../lib/result.js'
 import { assertLauncherReachable, collectForwardEnv, resolveDistro, sessionCwdOf } from '../lib/runner.js'
 import { capabilityLines, launcherSummary, parseFacts, workspaceLine } from '../lib/diagnostics.js'
@@ -3576,7 +3576,13 @@ async function channelUnitTests() {
     workspaceController: {
       async archiveSession(request) { calls.push(['archive', request]); return {} },
     },
-    agents: { get(id) { return id === 'open-1' ? { id } : undefined } },
+    agents: {
+      get(id) {
+        if (id === 'open-1') return { id }
+        if (id === 'session-busy') return { id, status: 'running' }
+        return undefined
+      },
+    },
   }
   const ctx = {
     get(name) { return services[name] },
@@ -3648,8 +3654,17 @@ async function channelUnitTests() {
     eq('the end frame names the reason', Buffer.from(end.slice(6).join(' '), 'base64').toString('utf8'), 'completed')
     const prompted = calls.find((entry) => entry[0] === 'prompt')
     eq('the prompt goes through the client session controller', prompted?.[1]?.sessionId, 'wsl')
-    eq('the prompt carries the raw text', prompted?.[1]?.content?.[0]?.text, 'hi')
+    eq('the prompt is marked as coming from the terminal', prompted?.[1]?.content?.[0]?.text, `${SAY_PREFIX} hi`)
+    eq('the prompt asks for the documented queue mode', prompted?.[1]?.mode, 'queue')
     check('the prompt carries a request id', typeof prompted?.[1]?.requestId === 'string' && prompted[1].requestId !== '')
+
+    // A target that is already answering queues the prompt; the terminal must say so.
+    const queued = await call('POST', '/say', 'in line', {
+      'content-type': 'text/plain',
+      'x-dsh-wsl-token': state.token,
+      'x-dsh-wsl-session': 'session-busy',
+    })
+    check('a busy target announces the queue', queued.body.split('\n').includes('~q'), queued.body)
 
     const listed = await call('POST', '/list', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
     check('the list route returns tab-separated sessions',

@@ -449,6 +449,10 @@ thinking marker with its latency, the reasoning as the model produces it, the an
 then a one-line summary (elapsed, steps, tokens). `Ctrl+C` stops waiting only; the
 turn keeps running in the client.
 
+Messages that arrive this way carry a 「【WSL 终端】」 prefix, so the conversation shows
+where they came from; if that conversation is already answering, the prompt joins its
+queue and the terminal says so instead of staying silent.
+
 | command | does |
 |---|---|
 | `dsh "问题"` | send to the current session and stream the reply |
@@ -462,7 +466,8 @@ turn keeps running in the client.
 Set it up once in the panel: turn on **启用 dsh 命令**, pick the conversation from the list (or create one right there), and click **安装 dsh 命令**; the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
 server to the address WSL uses as its default gateway, on a random port, and demands
 the token it generated at mount on every request. The desktop has to be running, and
-the designated conversation is ordinary: the channel admits a normal user message, so
+the designated conversation is ordinary: the channel admits a normal user message (prefixed
+with 「【WSL 终端】」), so
 the same reply appears in the client.
 
 ## `wsl` parameters
@@ -655,7 +660,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 959 host checks against real WSL (shim for ctx.subprocess) + 172 client checks
+npm test          # 961 host checks against real WSL (shim for ctx.subprocess) + 172 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
