@@ -288,7 +288,7 @@ check('the guard keeps its own wording rather than the new one',
   switches.some((node) => node.props?.label === '危险命令守卫' && String(node.props?.title).includes('有风险')),
   JSON.stringify(switches.map((node) => node.props?.title)))
 check('the panel says the installer is off unless the user turns it on',
-  rendered.includes('wsl-bootstrap 安装工具链') && rendered.includes('模型再确认一次才会真正安装'),
+  rendered.includes('wsl-bootstrap 安装工具链') && rendered.includes('模型再次确认后才执行'),
   rendered.slice(0, 200))
 check('and it explains that root is the authorisation itself',
   rendered.includes('管理员模式（root）') && rendered.includes('这项开关就是授权本身'), rendered.slice(0, 200))
@@ -845,7 +845,7 @@ getAnswer = { path: '', available: false, error: null }
 const missingRow = mountStateful(main.component, { ...panelProps })
 await missingRow.flush()
 check('a profile without the terminal row points at the opt-in',
-  textOf(missingRow.tree()).includes('还没有 WSL 终端这一项'), textOf(missingRow.tree()).slice(-240))
+  textOf(missingRow.tree()).includes('当前配置未启用 WSL 终端'), textOf(missingRow.tree()).slice(-240))
 eq('and saving is withheld until that opt-in exists', fieldIn(missingRow.tree()).save?.props?.disabled, true)
 check('while the field itself stays editable',
   fieldIn(missingRow.tree()).input?.props?.disabled !== true,
@@ -863,7 +863,7 @@ check('a host that cannot name the patch file reports that reason',
   unresolvedText.includes('读取失败') && unresolvedText.includes('profileContext'),
   unresolvedText.slice(-260))
 check('and it is not dressed up as a missing opt-in',
-  !unresolvedText.includes('还没有 WSL 终端那一项'), unresolvedText.slice(-260))
+  !unresolvedText.includes('当前配置未启用 WSL 终端'), unresolvedText.slice(-260))
 check('the field is still typeable in that state',
   fieldIn(unresolved.tree()).input?.props?.disabled !== true,
   String(fieldIn(unresolved.tree()).input?.props?.disabled))
@@ -937,7 +937,7 @@ context.fetch = undefined
 const noFetch = mountStateful(main.component, { ...panelProps })
 await noFetch.flush()
 check('a browser without fetch still renders the field',
-  textOf(noFetch.tree()).includes('没有 fetch'), textOf(noFetch.tree()).slice(-200))
+  textOf(noFetch.tree()).includes('当前环境无法读取设置值'), textOf(noFetch.tree()).slice(-200))
 check('and that panel offers a save control too', fieldIn(noFetch.tree()).save !== undefined)
 noFetch.unmount()
 context.fetch = realFetch
