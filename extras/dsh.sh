@@ -154,6 +154,7 @@ cmd_say() {
   while IFS= read -r line; do
     case "$line" in
       '~ack') ;;
+      '~q') printf '\033[2m该会话正在执行任务，消息已排队；轮到后开始回答（Ctrl+C 只停止等待，问题仍在队列里）\033[0m\n' ;;
       '~r '*) ms=${line#'~r '}; printf '\033[2m⏱ 思考中… %d.%01ds\033[0m' $((ms / 1000)) $(((ms % 1000) / 100)); reason=1 ;;
       '~t '*) if [ "$reason" = 1 ]; then printf '\033[0m\n'; fi; reason=2 ;;
       '~s '*) [ "$reason" = 1 ] || printf '\033[2m'; printf '%s' "${line#'~s '}" | base64 -d; reason=1 ;;

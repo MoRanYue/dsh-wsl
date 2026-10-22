@@ -3658,17 +3658,16 @@ async function channelUnitTests() {
     eq('the prompt asks for the documented queue mode', prompted?.[1]?.mode, 'queue')
     check('the prompt carries a request id', typeof prompted?.[1]?.requestId === 'string' && prompted[1].requestId !== '')
 
-    // A busy target is refused: the same agent cannot answer while it is still working,
-    // so the channel must not queue a message and pretend it was accepted.
-    const busySay = await call('POST', '/say', 'in line', {
+    // A busy target delays the answer instead of losing it: the prompt queues, and the
+    // terminal is told so before the stream goes quiet.
+    const queuedSay = await call('POST', '/say', 'in line', {
       'content-type': 'text/plain',
       'x-dsh-wsl-token': state.token,
       'x-dsh-wsl-session': 'session-busy',
     })
-    eq('a busy target is refused', busySay.status, 409)
-    check('the refusal says the conversation is busy', busySay.body.includes('正在执行任务'), busySay.body)
-    eq('a refused prompt never reaches the controller',
-      calls.filter((entry) => entry[0] === 'prompt').length, 1)
+    check('a busy target announces the queue', queuedSay.body.split('\n').includes('~q'), queuedSay.body)
+    eq('a queued prompt still reaches the controller',
+      calls.filter((entry) => entry[0] === 'prompt').length, 2)
 
     const listed = await call('POST', '/list', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
     check('the list route returns tab-separated sessions',

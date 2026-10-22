@@ -450,9 +450,9 @@ then a one-line summary (elapsed, steps, tokens). `Ctrl+C` stops waiting only; t
 turn keeps running in the client.
 
 Messages that arrive this way carry a 「【WSL 终端】」 prefix, so the conversation shows
-where they came from. A conversation that is still running a turn refuses the prompt:
-the same agent cannot answer while it is working, so the terminal says so instead of
-queueing behind the user's own request.
+where they came from. If that conversation is still running the user's turn, the message
+waits in its queue and the terminal says so; the answer streams once that turn ends, so a
+busy conversation is delayed, never dropped.
 
 | command | does |
 |---|---|
@@ -661,7 +661,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 963 host checks against real WSL (shim for ctx.subprocess) + 172 client checks
+npm test          # 962 host checks against real WSL (shim for ctx.subprocess) + 172 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
