@@ -3724,6 +3724,42 @@ async function channelUnitTests() {
   } finally {
     await filtered.stop()
   }
+  // The picker order must match the sidebar: the client controller lists by last activity
+  // (updatedAt = max(createdAt, lastPromptAt)), so an old session used recently comes first.
+  const orderedList = [
+    { sessionId: 'session-new-but-cold', updatedAt: 500, cwd: 'D:\\w', projections: { values: { title: '新建但没再用' } } },
+    { sessionId: 'session-old-used-now', updatedAt: 900, cwd: 'D:\\w', projections: { values: { title: '老会话刚用过' } } },
+    { sessionId: 'session-sub', updatedAt: 950, parentSessionId: 'session-old-used-now', cwd: 'D:\\w' },
+  ]
+  const orderedCtx = {
+    get(name) {
+      return {
+        sessionController: { async list() { return orderedList } },
+        workspaceRegistry: { archivedSessionIds: [], list: () => [{ title: 'w', path: 'D:\\w', sessionIds: orderedList.map((item) => item.sessionId) }] },
+      }[name]
+    },
+    on() { return () => {} },
+  }
+  const ordered = createChannel({ ctx: orderedCtx, config: { channelEnabled: true, channelSession: 'session-old-used-now' }, env: { USERPROFILE: home } })
+  const orderedPort = (await ordered.start()).port
+  try {
+    const listed = await new Promise((done, fail) => {
+      const request = httpRequest({ host: '127.0.0.1', port: orderedPort, method: 'POST', path: '/list', headers: { 'content-type': 'text/plain', 'x-dsh-wsl-token': ordered.token } }, (response) => {
+        const chunks = []
+        response.on('data', (chunk) => chunks.push(chunk))
+        response.on('end', () => done(Buffer.concat(chunks).toString('utf8')))
+      })
+      request.on('error', fail)
+      request.end()
+    })
+    const lines = listed.split(/\r?\n/).filter((line) => line.includes('session-'))
+    check('the picker orders like the sidebar: last activity first', lines[0]?.includes('session-old-used-now') === true, listed)
+    check('and marks the current session', lines[0]?.split('\t').at(-1) === '*', listed)
+    check('a subagent row never joins the picker', !listed.includes('session-sub'), listed)
+    check('the title comes from the projection', listed.includes('老会话刚用过'), listed)
+  } finally {
+    await ordered.stop()
+  }
   // A disabled channel answers, but refuses the turn; and a host without the session
   // controller reports that in words instead of throwing.
   const off = createChannel({ ctx, config: { channelEnabled: false }, env: { USERPROFILE: home } })
