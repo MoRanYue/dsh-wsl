@@ -37,13 +37,13 @@ cfg_json() { grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$CONFIG" 2>/de
 cfg_num() { grep -o "\"$1\"[[:space:]]*:[[:space:]]*[0-9][0-9]*" "$CONFIG" 2>/dev/null | head -1 | grep -o '[0-9][0-9]*$'; }
 
 load_channel() {
-  [ -r "$CONFIG" ] || die "找不到通道配置 $CONFIG —— 先在 DSH 侧边栏 WSL 面板里启用通道并安装 dsh 命令"
+  [ -r "$CONFIG" ] || die "找不到通道配置 $CONFIG —— 先在 DSH 侧边栏的 WSL 面板里打开「启用 dsh 命令」并安装 dsh 命令"
   TOKEN=$(cfg_json token)
   PORT=$(cfg_num port)
   ENABLED=$(grep -o '"enabled"[[:space:]]*:[[:space:]]*true' "$CONFIG" >/dev/null 2>&1 && echo 1 || echo 0)
   DEFAULT_SESSION=$(cfg_json sessionId)
   [ -n "${TOKEN:-}" ] && [ -n "${PORT:-}" ] || die "通道配置不完整 —— 在 DSH 面板里重新安装一次 dsh 命令"
-  [ "$ENABLED" = 1 ] || die "WSL 通道没有启用 —— 在 DSH 侧边栏 WSL 面板里打开「启用 WSL 通道」"
+  [ "$ENABLED" = 1 ] || die "WSL 通道没有启用 —— 在 DSH 侧边栏的 WSL 面板里打开「启用 dsh 命令」"
   GW=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
   [ -n "${GW:-}" ] || die "WSL 没有默认网关，无法连到 DSH 宿主机"
   BASE="http://$GW:$PORT"

@@ -891,6 +891,10 @@ async function unitTests() {
       eq('the plugin reads a real resolved volatile switch', liveConfig.dangerGuard, false)
       eq('the plugin reads a real nested volatile switch', liveConfig.tools.wsl, false)
       eq('the plugin reads the third real volatile switch', liveConfig.translatePaths, false)
+      const channelResolved = installed.Config({ channelEnabled: true, channelSession: 'session-x' })
+      const channelConfig = resolveConfig({}, channelResolved)
+      eq('the channel switch reaches the resolved config', channelConfig.channelEnabled, true)
+      eq('the channel session id reaches the resolved config', channelConfig.channelSession, 'session-x')
     }
   }
 
@@ -1058,6 +1062,8 @@ async function unitTests() {
   eq('a zero panel timeout means "not configured"',
     resolveConfig({ DSH_WSL_TIMEOUT_MS: '5000' }, { timeoutMs: 0 }).commandTimeoutMs, 5_000)
   eq('switches default to on', resolveConfig({}, {}).dangerGuard, true)
+eq('the channel is off by default', resolveConfig({}, {}).channelEnabled, false)
+eq('the channel session defaults to wsl', resolveConfig({}, {}).channelSession, 'wsl')
   eq('a non-boolean switch falls back instead of failing the mount',
     resolveConfig({}, { backgroundJobs: 'no' }).backgroundJobs, true)
   // The installer must NOT be mounted without a decision: it adds software. Its default
