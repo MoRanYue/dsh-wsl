@@ -1063,7 +1063,7 @@ async function unitTests() {
     resolveConfig({ DSH_WSL_TIMEOUT_MS: '5000' }, { timeoutMs: 0 }).commandTimeoutMs, 5_000)
   eq('switches default to on', resolveConfig({}, {}).dangerGuard, true)
 eq('the channel is off by default', resolveConfig({}, {}).channelEnabled, false)
-eq('the channel session defaults to wsl', resolveConfig({}, {}).channelSession, 'wsl')
+eq('the channel session defaults to auto mode', resolveConfig({}, {}).channelSession, '')
   eq('a non-boolean switch falls back instead of failing the mount',
     resolveConfig({}, { backgroundJobs: 'no' }).backgroundJobs, true)
   // The installer must NOT be mounted without a decision: it adds software. Its default
@@ -3506,8 +3506,8 @@ async function toolTests(tools, shim) {
  * chunks, the end line — rather than what the GUI paints.
  */
 async function channelUnitTests() {
-  eq('the channel session defaults to wsl', channelSessionOf({}), 'wsl')
-  eq('a blank channel session falls back to wsl', channelSessionOf({ channelSession: '   ' }), 'wsl')
+  eq('the channel session defaults to auto mode', channelSessionOf({}), '')
+  eq('a blank channel session stays in auto mode', channelSessionOf({ channelSession: '   ' }), '')
   eq('a configured channel session is trimmed', channelSessionOf({ channelSession: '  work  ' }), 'work')
 
   const headerRecord = sessionRecordOf({ header: { id: 'a', cwd: 'D:\\x', createdAt: 5 } })
@@ -3564,9 +3564,20 @@ async function channelUnitTests() {
         }, 25)
         return { accepted: true }
       },
+      async list() {
+        return {
+          items: [...sessions.values()].map((session) => ({
+            sessionId: session.id,
+            updatedAt: session.createdAt ?? 1,
+            cwd: session.cwd,
+          })),
+        }
+      },
       async create(request) {
         calls.push(['create', request])
-        return { sessionId: request.sessionId ?? 'minted' }
+        const id = request.sessionId ?? 'minted'
+        sessions.set(id, { id, cwd: request.cwd })
+        return { sessionId: id }
       },
     },
     sessionQuery: {
@@ -3702,6 +3713,40 @@ async function channelUnitTests() {
     try { rmSync(home, { recursive: true, force: true }) } catch {}
   }
 
+  // Auto mode: with no configured landing session the channel keeps its own conversation —
+  // created on first use, reused afterwards, and reachable through the client like any other.
+  const autoHome = mkdtempSync(join(tmpdir(), 'dsh-wsl-auto-'))
+  const createsBefore = calls.filter((entry) => entry[0] === 'create').length
+  const promptsBefore = calls.filter((entry) => entry[0] === 'prompt').length
+  const auto = createChannel({ ctx, config: { channelEnabled: true }, env: { USERPROFILE: autoHome } })
+  const autoPort = (await auto.start()).port
+  try {
+    const autoToken = JSON.parse(readFileSync(auto.stateFile, 'utf8')).token
+    const post = (body) => new Promise((done, fail) => {
+      const request = httpRequest({ host: '127.0.0.1', port: autoPort, method: 'POST', path: '/say', headers: { 'content-type': 'text/plain', 'x-dsh-wsl-token': autoToken } }, (response) => {
+        const chunks = []
+        response.on('data', (chunk) => chunks.push(chunk))
+        response.on('end', () => done({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+      })
+      request.on('error', fail)
+      request.write(body)
+      request.end()
+    })
+    const first = await post('first question')
+    check('auto mode answers without a configured session', first.status === 200 && first.body.includes('~ack'), first.body.slice(0, 200))
+    eq('auto mode creates one dedicated session', calls.filter((entry) => entry[0] === 'create').length, createsBefore + 1)
+    const firstPrompt = calls.filter((entry) => entry[0] === 'prompt').at(-1)
+    check('the prompt lands in the dedicated session', firstPrompt?.[1]?.sessionId === 'minted', JSON.stringify(firstPrompt?.[1]?.sessionId))
+    const autoState = JSON.parse(readFileSync(auto.stateFile, 'utf8'))
+    eq('the state file remembers the dedicated session', autoState.autoSessionId, 'minted')
+    eq('the state file reports auto mode', autoState.sessionMode, 'auto')
+    await post('second question')
+    eq('the dedicated session is reused, not recreated', calls.filter((entry) => entry[0] === 'create').length, createsBefore + 1)
+    eq('every prompt reached the controller', calls.filter((entry) => entry[0] === 'prompt').length, promptsBefore + 2)
+  } finally {
+    await auto.stop()
+    try { rmSync(autoHome, { recursive: true, force: true }) } catch {}
+  }
   // What the picker (and `dsh list`) is allowed to show: top-level, unarchived, titled
   // conversations, newest first, plus the configured session even while it has no title.
   const registryForPicker = {

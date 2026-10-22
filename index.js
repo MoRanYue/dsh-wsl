@@ -136,7 +136,7 @@ function defineConfig(Schema) {
   dangerGuard: Schema.boolean().default(true).description('危险命令（删除、分区、关机等）需显式 `allowDangerous` 才放行；关闭后模型可直接执行。').volatile(),
   allowRoot: Schema.boolean().default(false).description('允许 `wsl` 以 root 执行（`asRoot: true`）。WSL 的 root 免密，所以这项开关就是授权本身；默认关。').volatile(),
   channelEnabled: Schema.boolean().default(false).description('启用 WSL 通道：在 WSL 终端里用 `dsh "问题"` 把话发进指定会话，回复流式回到终端。默认关。').volatile(),
-  channelSession: Schema.string().default('wsl').description('WSL 通道默认使用的会话 id；终端里的 `dsh use <id>` 可以临时切换。').volatile(),
+  channelSession: Schema.string().default('').description('WSL 通道的落点会话 id；留空表示自动使用插件为终端维护的专用会话（推荐）。终端里的 `dsh use <id>` 可临时切换。').volatile(),
   distro: Schema.string().default('').description('固定使用的发行版；留空表示使用系统默认（也可用 `DSH_WSL_DISTRO`）。').volatile(),
   timeoutMs: Schema.number().default(0).description('默认命令超时（毫秒）；0 表示使用内置默认（也可用 `DSH_WSL_TIMEOUT_MS`）。').volatile(),
   }).description('dsh-wsl 的功能开关与默认值。')

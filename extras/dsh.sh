@@ -70,7 +70,8 @@ current_session() {
   local saved=''
   [ -r "$CURRENT_FILE" ] && saved=$(tr -d '[:space:]' < "$CURRENT_FILE")
   [ -n "$saved" ] && { printf '%s' "$saved"; return; }
-  printf '%s' "${DEFAULT_SESSION:-wsl}"
+  # Empty means auto: the host keeps a dedicated session for the terminal.
+  printf '%s' "${DEFAULT_SESSION:-}"
 }
 
 set_current() {
@@ -138,9 +139,12 @@ cmd_rm() {
 }
 
 cmd_status() {
-  local state
+  local state session_line
   state=$("$CURL" -sS --max-time 10 "$BASE/state" 2>/dev/null) || die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？"
-  printf '当前会话：%s\n' "$(current_session)"
+  session_line=$(current_session)
+  [ -n "$session_line" ] || session_line='自动（专用会话）'
+  CURRENT_SESSION=$session_line
+  printf '当前会话：%s\n' "${CURRENT_SESSION:-$(current_session)}"
   printf '通道：%s\n' "$(printf '%s\n' "$state" | tr '\n' ' ')"
   printf 'shim：%s\n' "$(command -v dsh || printf '未知')"
   printf '客户端：%s\n' "$CURL"
