@@ -449,10 +449,10 @@ thinking marker with its latency, the reasoning as the model produces it, the an
 then a one-line summary (elapsed, steps, tokens). `Ctrl+C` stops waiting only; the
 turn keeps running in the client.
 
-Messages that arrive this way carry a 「【WSL 终端】」 prefix, so the conversation shows
-where they came from. If that conversation is still running the user's turn, the message
-waits in its queue and the terminal says so; the answer streams once that turn ends, so a
-busy conversation is delayed, never dropped.
+The terminal is a second surface for that conversation: the text is forwarded verbatim,
+and the client streams the reply (reasoning included) back. When the conversation is
+already answering, the line is steered into the live turn instead of queueing, so the
+same agent reacts immediately and nothing is dropped.
 
 | command | does |
 |---|---|
@@ -464,7 +464,7 @@ busy conversation is delayed, never dropped.
 | `dsh rm <id>` | archive a session — the client's own reversible remove |
 | `dsh status` | current session and channel state |
 
-Set it up once in the panel: turn on **启用 dsh 命令** and click **安装 dsh 命令** — the default landing is 自动（专用会话）: the plugin keeps its own conversation for the terminal, so terminal questions never queue behind the chat you are already having (pick a conversation from the list, or create one right there, if you want a different landing); the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
+Set it up once in the panel: turn on **启用 dsh 命令** and click **安装 dsh 命令** — the default landing is the most recently active conversation — the one you are looking at (pick another from the list, or create one right there, if you want a different landing); the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
 server to the address WSL uses as its default gateway, on a random port, and demands
 the token it generated at mount on every request. The desktop has to be running, and
 the designated conversation is ordinary: the channel admits a normal user message (prefixed
@@ -661,7 +661,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 969 host checks against real WSL (shim for ctx.subprocess) + 172 client checks
+npm test          # 963 host checks against real WSL (shim for ctx.subprocess) + 172 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
