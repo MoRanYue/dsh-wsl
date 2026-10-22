@@ -1679,13 +1679,15 @@ async function toolTests(tools, shim) {
   }
   // Three original routes plus three WSL-channel routes: state for the panel, install for
   // the shim, and the picker's create-a-session action. The channel's own server is
-  eq('the plugin publishes its six routes', tools.routes.length, 6)
+  eq('the plugin publishes its seven routes', tools.routes.length, 7)
   const channelStateRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/channel')
   const channelInstallRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/channel-install')
   const channelNewRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/channel-new')
+  const pathsRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/paths')
   check('the channel state route is namespaced', channelStateRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
   check('the channel install route is namespaced', channelInstallRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
   check('the channel new-session route is namespaced', channelNewRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
+  check('the path-candidates route is namespaced', pathsRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
   eq('the channel state route matches exactly', channelStateRoute?.kind, 'exact')
   eq('the channel state route is read-only', await (async () => {
     const probe = { writeHead(code, headers) { this.code = code; this.headers = headers }, end(body) { this.body = body } }

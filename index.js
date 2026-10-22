@@ -174,6 +174,11 @@ const TERMINAL_ROUTE = '/dsh-wsl-tool/terminal-cwd'
 const CHANNEL_STATE_ROUTE = '/dsh-wsl-tool/channel'
 const CHANNEL_INSTALL_ROUTE = '/dsh-wsl-tool/channel-install'
 const CHANNEL_NEW_ROUTE = '/dsh-wsl-tool/channel-new'
+/**
+ * Candidate directories for the panel's two path settings, read from the distro so a user
+ * picks instead of typing. Read-only and best effort: a stopped WSL simply answers [].
+ */
+const PATHS_ROUTE = '/dsh-wsl-tool/paths'
 /** What the client's dock row above the composer reads. */
 const SUBTASK_ROUTE = '/dsh-wsl-tool/subtasks'
 
@@ -869,6 +874,37 @@ export function apply(ctx, settings = {}) {
           })
           response.end(JSON.stringify({ sessions }))
         }, 'dsh-wsl-tool: subtask route')
+        // The two path settings are chosen, not typed: list directories that actually
+        // exist in the distro (home, its children, /mnt/c, /mnt/d and D: top-level dirs).
+        // Read-only; a stopped WSL answers an empty list and the panel keeps working.
+        publish(PATHS_ROUTE, async (request, response) => {
+          if (request.method !== 'GET') {
+            response.writeHead(405, { allow: 'GET' })
+            response.end()
+            return
+          }
+          const options = []
+          try {
+            const script = [
+              'printf "%s\\n" "$HOME"',
+              'for d in "$HOME"/*/; do [ -d "$d" ] && printf "%s\\n" "${d%/}"; done',
+              'printf "%s\\n" /mnt/c /mnt/d',
+              'for d in /mnt/d/*/; do [ -d "$d" ] && printf "%s\\n" "${d%/}"; done',
+            ].join('; ')
+            const result = await runWslHost(['-e', 'bash', '-lc', script], config.distro)
+            const seen = new Set()
+            for (const line of String(result?.stdout ?? '').split(/\r?\n/)) {
+              const candidate = line.trim()
+              if (candidate === '' || !candidate.startsWith('/') || seen.has(candidate)) continue
+              seen.add(candidate)
+              options.push(candidate)
+              if (options.length >= 40) break
+            }
+          } catch {
+            /* empty list: the panel shows its built-in fallbacks */
+          }
+          answerJson(response, 200, { options })
+        }, 'dsh-wsl-tool: path candidates route')
         // The panel's WSL-channel block. State is read by the browser (same origin); the
         // install action writes the shim into the distro and is the only write here, so it
         // demands a JSON content type — a cross-site form cannot send that without a

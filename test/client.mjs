@@ -227,7 +227,9 @@ const sectionIn = (nodes, title) => nodes.find((node) => node.type === 'section'
   && Array.isArray(node.props?.children)
   && node.props.children[0] !== undefined
   && node.props.children[0].type === 'h3'
-  && node.props.children[0].props?.children === title)
+  && (node.props.children[0].props?.children === title
+      || (Array.isArray(node.props.children[0].props?.children)
+        && node.props.children[0].props.children.includes(title))))
 const switches = found.filter((node) => node.type?.primitiveName === 'Switch')
 check('it renders one switch per switchable feature', switches.length === 11,
   `found ${switches.length}; rendered: ${found.map((node) => String(node.type?.primitiveName ?? node.type)).join(',')}`)
@@ -258,6 +260,7 @@ const collectText = (node) => {
     for (const child of node) collectText(child)
     return
   }
+  if (typeof node.props?.text === 'string') texts.push(node.props.text)
   collectText(node.props?.children)
 }
 collectText(tree)
@@ -296,8 +299,9 @@ check('and it explains that root is the authorisation itself',
 // (Flattened inline: `textOf` is defined further down, after this point in the file.)
 const terminalNote = collect(found).flatMap((node) => {
   const kids = node.props?.children
-  if (typeof kids === 'string') return [kids]
-  return Array.isArray(kids) ? kids.filter((kid) => typeof kid === 'string') : []
+  const help = typeof node.props?.text === 'string' ? [node.props.text] : []
+  if (typeof kids === 'string') return [kids, ...help]
+  return Array.isArray(kids) ? [...kids.filter((kid) => typeof kid === 'string'), ...help] : help
 }).join('\n')
 check('the panel says the terminal tool works in the user\'s terminal, that it goes read-only, and how to take input back',
   terminalNote.includes('模型也可以在里面工作')
@@ -362,7 +366,7 @@ check('the reset reports success', resetSettled === true, String(resetSettled))
 console.log('\nworkdir input')
 const workdirSection = sectionIn(found, '默认 Linux 工作目录')
 check('the panel offers a workdir section', workdirSection !== undefined)
-const workdirInput = collect(workdirSection).find((node) => node.type === 'input')
+const workdirInput = collect(workdirSection).find((node) => node.type === 'select')
 check('the panel offers a workdir input', workdirInput !== undefined)
 const saveWorkdir = collect(workdirSection).find((node) => node.props?.children === '保存')
 check('it offers a save control', saveWorkdir !== undefined)
@@ -374,7 +378,7 @@ const liveWorkdir = () => {
   const area = sectionIn(collect(workdirMount.tree()), '默认 Linux 工作目录')
   const inner = area === undefined ? [] : collect(area)
   return {
-    input: inner.find((node) => node.type === 'input'),
+    input: inner.find((node) => node.type === 'select'),
     save: inner.find((node) => typeof node.props?.children === 'string' && node.props.children.startsWith('保存')),
   }
 }
@@ -406,18 +410,18 @@ console.log('\nterminal startup path field')
 const terminalSection = sectionIn(found, 'WSL 终端启动路径')
 check('the panel offers a terminal startup-path section', terminalSection !== undefined)
 const terminalNodes = collect(terminalSection)
-const terminalInput = terminalNodes.find((node) => node.type === 'input')
+const terminalInput = terminalNodes.find((node) => node.type === 'select')
 const saveTerminal = terminalNodes.find((node) => typeof node.props?.children === 'string'
   && node.props.children.startsWith('保存'))
-check('it has an input', terminalInput !== undefined)
+check('it offers a select', terminalInput !== undefined)
 check('it has a save control', saveTerminal !== undefined)
-eq('the field is one input, not one per row', terminalNodes.filter((node) => node.type === 'input').length, 1)
+eq('the field is one select, not one per row', terminalNodes.filter((node) => node.type === 'select').length, 1)
 eq('the save control is not repeated', terminalNodes.filter((node) => typeof node.props?.children === 'string'
   && node.props.children.startsWith('保存')).length, 1)
-check('the input names the empty case as "no flag at all"',
-  String(terminalInput?.props?.placeholder).includes('跟随会话工作区'), String(terminalInput?.props?.placeholder))
-// An empty field means "not read yet" before the Host answers, and saving then would
-// clear a `--cd` the user never asked to remove — so the SAVE waits. The input itself must
+check('the select names the empty case as "no flag at all"',
+  collect(terminalInput).some((node) => typeof node.props?.children === 'string'
+    && node.props.children.includes('不指定，从会话工作区启动')),
+  JSON.stringify(terminalInput?.props?.children ?? []).slice(0, 300))
 // stay editable: a field nobody can type into reads as a broken panel (measured live).
 check('the field stays editable while the current value is read',
   terminalInput?.props?.disabled !== true, String(terminalInput?.props?.disabled))
@@ -713,7 +717,7 @@ const fieldIn = (root) => {
   const area = sectionIn(collect(root), 'WSL 终端启动路径')
   const inner = area === undefined ? [] : collect(area)
   return {
-    input: inner.find((node) => node.type === 'input'),
+    input: inner.find((node) => node.type === 'select'),
     save: inner.find((node) => typeof node.props?.children === 'string'
       && node.props.children.startsWith('保存')),
   }
