@@ -366,8 +366,9 @@ check('the reset reports success', resetSettled === true, String(resetSettled))
 console.log('\nworkdir input')
 const workdirSection = sectionIn(found, '默认 Linux 工作目录')
 check('the panel offers a workdir section', workdirSection !== undefined)
-const workdirInput = collect(workdirSection).find((node) => node.type === 'select')
+const workdirInput = collect(workdirSection).find((node) => node.type === 'input')
 check('the panel offers a workdir input', workdirInput !== undefined)
+check('the workdir field can be typed into directly', String(workdirInput?.props?.placeholder).includes('可直接输入'), String(workdirInput?.props?.placeholder))
 const saveWorkdir = collect(workdirSection).find((node) => node.props?.children === '保存')
 check('it offers a save control', saveWorkdir !== undefined)
 
@@ -378,7 +379,7 @@ const liveWorkdir = () => {
   const area = sectionIn(collect(workdirMount.tree()), '默认 Linux 工作目录')
   const inner = area === undefined ? [] : collect(area)
   return {
-    input: inner.find((node) => node.type === 'select'),
+    input: inner.find((node) => node.type === 'input'),
     save: inner.find((node) => typeof node.props?.children === 'string' && node.props.children.startsWith('保存')),
   }
 }
@@ -410,18 +411,16 @@ console.log('\nterminal startup path field')
 const terminalSection = sectionIn(found, 'WSL 终端启动路径')
 check('the panel offers a terminal startup-path section', terminalSection !== undefined)
 const terminalNodes = collect(terminalSection)
-const terminalInput = terminalNodes.find((node) => node.type === 'select')
+const terminalInput = terminalNodes.find((node) => node.type === 'input')
 const saveTerminal = terminalNodes.find((node) => typeof node.props?.children === 'string'
   && node.props.children.startsWith('保存'))
-check('it offers a select', terminalInput !== undefined)
+check('it offers an input', terminalInput !== undefined)
 check('it has a save control', saveTerminal !== undefined)
-eq('the field is one select, not one per row', terminalNodes.filter((node) => node.type === 'select').length, 1)
+eq('the field is one input, not one per row', terminalNodes.filter((node) => node.type === 'input').length, 1)
 eq('the save control is not repeated', terminalNodes.filter((node) => typeof node.props?.children === 'string'
   && node.props.children.startsWith('保存')).length, 1)
-check('the select names the empty case as "no flag at all"',
-  collect(terminalInput).some((node) => typeof node.props?.children === 'string'
-    && node.props.children.includes('不指定，从会话工作区启动')),
-  JSON.stringify(terminalInput?.props?.children ?? []).slice(0, 300))
+check('the input can be typed into directly',
+  String(terminalInput?.props?.placeholder).includes('可直接输入'), String(terminalInput?.props?.placeholder))
 // stay editable: a field nobody can type into reads as a broken panel (measured live).
 check('the field stays editable while the current value is read',
   terminalInput?.props?.disabled !== true, String(terminalInput?.props?.disabled))
@@ -717,7 +716,7 @@ const fieldIn = (root) => {
   const area = sectionIn(collect(root), 'WSL 终端启动路径')
   const inner = area === undefined ? [] : collect(area)
   return {
-    input: inner.find((node) => node.type === 'select'),
+    input: inner.find((node) => node.type === 'input'),
     save: inner.find((node) => typeof node.props?.children === 'string'
       && node.props.children.startsWith('保存')),
   }

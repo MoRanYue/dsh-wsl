@@ -1679,11 +1679,13 @@ async function toolTests(tools, shim) {
   }
   // Three original routes plus three WSL-channel routes: state for the panel, install for
   // the shim, and the picker's create-a-session action. The channel's own server is
-  eq('the plugin publishes its seven routes', tools.routes.length, 7)
+  eq('the plugin publishes its eight routes', tools.routes.length, 8)
   const channelStateRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/channel')
   const channelInstallRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/channel-install')
   const channelNewRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/channel-new')
   const pathsRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/paths')
+  const dirsRoute = tools.routes.find((route) => route.path === '/dsh-wsl-tool/dirs')
+  check('the directory-browser route is namespaced', dirsRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
   check('the channel state route is namespaced', channelStateRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
   check('the channel install route is namespaced', channelInstallRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))
   check('the channel new-session route is namespaced', channelNewRoute !== undefined, JSON.stringify(tools.routes.map((r) => r.path)))

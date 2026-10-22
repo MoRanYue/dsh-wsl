@@ -179,6 +179,13 @@ const CHANNEL_NEW_ROUTE = '/dsh-wsl-tool/channel-new'
  * picks instead of typing. Read-only and best effort: a stopped WSL simply answers [].
  */
 const PATHS_ROUTE = '/dsh-wsl-tool/paths'
+/**
+ * One directory listing for the panel's path browser: `?path=` (a WSL path, `~` allowed)
+ * answers the normalized directory, its parent and its immediate subdirectories. The
+ * panel walks parent/child through this, so any directory in the distro is reachable
+ * without typing before the final choice.
+ */
+const DIRS_ROUTE = '/dsh-wsl-tool/dirs'
 /** What the client's dock row above the composer reads. */
 const SUBTASK_ROUTE = '/dsh-wsl-tool/subtasks'
 
@@ -905,6 +912,59 @@ export function apply(ctx, settings = {}) {
           }
           answerJson(response, 200, { options })
         }, 'dsh-wsl-tool: path candidates route')
+        // Directory browser for the two path settings: parent + immediate subdirectories,
+        // normalized in the distro. Read-only; a missing directory answers with an error
+        // the panel can show instead of an exception.
+        publish(DIRS_ROUTE, async (request, response) => {
+          if (request.method !== 'GET') {
+            response.writeHead(405, { allow: 'GET' })
+            response.end()
+            return
+          }
+          let requested = ''
+          try {
+            requested = new URL(String(request.url ?? '/'), 'http://localhost').searchParams.get('path') ?? ''
+          } catch {
+            requested = ''
+          }
+          let payload
+          try {
+            const script = [
+              'P="$1"',
+              'case "$P" in "~") P="$HOME" ;; "~/"*) P="$HOME/${P#~/}" ;; esac',
+              'if [ -z "$P" ]; then P="$HOME"; fi',
+              'if [ ! -d "$P" ]; then printf "NODIR\\n"; exit 3; fi',
+              'cd "$P" || exit 4',
+              'pwd -P',
+              'find . -mindepth 1 -maxdepth 1 -type d -printf "%f\\n" 2>/dev/null | LC_ALL=C sort | head -n 300',
+            ].join('\n')
+            const result = await runWslHost(['-e', 'bash', '-c', script, 'dsh-dirs', requested], config.distro)
+            const lines = String(result?.stdout ?? '').split(/\r?\n/)
+            if (result?.code !== 0 || lines[0] === 'NODIR') {
+              payload = {
+                path: requested,
+                parent: null,
+                entries: [],
+                error: lines[0] === 'NODIR' ? '这个目录不存在' : String(result?.stderr ?? '读取目录失败').trim(),
+              }
+            } else {
+              const resolved = lines.shift()
+              const names = lines.filter((name) => name !== '' && name !== '.' && name !== '..')
+              const parent = resolved === '/' ? null : (resolved.slice(0, resolved.lastIndexOf('/')) || '/')
+              payload = {
+                path: resolved,
+                parent,
+                entries: names.slice(0, 300).map((name) => ({
+                  name,
+                  path: resolved === '/' ? `/${name}` : `${resolved}/${name}`,
+                })),
+              }
+            }
+          } catch (error) {
+            payload = { path: requested, parent: null, entries: [], error: String(error?.message ?? error) }
+          }
+          answerJson(response, 200, payload)
+        }, 'dsh-wsl-tool: directory browser route')
         // The panel's WSL-channel block. State is read by the browser (same origin); the
         // install action writes the shim into the distro and is the only write here, so it
         // demands a JSON content type — a cross-site form cannot send that without a
