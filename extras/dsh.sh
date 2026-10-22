@@ -47,6 +47,23 @@ load_channel() {
   GW=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
   [ -n "${GW:-}" ] || die "WSL 没有默认网关，无法连到 DSH 宿主机"
   BASE="http://$GW:$PORT"
+  # Windows Firewall may block inbound connections that originate inside the WSL VM.
+  # Windows' own curl reaches the same address over the host adapter, so probe with
+  # the in-WSL client first and switch over when it cannot get through (interop keeps
+  # the pipes, so streaming still works).
+  CURL=curl
+  if ! curl -sS --max-time 3 "$BASE/state" >/dev/null 2>&1; then
+    if command -v curl.exe >/dev/null 2>&1 && curl.exe -sS --max-time 3 "$BASE/state" >/dev/null 2>&1; then
+      # Windows 自己的 curl 能过宿主网卡；interop 保留管道，流式仍可用。
+      CURL=curl.exe
+    elif command -v curl.exe >/dev/null 2>&1 && curl.exe -sS --max-time 3 "http://127.0.0.1:$PORT/state" >/dev/null 2>&1; then
+      # 服务若绑在 127.0.0.1/0.0.0.0，Windows 的环回就是宿主自己。
+      CURL=curl.exe
+      BASE="http://127.0.0.1:$PORT"
+    else
+      die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？通道在面板里启用了吗？"
+    fi
+  fi
 }
 
 current_session() {
@@ -69,12 +86,12 @@ post() {
   local extra=()
   [ "$route" = say ] && { timeout=0; extra=(-N); }
   if [ -n "$session" ]; then
-    curl -sS "${extra[@]}" --max-time "$timeout" -X POST \
+    "$CURL" -sS "${extra[@]}" --max-time "$timeout" -X POST \
       -H "x-dsh-wsl-token: $TOKEN" \
       -H "x-dsh-wsl-session: $session" \
       --data-binary "$body" "$BASE/$route"
   else
-    curl -sS "${extra[@]}" --max-time "$timeout" -X POST -H "x-dsh-wsl-token: $TOKEN" \
+    "$CURL" -sS "${extra[@]}" --max-time "$timeout" -X POST -H "x-dsh-wsl-token: $TOKEN" \
       --data-binary "$body" "$BASE/$route"
   fi
 }
@@ -122,10 +139,11 @@ cmd_rm() {
 
 cmd_status() {
   local state
-  state=$(curl -sS --max-time 10 "$BASE/state" 2>/dev/null) || die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？"
+  state=$("$CURL" -sS --max-time 10 "$BASE/state" 2>/dev/null) || die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？"
   printf '当前会话：%s\n' "$(current_session)"
   printf '通道：%s\n' "$(printf '%s\n' "$state" | tr '\n' ' ')"
   printf 'shim：%s\n' "$(command -v dsh || printf '未知')"
+  printf '客户端：%s\n' "$CURL"
 }
 
 # Stream one turn: `~`-prefixed frames, `~s`/`~a` carry base64 chunks of raw text.
