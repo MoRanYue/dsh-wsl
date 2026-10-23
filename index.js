@@ -796,7 +796,9 @@ export function apply(ctx, settings = {}) {
         // The client's dock row above the composer reads this: which terminal subtasks this
         // conversation has, running first, with each one's result, commands and shell decision.
         // Every conversation is returned and the client filters by its own session id, because
-        // this route has no session of its own.
+        // this route has no session of its own. A `?session=` names the dock's own conversation
+        // so the terminals the USER opened can be listed as records beside the subtasks (owner
+        // request), labelled as user-created and ended only once the terminal is gone.
         publish(SUBTASK_ROUTE, (request, response) => {
           if (request.method !== 'GET') {
             response.writeHead(405, { allow: 'GET' })
@@ -808,22 +810,90 @@ export function apply(ctx, settings = {}) {
           // exists reads as closed, whatever the log last heard. Read once per session; its
           // absence is not an error — the projection falls back to what the log recorded.
           const controller = terminalTransport
-          for (const [sessionId, log] of Object.entries(subtasks.snapshot())) {
-            let live = null
+          const listOf = (sessionId) => {
+            const found = []
+            const seen = new Set()
+            const add = (info) => {
+              const id = String(info?.id ?? '')
+              if (id === '' || seen.has(id)) return
+              seen.add(id)
+              found.push(info)
+            }
             if (controller !== null && typeof controller.list === 'function') {
               try {
-                live = controller.list(sessionId)
+                const listed = controller.list(sessionId)
+                if (Array.isArray(listed)) for (const info of listed) add(info)
               } catch {
-                live = null
+                // The projection falls back to the last snapshot; nothing else to do here.
               }
             }
+            // The transport's `list` only reports the shells this plugin opened. The liveness
+            // lookup needs the user's terminals too, or their record would read as closed while
+            // they are very much open.
+            if (controller !== null && typeof controller.userTerminals === 'function') {
+              try {
+                const listed = controller.userTerminals(sessionId)
+                if (Array.isArray(listed)) for (const info of listed) add(info)
+              } catch {
+                // Same fallback as above.
+              }
+            }
+            return found
+          }
+          let wanted = ''
+          try {
+            wanted = new URL(String(request.url ?? '/'), 'http://localhost').searchParams.get('session') ?? ''
+          } catch {
+            wanted = ''
+          }
+          if (wanted !== '') {
+            let shared = null
+            if (controller !== null && typeof controller.userTerminals === 'function') {
+              try {
+                const listed = controller.userTerminals(wanted)
+                if (Array.isArray(listed)) shared = listed
+              } catch {
+                shared = null
+              }
+            }
+            for (const info of shared ?? []) {
+              const id = String(info?.id ?? '')
+              if (id === '') continue
+              const mine = subtasks.list(wanted).entries
+                .filter((entry) => entry.terminalCreated !== true && String(entry.terminalId) === id)
+              const record = mine.find((entry) => entry.userTerminal === true)
+              if (record !== undefined) {
+                // Refresh the stored description; the title and the flag stay as they are.
+                subtasks.start(wanted, record.title, { terminalId: id, terminalCreated: false, terminalSnapshot: info })
+                continue
+              }
+              // A normal subtask that an explicit call recorded on this terminal stays as it
+              // is; the terminal gets its own record beside it.
+              const base = `用户建立的终端「${info?.title ?? 'WSL'}」`
+              const taken = new Set(mine.map((entry) => entry.title))
+              let title = base
+              for (let index = 2; taken.has(title); index += 1) title = `${base} #${index}`
+              const created = subtasks.start(wanted, title, {
+                terminalId: id,
+                terminalCreated: false,
+                terminalSnapshot: info,
+              })
+              created.userTerminal = true
+            }
+          }
+          const sessionIds = Object.keys(subtasks.snapshot())
+          if (wanted !== '' && !sessionIds.includes(wanted)) sessionIds.push(wanted)
+          for (const sessionId of sessionIds) {
+            const log = subtasks.list(sessionId)
+            const live = listOf(sessionId)
             const byId = new Map((Array.isArray(live) ? live : []).map((info) => [String(info?.id), info]))
             const entries = log.entries.map((entry) => (entry.terminalId === null
               ? projectSubtask(entry)
               : projectSubtask(entry, byId.get(String(entry.terminalId)) ?? null)))
             sessions[sessionId] = {
               total: log.total,
-              running: entries.filter((entry) => entry.status !== 'done').length,
+              // A terminal the user keeps open is not "a subtask running": count real work only.
+              running: entries.filter((entry) => entry.status !== 'done' && entry.userTerminal !== true).length,
               entries,
             }
           }

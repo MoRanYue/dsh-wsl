@@ -4108,16 +4108,33 @@ async function bridgeUnitTests() {
       tool.description.slice(-360))
   }
 
-  // The plugin itself publishes the two routes when the host is a 0.2.1 build.
+  // The plugin itself publishes the two routes when the host is a 0.2.1 build, and the subtask
+  // route turns the terminals the USER opened into records beside the subtasks (collapsed dock).
   {
     const shim = makeShim(mkdtempSync(join(tmpdir(), 'dsh-wsl-bridge-')))
+    const shared = [browserTerminalOf('shared-term', 'session-1')]
     const tools = makeCtx(shim, {
-      terminalController: { list: () => [], create: async () => {}, close: async () => {} },
+      terminalController: {
+        list: (sessionId) => shared.filter((info) => info.sessionId === sessionId),
+        create: async () => {},
+        close: async () => {},
+      },
     })
     eq('the plugin publishes the bridge routes alongside its own', tools.routes.length, 10)
     check('the bridge routes are the two the client half polls',
       tools.routes.filter((entry) => entry.path.startsWith('/dsh-wsl-tool/term-bridge/')).length === 2,
       JSON.stringify(tools.routes.map((entry) => entry.path)))
+    const subtaskRoute = tools.routes.find((entry) => entry.path === '/dsh-wsl-tool/subtasks')
+    check('the subtask route is namespaced', subtaskRoute !== undefined,
+      JSON.stringify(tools.routes.map((entry) => entry.path)))
+    const readSubtasks = async (sessionId) => {
+      const response = {
+        writeHead() {},
+        end(text) { this.body = text },
+      }
+      await subtaskRoute.handler({ method: 'GET', url: `/dsh-wsl-tool/subtasks?session=${sessionId}` }, response)
+      return JSON.parse(response.body)
+    }
     // The self-info route is how a person (or a script) checks, after a restart, whether the
     // bridge half is really mounted and whether a page is polling right now.
     const infoRoute = tools.routes.find((entry) => entry.path === '/dsh-wsl-tool/info')
@@ -4133,6 +4150,24 @@ async function bridgeUnitTests() {
       JSON.stringify(Object.keys(info.terminal ?? {}).sort()) === '["bridge","bridgeCapable","kind"]'
       && JSON.stringify(Object.keys(info.terminal?.bridge ?? {}).sort()) === '["attachments","client","pending"]',
       JSON.stringify(info.terminal))
+    // The user's terminal is listed as a record of its own once the dock asks for its session.
+    const holder = { routes: tools.routes }
+    const poll = startBridgePoll(holder, 'dock-window')
+    await tickMs(5)
+    let payload = await readSubtasks('session-1')
+    const record = payload.sessions['session-1']?.entries?.[0]
+    check('a terminal the user opened is listed beside the subtasks',
+      String(record?.title ?? '').startsWith('用户建立的终端'), JSON.stringify(record))
+    eq('and it is marked as a user terminal', record?.userTerminal, true)
+    eq('and it shows as in use while the terminal runs', record?.status, 'running')
+    eq('and it does not count as a running subtask', payload.sessions['session-1']?.running, 0)
+    // Closing it (the user closes the tab) ends that record; the tool never closes it itself.
+    shared.length = 0
+    payload = await readSubtasks('session-1')
+    const ended = payload.sessions['session-1']?.entries?.[0]
+    eq('after the user closes it the record reads as ended', ended?.status, 'done')
+    eq('and it is marked closed', ended?.terminal, 'closed')
+    poll.catch(() => {})
   }
 }
 

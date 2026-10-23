@@ -218,7 +218,9 @@ terminal's full description, the result, and the commands. `subtask-done` writes
 result and decides the shell: `keepTerminal: true` (the default) leaves it idle for a
 follow-up step, `false` closes a shell the tool opened. A terminal **you** opened is never
 closed this way, and `close` is the other way to end one (it also refuses terminals the
-tool did not open). The records live in memory for the current DSH run — they describe this
+tool did not open). The dock also lists the terminals **you** opened, labelled
+用户建立的终端: one shows 使用中 while it is open and flips to 已结束 only once you close
+it yourself. The records live in memory for the current DSH run — they describe this
 conversation's work, and a restart clears them along with the terminals.
 
 Terminals belong to the current DSH run — restarting DSH ends them — and the app can
@@ -675,7 +677,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1045 host checks against real WSL (shim for ctx.subprocess) + 229 client checks
+npm test          # 1052 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

@@ -955,9 +955,18 @@ eq('the row sits after the app\'s own dock entries', dock?.seat.order, 30)
 const dockFetch = context.fetch
 {
   const payload = {
-    total: 2,
+    total: 3,
     running: 1,
     entries: [
+      {
+        id: 'terminal:da0e', title: '用户建立的终端「WSL」', status: 'running', result: null, terminal: 'attached',
+        terminalCreated: false, userTerminal: true, terminalId: 'da0e',
+        terminalInfo: {
+          id: 'da0e', title: 'WSL', shell: 'WSL', args: ['-d', 'Ubuntu-22.04', '-e', 'bash'],
+          cwd: '/home', cols: 76, rows: 46, state: 'running', toolCreated: false, stale: false,
+        },
+        commands: [], finishedAt: null,
+      },
       {
         id: '2', title: '跑通 sta 流程', status: 'running', result: null, terminal: 'attached',
         terminalCreated: true, terminalId: 'dsh-agent',
@@ -974,12 +983,18 @@ const dockFetch = context.fetch
       },
     ],
   }
-  context.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({ sessions: { 'session-1': payload } }) })
+  const dockRequests = []
+  context.fetch = (url) => {
+    dockRequests.push(String(url))
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ sessions: { 'session-1': payload } }) })
+  }
   const mounted = mountStateful(dock.component, { sessionId: 'session-1' })
   eq('before the first answer it says nothing at all', textOf(mounted.tree()), '')
   await mounted.flush()
+  check('the dock names its session so the Host can list the user\'s terminals',
+    dockRequests.some((url) => url.includes('?session=session-1')), JSON.stringify(dockRequests))
   const collapsed = textOf(mounted.tree())
-  check('the collapsed dock shows only the count', collapsed.includes('共 2 个子任务') && collapsed.includes('运行 1'), collapsed)
+  check('the collapsed dock shows only the count', collapsed.includes('共 3 个子任务') && collapsed.includes('运行 1'), collapsed)
   check('and offers one control to expand it', collapsed.includes('展开'), collapsed)
   check('it does not list the subtasks while collapsed',
     !collapsed.includes('跑通 sta 流程') && !collapsed.includes('修终端就绪竞态'), collapsed)
@@ -987,28 +1002,56 @@ const dockFetch = context.fetch
   eq('one click target while collapsed', collapsedClicks.length, 1)
   collapsedClicks[0].props.onClick()
   const text = textOf(mounted.tree())
+  check('a terminal the user opened is shown as one of the records',
+    text.includes('用户建立的终端') && text.includes('使用中'), text)
   check('expanding names the running subtask', text.includes('跑通 sta 流程') && text.includes('运行中'), text)
   check('and marks the finished one done', text.includes('修终端就绪竞态') && text.includes('已结束·关闭'), text)
   check('commands stay hidden until a subtask is opened',
     !text.includes('make sta') && !text.includes('node test/smoke.mjs'), text)
   check('the expanded dock offers 收起', text.includes('收起'), text)
   const clickables = collect(mounted.tree()).filter((node) => typeof node.props?.onClick === 'function')
-  eq('one click target per subtask plus the collapse control', clickables.length, 3)
-  clickables[1].props.onClick()
+  eq('one click target per record plus the collapse control', clickables.length, 4)
+  clickables[2].props.onClick()
   const opened = textOf(mounted.tree())
   check('opening a subtask shows the command it ran', opened.includes('$ make sta') && opened.includes('→ 0'), opened)
   check('and the whole terminal it ran in',
     opened.includes('dsh-agent') && opened.includes('Ubuntu-22.04') && opened.includes('120x30'),
     opened)
-  clickables[2].props.onClick()
+  clickables[3].props.onClick()
   const second = textOf(mounted.tree())
   check('opening a finished subtask shows its result', second.includes('结果：已修'), second)
   // Collapsing again: the count is the only thing left, and the detail closes with it.
   collect(mounted.tree()).filter((node) => typeof node.props?.onClick === 'function')[0].props.onClick()
   const recollapsed = textOf(mounted.tree())
   check('collapsing returns to the count-only row',
-    recollapsed.includes('共 2 个子任务') && !recollapsed.includes('跑通 sta 流程'), recollapsed)
+    recollapsed.includes('共 3 个子任务') && !recollapsed.includes('跑通 sta 流程'), recollapsed)
   mounted.unmount()
+
+  // A terminal record reads "已结束" only once the terminal is gone.
+  {
+    const endedPayload = {
+      total: 1,
+      running: 0,
+      entries: [{
+        id: 'terminal:gone', title: '用户建立的终端「WSL」', status: 'done', result: '终端已关闭', terminal: 'closed',
+        terminalCreated: false, userTerminal: true, terminalId: 'gone',
+        terminalInfo: {
+          id: 'gone', title: 'WSL', shell: 'WSL', args: [], cwd: '/home', cols: 76, rows: 46,
+          state: 'running', toolCreated: false, stale: true,
+        },
+        commands: [], finishedAt: 1,
+      }],
+    }
+    context.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({ sessions: { 'session-1': endedPayload } }) })
+    const view = mountStateful(dock.component, { sessionId: 'session-1' })
+    await view.flush()
+    collect(view.tree()).filter((node) => typeof node.props?.onClick === 'function')[0].props.onClick()
+    const endedText = textOf(view.tree())
+    check('a closed user terminal reads 已结束, not 使用中',
+      endedText.includes('用户建立的终端') && endedText.includes('已结束') && !endedText.includes('使用中'),
+      endedText)
+    view.unmount()
+  }
 
   // A readable log with nothing in it: one faint line, and no card around it.
   context.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve({ sessions: {} }) })

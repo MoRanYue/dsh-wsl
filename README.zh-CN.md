@@ -185,6 +185,7 @@ wsl-term({ action: "subtask-done", subtask: "跑通 sta 流程", result: "三条
 带着结果排在后面；再点开一行会看到详情——终端的完整描述、结果、以及每条命令。`subtask-done` 负责写下结果并决定
 这个 shell 的去留：`keepTerminal: true`（默认）把它闲置着等你下一步，`false` 则关掉**工具自己开的**那个 shell；
 **你自己开的终端永远不会被这样关掉**，要关就用 `close`（它同样拒绝关闭不是工具开的终端）。
+dock 里也会列出**你打开的终端**，标注为「用户建立的终端」：开着的时候显示「使用中」，只有**你自己关掉**它之后才变成「已结束」。
 这些记录只存在**本次 DSH 运行**的内存里：它们描述的是这次对话做过的事，重启会连同终端一起清空。
 
 终端属于**本次 DSH 运行**，重启即结束；应用在重新创建浏览器终端时会给它一个**新的 id**，所以早前消息里的 id
@@ -586,7 +587,7 @@ argv 包一层过 `ctx.sandbox`）和文件系统服务（`@deepseek-ai/dsh-fs-s
 ### 测试
 
 ```sh
-npm test          # 1045 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 229 项客户端检查
+npm test          # 1052 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 232 项客户端检查
 npm run test:real # 同一套检查改跑真实 provider，外加 seam 事实套件
 ```
 
