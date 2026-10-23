@@ -3746,7 +3746,7 @@ async function bridgeUnitTests() {
       (await callRoute(events, 'POST', JSON.stringify({ clientId: 'nobody', events: [{ type: 'snapshot' }] }))).code, 200)
     eq('with no window polling, the transport reports the private-shell kind', host.transport.kind, 'pty')
     eq('and its status says no page is holding the bridge', host.transport.status().client, false)
-    eq('and it still lists the browser terminal', host.transport.list('session-1').map((info) => info.id).join(','), 'user-term')
+    eq('an undrivable browser terminal is not listed without a page', host.transport.list('session-1').length, 0)
   }
 
   // The happy path: a run over the bridge, end to end through the real tool.
@@ -3922,6 +3922,38 @@ async function bridgeUnitTests() {
     eq('and it really spawned one shell', host.calls.spawned.length, 1)
   }
 
+  // A browser terminal exists but no page is alive to drive it: the tool must fall back to the
+  // private shell instead of picking an undrivable terminal (measured on the first restarted
+  // build — the page had been hot-reloaded away and `run` failed instead of using the PTY).
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const run = await tool.execute({ action: 'run', command: 'pwd', subtask: '无页面兜底' }, { agent: { id: 'session-1' } })
+    check('without a page the tool opens its own shell rather than an undrivable terminal',
+      run.summary.includes('pty fallback output') && !run.summary.includes('user-term'), run.summary.slice(0, 300))
+    eq('and that fallback really spawned a shell', host.calls.spawned.length, 1)
+    eq('and it did not touch the browser terminal', host.calls.closed.length, 0)
+  }
+
+  // With a page alive, the user's browser terminal wins over a fallback shell opened earlier:
+  // collaboration is the point of the bridge, and the private shell stays usable by id.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('browser-term')] })
+    await host.transport.create({ id: 'session-1' }, { id: 'dsh-agent', cols: 120, rows: 30 })
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    await tickMs(5)
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const running = tool.execute({ action: 'run', command: 'echo pick-browser', subtask: '优先协作' }, { agent: { id: 'session-1' } })
+    const first = await warm
+    eq('the tool picks the browser terminal when a page can drive it',
+      first.commands?.[0]?.terminalId, 'browser-term')
+    for (const command of first.commands ?? []) await page.handle(command)
+    const result = await driveBridge(page, running)
+    check('and the command runs there', result.summary.includes('bridge says hi'), result.summary.slice(-200))
+    eq('the earlier private shell was not used for it', host.calls.spawned.length, 1)
+  }
+
   // A shell opened while the window was closed stays drivable after it reopens: both
   // generations show in one list, and follow routes by ownership.
   {
@@ -3932,8 +3964,8 @@ async function bridgeUnitTests() {
     const warm = page.poll()
     await tickMs(5)
     eq('the reopened window turns the transport back into the bridge', host.transport.kind, 'bridge')
-    eq('one list holds the browser terminal and the fallback shell',
-      host.transport.list('session-1').map((info) => String(info.id)).join(','), 'browser-term,dsh-agent')
+    eq('one list holds the fallback shell and the browser terminal, in the order the tool prefers',
+      host.transport.list('session-1').map((info) => String(info.id)).join(','), 'dsh-agent,browser-term')
     // The page is alive but the call is over: the held poll is expected to time out, and its
     // rejection is handled so it cannot surface as an unhandled one.
     warm.catch(() => {})
