@@ -188,19 +188,25 @@ wsl-term({ action: "subtask-done", subtask: "跑通 sta 流程", result: "三条
                                                                → writes the result and decides the shell
 ```
 
-**Which shell it drives: one the tool opened itself.** `wsl-term` never takes over a terminal
-you opened for your own work — that terminal can be long-lived, and the model typing into it
-would interrupt you. By default it opens a **private WSL shell per subtask**: the same
-actions and the same records above the composer, but the shell does not appear in the
-sidebar and only the tool types into it. A terminal **you** opened is used only when its
-`id` is named explicitly; while that call runs your view is read-only until you press
-接管输入, and the tool never closes it. The bridge exists for exactly that explicit case
-and for hosts without a private-shell provider: from DSH 0.2.1 the host no longer lets a
-plugin attach to a browser terminal directly, but this plugin's own browser half runs in
-the page, where that attachment is allowed, so the host queues `attach`/`write`/`detach`
-commands for it over two same-origin routes (no extra port and no extra service). On hosts
-up to 0.2.0 no bridge is needed: the plugin drives the browser terminal directly through
-`terminalController.follow`/`write`.
+**Which shell it drives.** Two rules, and the difference is the `subtask` argument:
+
+- **A `run` with a `subtask` is tracked work.** It uses a **private WSL shell this tool opens**:
+  one shell per piece of work, every command recorded above the composer, and `subtask-done`
+  closes it (or leaves it idle). It is not a sidebar tab and only the tool types into it —
+  tracking bookkeeping never touches a terminal you opened.
+- **A command without a `subtask` is collaborative.** `run`, `read`, `input` and `interrupt`
+  use the newest terminal **you** have open, so you watch the command happen and can read the
+  screen afterwards. While the tool works, that terminal is read-only; press 接管输入 to type
+  again. The tool **never closes** a terminal you opened.
+- **A named `id` always wins**, whichever kind of terminal it is.
+
+If you have no terminal open, an ad-hoc command opens a private shell instead — a normal shell
+for that session, but **not a sidebar tab**. The bridge makes the collaborative case possible
+on DSH 0.2.1: the host no longer lets a plugin attach to a browser terminal directly, but this
+plugin's own browser half runs in the page, where that attachment is allowed, so the host
+queues `attach`/`write`/`detach` commands for it over two same-origin routes (no extra port and
+no extra service). On hosts up to 0.2.0 no bridge is needed: the plugin drives the browser
+terminal directly through `terminalController.follow`/`write`.
 
 #### Work is recorded as subtasks
 
@@ -211,22 +217,17 @@ first, then finished ones with their result — and clicking a row opens its det
 terminal's full description, the result, and the commands. `subtask-done` writes the
 result and decides the shell: `keepTerminal: true` (the default) leaves it idle for a
 follow-up step, `false` closes a shell the tool opened. A terminal **you** opened is never
-closed this way and never selected for a subtask, and `close` is the other way to end one
-(it also refuses terminals the tool did not open). The records live in memory for the
-current DSH run — they describe this conversation's work, and a restart clears them along
-with the terminals.
+closed this way, and `close` is the other way to end one (it also refuses terminals the
+tool did not open). The records live in memory for the current DSH run — they describe this
+conversation's work, and a restart clears them along with the terminals.
 
-You do not have to open a terminal first. `run` and `read` use the newest running shell
-**this tool** opened, and open one if there is none — a normal shell for that session, but
-**not a sidebar tab**, so a private shell is something you watch through the tool's results
-rather than in the sidebar. Terminals belong to the current DSH run — restarting DSH ends
-them — and the app can re-create a browser terminal under a **new id**, so an id from an
-earlier answer may no longer exist. The tool then falls back to one of its own shells and
-says which one it used.
+Terminals belong to the current DSH run — restarting DSH ends them — and the app can
+re-create a browser terminal under a **new id**, so an id from an earlier answer may no
+longer exist. The tool then falls back to one of its own shells and says which one it used.
 
 Four things worth knowing:
 
-- **A terminal you named explicitly is read-only while the model works in it, and it stays
+- **A terminal you have open is read-only while the model works in it, and it stays
   read-only afterwards**: click **「接管输入」** in that terminal to type again. If you are
   typing when the model calls, the call is refused instead of landing in the middle of your
   line.
@@ -238,13 +239,13 @@ Four things worth knowing:
   bottom, so what comes back is the end of the output; the complete text is written
   to a file and the result names it.
 
-Commands run as **you**, exactly as if you had typed them — and you see each one as a short,
-readable line (`__dsh_term_run 'make syn'`), because the first command in a terminal defines
-that one-line helper there. What comes back is the output between its two markers, plus the
-exit code. **There is no switch for this tool**: it is always available, the terminal it
-works in is either yours or one it opened for this session, and every command it types is
-visible there. A destructive command still stops at the guard unless the caller says it is
-intended.
+Commands run as **you**, exactly as if you had typed them — and in a collaborative call you
+see each one as a short, readable line (`__dsh_term_run 'make syn'`), because the first command
+in that terminal defines the one-line helper there. What comes back is the output between its
+two markers, plus the exit code. **There is no switch for this tool**: it is always available;
+a tracked subtask runs in a private shell, a collaborative command runs in the terminal you
+have open, and a named `id` decides explicitly. A destructive command still stops at the guard
+unless the caller says it is intended.
 
 Reach for it only when the work needs **one shell across several steps** — a long build worth
 watching go by, an interactive program, a directory or environment that has to persist. For
@@ -674,7 +675,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1035 host checks against real WSL (shim for ctx.subprocess) + 229 client checks
+npm test          # 1045 host checks against real WSL (shim for ctx.subprocess) + 229 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

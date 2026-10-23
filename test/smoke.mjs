@@ -3774,9 +3774,9 @@ async function bridgeUnitTests() {
     const result = await driveBridge(page, running)
     check('a run over the bridge returns the terminal output and its exit code',
       result.summary.includes('bridge says hi') && result.summary.includes('exit code: 0'), result.summary)
-    check('the header says the terminal belongs to the user and was named explicitly',
-      result.summary.includes('opened by the user') && result.summary.includes('/mnt/d/proj'),
-      result.summary.slice(0, 280))
+    check('the header says the terminal belongs to the user and its id was named',
+      result.summary.includes('this call named its id') && result.summary.includes('/mnt/d/proj'),
+      result.summary.slice(0, 320))
     check('and it carries the handover warning the user needs',
       result.summary.includes('接管输入'), result.summary.slice(0, 320))
     eq('no terminal was created for an existing one', host.calls.created.length, 0)
@@ -3807,6 +3807,49 @@ async function bridgeUnitTests() {
       () => tool.execute({ action: 'close', id: 'user-term' }, { agent: { id: 'session-1' } }),
       /not opened by this tool/)
     eq('and no close reached the controller', host.calls.closed.length, 0)
+  }
+
+  // Ad-hoc commands ARE collaborative: without a `subtask`, the newest terminal the user has
+  // open is used, so the command is visible there — and the tool never closes it.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    await tickMs(5)
+    const subtasks = createSubtaskLog()
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, subtasks, transport: host.transport })
+    const running = tool.execute({ action: 'run', command: 'echo collab' }, { agent: { id: 'session-1' } })
+    const first = await warm
+    eq('an ad-hoc run attaches to the terminal the user has open', first.commands?.[0]?.terminalId, 'user-term')
+    for (const command of first.commands ?? []) await page.handle(command)
+    const result = await driveBridge(page, running)
+    check('and the command runs there, visibly', result.summary.includes('bridge says hi'), result.summary.slice(-200))
+    check('the header says the call is collaborative',
+      result.summary.includes('this call is collaborative'), result.summary.slice(0, 340))
+    eq('no private shell was opened for it', host.calls.spawned.length, 0)
+    eq('and no subtask record was created', subtasks.list('session-1').total, 0)
+    eq('and the user terminal was not closed', host.calls.closed.length, 0)
+  }
+
+  // The same page, but the run names a `subtask`: tracked work goes to a private shell this
+  // tool manages, never into the user's terminal.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    warm.catch(() => {})
+    await tickMs(5)
+    const subtasks = createSubtaskLog()
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, subtasks, transport: host.transport })
+    const run = await tool.execute({ action: 'run', command: 'pwd', subtask: '私有子任务' }, { agent: { id: 'session-1' } })
+    check('a subtask run uses a private shell instead of the user terminal',
+      run.summary.includes('pty fallback output') && run.summary.includes('does not appear in the sidebar'),
+      run.summary.slice(0, 340))
+    check('the user terminal is untouched', !run.summary.includes('user-term'), run.summary.slice(0, 340))
+    eq('one private shell was opened', host.calls.spawned.length, 1)
+    check('and the subtask was recorded on it',
+      subtasks.list('session-1').entries[0]?.terminalId === 'dsh-agent',
+      JSON.stringify(subtasks.list('session-1').entries[0]?.terminalId))
   }
 
   // `read` over the bridge: the snapshot is the screen, and the call still detaches.
@@ -4057,12 +4100,12 @@ async function bridgeUnitTests() {
     const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
     const cost = tool.description.length + JSON.stringify(tool.parameters).length
     check('the bridge wording fits the model-facing catalog budget', cost <= 2_700, `${cost} chars`)
-    check('the bridge wording names the private shells and the explicit-only collaboration',
-      tool.description.includes('never chosen automatically')
+    check('the bridge wording separates collaborative commands from tracked subtasks',
+      tool.description.includes('WITHOUT a `subtask`')
+      && tool.description.includes('runs in the terminal YOU have open')
       && tool.description.includes('read-only')
-      && tool.description.includes('one is opened here')
       && tool.description.includes('`close` it when the subtask is done'),
-      tool.description.slice(-340))
+      tool.description.slice(-360))
   }
 
   // The plugin itself publishes the two routes when the host is a 0.2.1 build.
