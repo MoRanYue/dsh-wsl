@@ -4193,11 +4193,14 @@ async function bridgeUnitTests() {
     payload = await readSubtasks('session-1')
     const entries = payload.sessions['session-1']?.entries ?? []
     eq('a re-created terminal gets a second record', entries.length, 2)
-    eq('the new record is the running one', entries[0]?.status, 'running')
+    // Order between two records made in the same millisecond is not a contract: find them.
+    const recreated = entries.find((entry) => entry.terminalId === 'shared-term-2')
+    const closed = entries.find((entry) => entry.terminalId === 'shared-term')
+    eq('the new record is the running one', recreated?.status, 'running')
     check('and its title is numbered, not reused',
-      entries[0]?.title === '用户建立的终端「WSL」 #2', entries[0]?.title)
-    eq('while the closed one still reads as ended', entries[1]?.status, 'done')
-    eq('and still points at the old terminal', entries[1]?.terminalId, 'shared-term')
+      recreated?.title === '用户建立的终端「WSL」 #2', recreated?.title)
+    eq('while the closed one still reads as ended', closed?.status, 'done')
+    eq('and it still points at the old terminal', closed?.terminalId, 'shared-term')
     poll.catch(() => {})
   }
 }
