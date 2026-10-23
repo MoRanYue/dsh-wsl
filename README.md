@@ -227,7 +227,7 @@ Terminals belong to the current DSH run — restarting DSH ends them — and the
 re-create a browser terminal under a **new id**, so an id from an earlier answer may no
 longer exist. The tool then falls back to one of its own shells and says which one it used.
 
-Four things worth knowing:
+Five things worth knowing:
 
 - **A terminal you have open is read-only while the model works in it, and it stays
   read-only afterwards**: click **「接管输入」** in that terminal to type again. If you are
@@ -237,6 +237,11 @@ Four things worth knowing:
   full-screen programs (`vim`, `htop`) come back as their raw screen.
 - **`run` needs a POSIX-style shell** (`sh`, `bash`, `zsh`). On `cmd.exe` or
   PowerShell, use `input`.
+- **A busy terminal is never typed into.** If its prompt is not back — another command
+  owns the foreground, and a `dsh` reply still streaming is one such command — `run` waits
+  out its deadline and then declines instead of typing, so nothing is sent and the running
+  command is not disturbed. Wait for it, send a message with `dsh insert` (it returns at
+  once), or use a private shell for that work.
 - **Long output is not thrown away.** A build or synthesis log's answer is at the
   bottom, so what comes back is the end of the output; the complete text is written
   to a file and the result names it.
@@ -681,7 +686,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1061 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
+npm test          # 1064 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

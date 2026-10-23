@@ -3664,7 +3664,7 @@ function postBridgeEvents(host, clientId, events) {
 }
 
 /** The browser half, reduced to what the host sees: a poller and the frames it reports. */
-function makeBridgePage(host, { clientId = 'window-a' } = {}) {
+function makeBridgePage(host, { clientId = 'window-a', screen = 'user@host:~/proj$ ' } = {}) {
   const page = {
     clientId,
     attachmentId: null,
@@ -3678,7 +3678,7 @@ function makeBridgePage(host, { clientId = 'window-a' } = {}) {
         const info = host.live.find((entry) => entry.id === command.terminalId)
         await page.send([
           { type: 'result', commandId: command.id, ok: true },
-          { type: 'snapshot', attachmentId: command.attachmentId, screen: 'user@host:~/proj$ ', info, writable: true },
+          { type: 'snapshot', attachmentId: command.attachmentId, screen, info, writable: true },
         ])
         return
       }
@@ -3850,6 +3850,26 @@ async function bridgeUnitTests() {
     check('and the subtask was recorded on it',
       subtasks.list('session-1').entries[0]?.terminalId === 'dsh-agent',
       JSON.stringify(subtasks.list('session-1').entries[0]?.terminalId))
+  }
+
+  // A terminal whose prompt is away — another command owns its foreground, and a streaming
+  // `dsh` reply is exactly that — is never typed into: the keystrokes would queue and fire the
+  // moment that command exits, corrupting the user's shell.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const page = makeBridgePage(host, { screen: 'xiny@XINY9:/home$ dsh "问题"\r\n⏱ 思考中… 2.1s' })
+    const warm = page.poll()
+    await tickMs(5)
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const running = tool.execute({ action: 'run', command: 'echo hi', timeoutMs: 450 }, { agent: { id: 'session-1' } })
+    const first = await warm
+    for (const command of first.commands ?? []) await page.handle(command)
+    const run = await driveBridge(page, running)
+    check('a busy terminal is not typed into', run.summary.includes('nothing was typed: this terminal is busy'),
+      run.summary.slice(-420))
+    check('the refusal names the dsh case and the way out',
+      run.summary.includes('dsh insert') && run.summary.includes('private shell'), run.summary.slice(-420))
+    eq('and no keystrokes reached it', page.writes.length, 0)
   }
 
   // `read` over the bridge: the snapshot is the screen, and the call still detaches.
