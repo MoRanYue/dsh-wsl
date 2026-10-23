@@ -1338,6 +1338,58 @@ const flushBridgeEvents = async () => {
   applied.restore()
 }
 
+// (5b) The Host may have created the terminal a moment ago (the tool opens one when the session
+// has none), and the page's terminal list is a shared cache: without a refresh the new terminal is
+// invisible and `view()` fails as `missingTerminal`. The attach must therefore ask the service to
+// refresh that list — `recover(sessionId, true)` — before it opens the view.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const view = makeBridgeView()
+  const order = []
+  const applied = applyBridge({
+    webTerminals: {
+      recover: (sessionId, refresh) => {
+        order.push(['recover', sessionId, refresh])
+        return Promise.resolve([])
+      },
+      view: (...args) => {
+        order.push(['view', ...args])
+        return view
+      },
+    },
+    fetch: bridgeFetch.fetcher,
+  })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-9', sessionId: 's-9', terminalId: 'dsh-agent' })
+  await settleBridge()
+  await settleBridge()
+  eq('attach refreshes the cached terminal list first',
+    JSON.stringify(order[0]), JSON.stringify(['recover', 's-9', true]))
+  eq('and only then opens the view', order[1]?.[0], 'view')
+  eq('the attach still mounts and succeeds', view.mounts, 1)
+  applied.restore()
+}
+
+// (5c) A refused refresh must not fail the attach: the refresh is an optimization, and the view
+// itself reports the real problem.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const view = makeBridgeView()
+  const applied = applyBridge({
+    webTerminals: {
+      recover: () => Promise.reject(new Error('list refused')),
+      view: () => view,
+    },
+    fetch: bridgeFetch.fetcher,
+  })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-8', sessionId: 's-8', terminalId: 't-8' })
+  await settleBridge()
+  await settleBridge()
+  eq('a refused list refresh still attaches', view.mounts, 1)
+  applied.restore()
+}
+
 // (6) A view that fails (the terminal was closed or vanished): one error event, once.
 {
   const bridgeFetch = makeBridgeFetch()
