@@ -51,6 +51,8 @@ import {
 } from '../lib/terminal.js'
 import { createSubtaskLog, projectSubtask } from '../lib/subtasks.js'
 import { createWslTermTool } from '../lib/tools/wsl-term.js'
+import { createTerminalTransport } from '../lib/pty-transport.js'
+import { createBridgeTransport } from '../lib/term-bridge.js'
 
 // One resolved configuration stands in for the mount the host would create.
 const CONFIG = resolveConfig({})
@@ -1732,6 +1734,16 @@ async function toolTests(tools, shim) {
   check('the WSL facts are an object or null, never a guess',
     payload.wsl === null || typeof payload.wsl === 'object',
     JSON.stringify(payload.wsl))
+  // The one bridge question a person debugging it has. Counts only: this route is local.
+  check('the terminal block reports the transport, never ids',
+    payload.terminal === null
+    || (typeof payload.terminal === 'object'
+      && typeof payload.terminal.kind === 'string'
+      && typeof payload.terminal.bridgeCapable === 'boolean'
+      && (payload.terminal.bridge === null
+        || (typeof payload.terminal.bridge?.client === 'boolean'
+          && typeof payload.terminal.bridge?.attachments === 'number'))),
+    JSON.stringify(payload.terminal))
   const refusedInfo = { writeHead(code) { this.code = code }, end() {} }
   await infoRoute.handler({ method: 'POST' }, refusedInfo)
   eq('a non-GET is refused with 405', refusedInfo.code, 405)
@@ -3497,7 +3509,503 @@ async function toolTests(tools, shim) {
   )
 }
 
-// --- WSL channel (host half) ----------------------------------------------
+// --- terminal bridge (host half) -------------------------------------------
+
+/** Wait a few macrotasks: enough for a route handler to reach its hold or a transport to flush. */
+function tickMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** One terminal the app's sidebar owns, shaped as the host controller publishes it. */
+function browserTerminalOf(id, sessionId = 'session-1') {
+  return {
+    id, title: 'WSL', shell: { name: 'bash', path: '/bin/bash', args: ['-i'] },
+    cwd: '/mnt/d/proj', cols: 120, rows: 30, state: 'running', exitCode: null, sessionId,
+  }
+}
+
+/**
+ * A DSH 0.2.1 host: `terminalController` has only list/create/close (no `follow`), and
+ * `subprocess` can still spawn a PTY. The bridge is built exactly like `index.js` builds it,
+ * so these checks exercise the same wiring the plugin ships.
+ */
+function makeBridgeHarness({ terminals = [], timings, withPty = true } = {}) {
+  const calls = { created: [], closed: [], spawned: [] }
+  const routes = []
+  const live = terminals.map((info) => ({ ...info }))
+  const terminalController = {
+    list(sessionId) {
+      return live
+        .filter((info) => info.sessionId === undefined || info.sessionId === sessionId)
+        .map((info) => ({ ...info }))
+    },
+    async create(agent, request) {
+      const info = { ...browserTerminalOf(request.id, agent.id), cols: request.cols, rows: request.rows }
+      live.push(info)
+      calls.created.push(info)
+      return { ...info }
+    },
+    async close(agent, id) {
+      calls.closed.push(String(id))
+      const index = live.findIndex((info) => info.id === id)
+      if (index >= 0) live.splice(index, 1)
+    },
+  }
+  const subprocess = {
+    resolveExecutable: async (name) => `C:/Windows/System32/${name}`,
+    async spawnTerminal(spec) {
+      calls.spawned.push(spec)
+      return makeBridgePtyHandle()
+    },
+  }
+  const webServer = { register(route) { routes.push(route); return () => {} } }
+  const ctx = {
+    get: (name) => (name === 'terminalController' ? terminalController
+      : name === 'subprocess' && withPty ? subprocess : undefined),
+    inject: (deps, callback) => {
+      if (Array.isArray(deps) && deps.includes('webServer')) {
+        callback({ webServer, effect: (fn) => { fn() } })
+      }
+    },
+  }
+  const transport = timings === undefined
+    ? createTerminalTransport({ ctx, config: CONFIG })
+    : createBridgeTransport({ ctx, config: CONFIG, controller: terminalController, pty: null, timings })
+  return { ctx, transport, routes, calls, live, terminalController }
+}
+
+/** A PTY handle that answers helper calls the way a real shell does, for the fallback path. */
+function makeBridgePtyHandle() {
+  let finished = false
+  let exitResolve
+  const done = new Promise((resolve) => { exitResolve = resolve })
+  const queue = []
+  const waiters = []
+  const push = (text) => {
+    const value = Buffer.from(String(text), 'utf8')
+    const waiter = waiters.shift()
+    if (waiter) waiter({ value, done: false })
+    else queue.push(value)
+  }
+  const output = {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          if (queue.length > 0) return Promise.resolve({ value: queue.shift(), done: false })
+          if (finished) return Promise.resolve({ value: undefined, done: true })
+          return new Promise((resolve) => waiters.push(resolve))
+        },
+      }
+    },
+  }
+  return {
+    output,
+    done,
+    write(data) {
+      const text = String(data)
+      const nonce = new RegExp(`${HELPER_NAME} ([0-9a-f]+) '`).exec(text)?.[1] ?? null
+      if (nonce === null) {
+        if (text.includes(`${HELPER_NAME}()`)) push(`${text.replace(/^\u0015/, '').split('\r')[0]}\r\n`)
+        return
+      }
+      push(`${START_PREFIX}${nonce}\r\n`)
+      push('pty fallback output\r\n')
+      push(`${END_PREFIX}${nonce}:0\r\n`)
+    },
+    async terminate() { finished = true; exitResolve({ exitCode: 0 }) },
+    async resize() {},
+    async inspectActivity() { return { state: 'idle', revision: 0 } },
+  }
+}
+
+/** Start one poll; it resolves when the host answers (a command batch, or the hold timeout). */
+function startBridgePoll(host, clientId) {
+  const route = host.routes.find((entry) => entry.path === '/dsh-wsl-tool/term-bridge/poll')
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      reject(new Error('the bridge poll did not answer within 2000 ms'))
+    }, 2_000)
+    const settle = (value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const request = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      on(event, callback) {
+        if (event === 'data') callback(Buffer.from(JSON.stringify({ clientId }), 'utf8'))
+        if (event === 'end') callback()
+        return this
+      },
+    }
+    const response = {
+      writeHead() {},
+      end(text) { settle(text === undefined || text === '' ? { ok: false } : JSON.parse(text)) },
+    }
+    Promise.resolve(route.handler(request, response)).catch((error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(error)
+    })
+  })
+}
+
+/** Post a batch of bridge events the way the client half does. */
+function postBridgeEvents(host, clientId, events) {
+  const route = host.routes.find((entry) => entry.path === '/dsh-wsl-tool/term-bridge/events')
+  return callRoute(route, 'POST', JSON.stringify({ clientId, events }))
+}
+
+/** The browser half, reduced to what the host sees: a poller and the frames it reports. */
+function makeBridgePage(host, { clientId = 'window-a' } = {}) {
+  const page = {
+    clientId,
+    attachmentId: null,
+    writes: [],
+    detaches: 0,
+    poll() { return startBridgePoll(host, clientId) },
+    send(events) { return postBridgeEvents(host, clientId, events) },
+    async handle(command) {
+      if (command.kind === 'attach') {
+        page.attachmentId = command.attachmentId
+        const info = host.live.find((entry) => entry.id === command.terminalId)
+        await page.send([
+          { type: 'result', commandId: command.id, ok: true },
+          { type: 'snapshot', attachmentId: command.attachmentId, screen: 'user@host:~/proj$ ', info, writable: true },
+        ])
+        return
+      }
+      if (command.kind === 'write') {
+        page.writes.push(command.data)
+        const nonce = new RegExp(`${HELPER_NAME} ([0-9a-f]+) '`).exec(command.data)?.[1] ?? null
+        const events = [{ type: 'result', commandId: command.id, ok: true }]
+        if (nonce !== null) {
+          events.push({ type: 'output', attachmentId: command.attachmentId, data: `${START_PREFIX}${nonce}\r\n` })
+          events.push({ type: 'output', attachmentId: command.attachmentId, data: 'bridge says hi\r\n' })
+          events.push({ type: 'output', attachmentId: command.attachmentId, data: `${END_PREFIX}${nonce}:0\r\n` })
+        }
+        await page.send(events)
+        return
+      }
+      if (command.kind === 'detach') {
+        page.detaches += 1
+        await page.send([{ type: 'result', commandId: command.id, ok: true }])
+      }
+    },
+  }
+  return page
+}
+
+/**
+ * Poll and answer until one tool call settles.
+ *
+ * A poll that loses the race to the settling call is left held; the transport unrefs its own
+ * hold timer, so it cannot keep the process alive.
+ */
+async function driveBridge(page, running) {
+  let outcome = null
+  const finished = running.then(
+    (value) => { outcome = { value }; return outcome },
+    (error) => { outcome = { error }; return outcome },
+  )
+  while (outcome === null) {
+    const next = await Promise.race([finished, page.poll().then((batch) => ({ batch }))])
+    if (outcome !== null) break
+    for (const command of next.batch?.commands ?? []) await page.handle(command)
+  }
+  await finished
+  if (outcome.error !== undefined) throw outcome.error
+  return outcome.value
+}
+
+async function bridgeUnitTests() {
+  console.log('\nterminal bridge')
+
+  // Routes, request policy, and the liveness rule: two routes, JSON-only, POST-only.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    eq('the bridge publishes exactly two routes', host.routes.length, 2)
+    eq('the bridge routes are namespaced and exact',
+      host.routes.map((entry) => `${entry.kind}:${entry.path}`).join(','),
+      'exact:/dsh-wsl-tool/term-bridge/poll,exact:/dsh-wsl-tool/term-bridge/events')
+    const poll = host.routes.find((entry) => entry.path.endsWith('/poll'))
+    const events = host.routes.find((entry) => entry.path.endsWith('/events'))
+    eq('the poll route refuses GET', (await callRoute(poll, 'GET')).code, 405)
+    eq('the poll route refuses a non-JSON content type',
+      (await callRoute(poll, 'POST', JSON.stringify({ clientId: 'x' }), { 'content-type': 'text/plain' })).code, 415)
+    eq('the poll route needs a clientId', (await callRoute(poll, 'POST', JSON.stringify({}))).code, 400)
+    eq('the events route refuses a malformed body', (await callRoute(events, 'POST', '{nope')).code, 400)
+    eq('the events route refuses GET', (await callRoute(events, 'GET')).code, 405)
+    eq('events from an unknown window are accepted and ignored',
+      (await callRoute(events, 'POST', JSON.stringify({ clientId: 'nobody', events: [{ type: 'snapshot' }] }))).code, 200)
+    eq('with no window polling, the transport reports the private-shell kind', host.transport.kind, 'pty')
+    eq('and its status says no page is holding the bridge', host.transport.status().client, false)
+    eq('and it still lists the browser terminal', host.transport.list('session-1').map((info) => info.id).join(','), 'user-term')
+  }
+
+  // The happy path: a run over the bridge, end to end through the real tool.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    await tickMs(5)
+    eq('a polling window makes the transport the bridge', host.transport.kind, 'bridge')
+    eq('and the status route can see that page', host.transport.status().client, true)
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, subtasks: createSubtaskLog(), transport: host.transport })
+    const running = tool.execute({ action: 'run', command: 'echo bridge', subtask: '桥接' }, { agent: { id: 'session-1' } })
+    const first = await warm
+    eq('the tool hands the page an attach command', first.commands?.[0]?.kind, 'attach')
+    eq('and names the existing terminal', first.commands?.[0]?.terminalId, 'user-term')
+    for (const command of first.commands ?? []) await page.handle(command)
+    eq('one bridge attachment is in flight', host.transport.status().attachments, 1)
+    const result = await driveBridge(page, running)
+    check('a run over the bridge returns the terminal output and its exit code',
+      result.summary.includes('bridge says hi') && result.summary.includes('exit code: 0'), result.summary)
+    check('the header says this is an existing terminal, not a private shell',
+      result.summary.includes('existing terminal in this session') && result.summary.includes('/mnt/d/proj'),
+      result.summary.slice(0, 280))
+    check('and it carries the handover warning the user needs',
+      result.summary.includes('接管输入'), result.summary.slice(0, 320))
+    eq('no terminal was created for an existing one', host.calls.created.length, 0)
+    eq('the tool never closes the user terminal', host.calls.closed.length, 0)
+    check('the helper is defined once, then the short call line is typed',
+      page.writes.length === 2
+      && page.writes[0].includes(`${HELPER_NAME}()`)
+      && /__dsh_term_run [0-9a-f]{8} 'echo bridge'/.test(page.writes[1]),
+      JSON.stringify(page.writes.map((write) => write.slice(0, 40))))
+    eq('the tool detaches after the call, releasing the keyboard', page.detaches, 1)
+  }
+
+  // `read` over the bridge: the snapshot is the screen, and the call still detaches.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    await tickMs(5)
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const running = tool.execute({ action: 'read', timeoutMs: 200 }, { agent: { id: 'session-1' } })
+    const first = await warm
+    for (const command of first.commands ?? []) await page.handle(command)
+    const read = await driveBridge(page, running)
+    check('a read over the bridge returns the screen', read.summary.includes('user@host:~/proj'), read.summary.slice(-220))
+    eq('a read does not type anything', page.writes.length, 0)
+  }
+
+  // A page that cannot attach reports why; the tool carries the sentence through.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    await tickMs(5)
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const running = tool.execute({ action: 'read', timeoutMs: 500 }, { agent: { id: 'session-1' } })
+    const first = await warm
+    const attach = first.commands?.find((command) => command.kind === 'attach')
+    await page.send([
+      { type: 'result', commandId: attach.id, ok: true },
+      { type: 'error', attachmentId: attach.attachmentId, message: 'the terminal tab was closed' },
+    ])
+    await rejects('a page that loses the terminal fails the call with its reason',
+      () => running, /terminal tab was closed/)
+  }
+
+  // Input control is gone (the user clicked 接管输入): the write is refused, not silently dropped.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    await tickMs(5)
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const running = tool.execute({ action: 'run', command: 'echo x', subtask: '只读' }, { agent: { id: 'session-1' } })
+    const first = await warm
+    for (const command of first.commands ?? []) await page.handle(command)
+    const second = await page.poll()
+    for (const command of second.commands ?? []) {
+      if (command.kind === 'write') {
+        await page.send([{
+          type: 'result',
+          commandId: command.id,
+          ok: false,
+          error: 'the terminal is read-only (the user took keyboard control)',
+        }])
+      }
+    }
+    await rejects('a read-only terminal surfaces as a refused write', () => running, /read-only/)
+  }
+
+  // A closed window: the poll heartbeat stops and the call does not wait out its deadline.
+  {
+    const host = makeBridgeHarness({
+      terminals: [browserTerminalOf('user-term')],
+      timings: { clientTtlMs: 120, lostCheckMs: 20, attachTimeoutMs: 3_000, writeTimeoutMs: 3_000, pollHoldMs: 400 },
+      withPty: false,
+    })
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    await tickMs(5)
+    eq('a short-lived timing override still makes the transport the bridge', host.transport.kind, 'bridge')
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const running = tool.execute({ action: 'read', timeoutMs: 3_000 }, { agent: { id: 'session-1' } })
+    await warm
+    // No attach result and no further polls: the window is gone as far as the host can tell.
+    await rejects('a window that stops answering fails the call instead of hanging it',
+      () => running, /stopped answering the terminal bridge/)
+  }
+
+  // A second window waits instead of fighting the serving one: a live bridge keeps its
+  // attachments, and the newcomer is answered empty.
+  {
+    const host = makeBridgeHarness({
+      terminals: [browserTerminalOf('user-term')],
+      timings: { clientTtlMs: 15_000, lostCheckMs: 1_000, attachTimeoutMs: 3_000, writeTimeoutMs: 3_000, pollHoldMs: 120 },
+      withPty: false,
+    })
+    const firstPage = makeBridgePage(host, { clientId: 'window-a' })
+    const warm = firstPage.poll()
+    await tickMs(5)
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const running = tool.execute({ action: 'read', timeoutMs: 500 }, { agent: { id: 'session-1' } })
+    const batch = await warm
+    for (const command of batch.commands ?? []) await firstPage.handle(command)
+    const secondPage = makeBridgePage(host, { clientId: 'window-b' })
+    const secondBatch = await secondPage.poll()
+    eq('a second window waits instead of stealing a live bridge', secondBatch.commands?.length, 0)
+    const read = await running
+    check('the first window keeps serving the attachment',
+      read.summary.includes('user@host:~/proj'), read.summary.slice(-200))
+  }
+
+  // When the serving window goes quiet, the next window inherits the bridge and the stale
+  // attachment fails instead of being driven by a page that is no longer there.
+  {
+    const host = makeBridgeHarness({
+      terminals: [browserTerminalOf('user-term')],
+      timings: { clientTtlMs: 120, lostCheckMs: 10_000, attachTimeoutMs: 3_000, writeTimeoutMs: 3_000, pollHoldMs: 100 },
+      withPty: false,
+    })
+    const firstPage = makeBridgePage(host, { clientId: 'window-a' })
+    const warm = firstPage.poll()
+    await tickMs(5)
+    const frames = host.transport.follow(
+      { id: 'session-1' }, 'user-term', 'attach-stale', new AbortController().signal,
+    )
+    const iterator = frames[Symbol.asyncIterator]()
+    const batch = await warm
+    for (const command of batch.commands ?? []) await firstPage.handle(command)
+    const first = await iterator.next()
+    check('the first attachment streams its snapshot', first.value?.type === 'snapshot',
+      JSON.stringify(first.value).slice(0, 140))
+    await tickMs(180)
+    const secondPage = makeBridgePage(host, { clientId: 'window-b' })
+    secondPage.poll().catch(() => {})
+    await rejects('a stale attachment fails when the next window takes over',
+      async () => { await iterator.next() }, /another DSH window took over/)
+    try { await iterator.return() } catch {}
+  }
+
+  // With no page at all, the same transport creates and drives its own PTY.
+  {
+    const host = makeBridgeHarness({ terminals: [] })
+    eq('with no page polling, the transport is the private shell', host.transport.kind, 'pty')
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const run = await tool.execute({ action: 'run', command: 'pwd', subtask: '兜底' }, { agent: { id: 'session-1' } })
+    check('the fallback opens a private PTY and reports its output',
+      run.summary.includes('pty fallback output') && run.summary.includes('exit code: 0'), run.summary)
+    check('the fallback says the shell is not in the sidebar',
+      run.summary.includes('does not appear in the sidebar'), run.summary.slice(0, 260))
+    eq('and it really spawned one shell', host.calls.spawned.length, 1)
+  }
+
+  // A shell opened while the window was closed stays drivable after it reopens: both
+  // generations show in one list, and follow routes by ownership.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('browser-term')] })
+    await host.transport.create({ id: 'session-1' }, { id: 'dsh-agent', cols: 120, rows: 30 })
+    eq('a closed window still gets a private shell', host.calls.spawned.length, 1)
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    await tickMs(5)
+    eq('the reopened window turns the transport back into the bridge', host.transport.kind, 'bridge')
+    eq('one list holds the browser terminal and the fallback shell',
+      host.transport.list('session-1').map((info) => String(info.id)).join(','), 'browser-term,dsh-agent')
+    // The page is alive but the call is over: the held poll is expected to time out, and its
+    // rejection is handled so it cannot surface as an unhandled one.
+    warm.catch(() => {})
+  }
+
+  // `create` while a window is polling goes to the host controller: the page can attach it.
+  {
+    const host = makeBridgeHarness({ terminals: [] })
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    await tickMs(5)
+    const info = await host.transport.create({ id: 'session-1' }, { id: 'dsh-agent', cols: 80, rows: 24 })
+    eq('a live bridge creates through the host controller', info.id, 'dsh-agent')
+    eq('and no private PTY is spawned for it', host.calls.spawned.length, 0)
+    eq('the controller recorded the creation', host.calls.created.length, 1)
+    // The window is alive but the call is over; the held poll times out on its own.
+    warm.catch(() => {})
+  }
+
+  // A follow with no window is a readable refusal, never a `follow is not a function` crash.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    await rejects('a follow with no window explains that no page is open',
+      async () => Promise.resolve(host.transport.follow(
+        { id: 'session-1' }, 'user-term', 'att-x', new AbortController().signal,
+      )), /not answering the terminal bridge/)
+  }
+
+  // The bridge wording is what the model reads, and the catalog budget is measured on the
+  // REAL mount (index.js hands the tool its transport), so the budget must be checked on this
+  // variant too — the fallback wording the other checks see is shorter.
+  {
+    const host = makeBridgeHarness({ terminals: [] })
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const cost = tool.description.length + JSON.stringify(tool.parameters).length
+    check('the bridge wording fits the model-facing catalog budget', cost <= 2_700, `${cost} chars`)
+    check('the bridge wording names the collaboration and the private fallback',
+      tool.description.includes('joins the terminal you opened')
+      && tool.description.includes('read-only')
+      && tool.description.includes('one is opened here')
+      && tool.description.includes('`close` it when the subtask is done'),
+      tool.description.slice(-320))
+  }
+
+  // The plugin itself publishes the two routes when the host is a 0.2.1 build.
+  {
+    const shim = makeShim(mkdtempSync(join(tmpdir(), 'dsh-wsl-bridge-')))
+    const tools = makeCtx(shim, {
+      terminalController: { list: () => [], create: async () => {}, close: async () => {} },
+    })
+    eq('the plugin publishes the bridge routes alongside its own', tools.routes.length, 10)
+    check('the bridge routes are the two the client half polls',
+      tools.routes.filter((entry) => entry.path.startsWith('/dsh-wsl-tool/term-bridge/')).length === 2,
+      JSON.stringify(tools.routes.map((entry) => entry.path)))
+    // The self-info route is how a person (or a script) checks, after a restart, whether the
+    // bridge half is really mounted and whether a page is polling right now.
+    const infoRoute = tools.routes.find((entry) => entry.path === '/dsh-wsl-tool/info')
+    const answered = {
+      writeHead(code, headers) { this.code = code; this.headers = headers },
+      end(text) { this.body = text },
+    }
+    await infoRoute.handler({ method: 'GET' }, answered)
+    const info = JSON.parse(answered.body)
+    eq('the self-info route reports the bridge build', info.terminal?.bridgeCapable, true)
+    eq('and reports that no page is driving it yet', info.terminal?.bridge?.client, false)
+    check('and reports counts only, never ids',
+      JSON.stringify(Object.keys(info.terminal ?? {}).sort()) === '["bridge","bridgeCapable","kind"]'
+      && JSON.stringify(Object.keys(info.terminal?.bridge ?? {}).sort()) === '["attachments","client","pending"]',
+      JSON.stringify(info.terminal))
+  }
+}
+
 
 /**
  * Drive `lib/channel.js` against fake host services: a real HTTP server on loopback, the
@@ -3860,6 +4368,7 @@ try {
     Object.keys(tools).sort().join(',') === 'wsl,wsl-doctor,wsl-env,wsl-path,wsl-term', Object.keys(tools).join(','))
   await unitTests()
   await terminalUnitTests()
+  await bridgeUnitTests()
   await channelUnitTests()
   await toolTests(tools, shim)
 } finally {

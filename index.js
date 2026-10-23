@@ -47,6 +47,7 @@ import { createWslDoctorTool } from './lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from './lib/tools/wsl-bootstrap.js'
 import { createWslTermTool } from './lib/tools/wsl-term.js'
 import { createTerminalTransport } from './lib/pty-transport.js'
+import { answerJson, isJsonRequest, readJsonBody } from './lib/http.js'
 import { createSubtaskLog, projectSubtask } from './lib/subtasks.js'
 import { createChannel } from './lib/channel.js'
 import { execFile } from 'node:child_process'
@@ -224,9 +225,6 @@ function resolvePatchFile(ctx, env) {
 /** Why the file could not be named, worded so the next reader knows where to look. */
 const NO_PATCH_ERROR = '宿主既没有 profileContext.patchPath 也没有 DSH_PROFILE_DIR，读不到 profile 的 patch 文件'
 
-/** A body past this is not a path; refuse it instead of buffering whatever arrives. */
-const MAX_TERMINAL_BODY_BYTES = 4096
-
 /**
  * How many of THIS plugin's own backups to keep beside the patch.
  *
@@ -259,70 +257,6 @@ function backupOrder(name) {
     stamp: `${match[1]}${match[2]}${match[3] ?? '000'}`,
     counter: match[4] === undefined ? 1 : Number(match[4]),
   }
-}
-
-function answerJson(response, code, payload) {
-  response.writeHead(code, {
-    'content-type': 'application/json; charset=utf-8',
-    // A value that was just read or written must describe this moment, not a cached one.
-    'cache-control': 'no-store',
-  })
-  response.end(JSON.stringify(payload))
-}
-
-/** One request header, from a node:http request or a fetch-style request object. */
-function requestHeader(request, name) {
-  const headers = request === undefined || request === null ? undefined : request.headers
-  if (headers === undefined || headers === null) return ''
-  const value = typeof headers.get === 'function' ? headers.get(name) : headers[name.toLowerCase()]
-  return typeof value === 'string' ? value : ''
-}
-
-/** Read one bounded JSON object body. @returns `{ value }` or `{ error }`. */
-function readJsonBody(request, limit = MAX_TERMINAL_BODY_BYTES) {
-  return new Promise((resolve) => {
-    if (request === null || typeof request.on !== 'function') {
-      resolve({ error: '读不到请求体' })
-      return
-    }
-    const chunks = []
-    let size = 0
-    let settled = false
-    const finish = (result) => {
-      if (!settled) {
-        settled = true
-        resolve(result)
-      }
-    }
-    request.on('data', (chunk) => {
-      size += chunk.length
-      if (size > limit) {
-        finish({ error: `请求体超过 ${limit} 字节` })
-        return
-      }
-      chunks.push(chunk)
-    })
-    request.on('end', () => {
-      const text = Buffer.concat(chunks).toString('utf8').trim()
-      if (text === '') {
-        finish({ error: '请求体是空的' })
-        return
-      }
-      let parsed
-      try {
-        parsed = JSON.parse(text)
-      } catch {
-        finish({ error: '请求体不是合法 JSON' })
-        return
-      }
-      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        finish({ error: '请求体必须是一个 JSON 对象' })
-        return
-      }
-      finish({ value: parsed })
-    })
-    request.on('error', () => finish({ error: '读取请求体失败' }))
-  })
 }
 
 /**
@@ -446,8 +380,7 @@ async function serveTerminalCwd(ctx, request, response) {
   // a form or a `no-cors` fetch cannot set it at all. The panel is same-origin and already
   // sends it, so this costs an honest caller nothing and keeps a hostile page from
   // rewriting the patch.
-  const contentType = requestHeader(request, 'content-type')
-  if (!/^application\/json\s*(?:;|$)/i.test(contentType)) {
+  if (!isJsonRequest(request)) {
     answerJson(response, 415, { ok: false, path: '', scrollback: null, error: '请求必须是 application/json' })
     return
   }
@@ -648,16 +581,33 @@ async function wslFacts(runner, config) {
  * effective configuration — the same resolved object the tools read — so the copied
  * block cannot disagree with the running plugin. `dsh` and `wsl` are the two facts
  * the browser half cannot reach on its own, and both degrade to `null` rather than
- * to a guess.
+ * to a guess. `terminal` answers the one question the bridge raises in practice —
+ * is a page polling right now — with counts only, never ids.
  *
  * No paths, host names or credentials: this route is served by the local web server
  * and a browser (or anything else on the machine) can fetch it.
  */
-async function selfInfo(config, runner) {
+async function selfInfo(config, runner, terminalTransport) {
   const manifest = readManifest()
   const repository = typeof manifest?.repository?.url === 'string'
     ? manifest.repository.url.replace(/^git\+/, '')
     : null
+  let terminal = null
+  if (terminalTransport !== null && terminalTransport !== undefined) {
+    const bridge = typeof terminalTransport.status === 'function' ? terminalTransport.status() : null
+    terminal = {
+      // 'bridge' when a page is driving the sidebar terminal, 'pty' when only this plugin can.
+      kind: typeof terminalTransport.kind === 'string' ? terminalTransport.kind : null,
+      bridgeCapable: terminalTransport.bridgeCapable === true,
+      bridge: bridge !== null && typeof bridge === 'object'
+        ? {
+            client: bridge.client === true,
+            attachments: typeof bridge.attachments === 'number' ? bridge.attachments : 0,
+            pending: typeof bridge.pending === 'number' ? bridge.pending : 0,
+          }
+        : null,
+    }
+  }
   return {
     name: manifest?.name ?? 'dsh-wsl-tool',
     version: manifest?.version ?? null,
@@ -667,6 +617,7 @@ async function selfInfo(config, runner) {
     arch: process.arch,
     dsh: dshVersion(),
     wsl: await wslFacts(runner, config),
+    terminal,
     config: {
       tools: { ...config.tools },
       backgroundJobs: config.backgroundJobs,
@@ -692,10 +643,11 @@ export function apply(ctx, settings = {}) {
   const subtasks = createSubtaskLog()
   // ONE terminal transport for this mount: the tool drives it and the subtask route asks it
   // whether a recorded terminal is still alive. Whichever generation the host offers is picked
-  // here — a `terminalController` with follow/write (browser terminals, the user can watch), or a
-  // PTY this plugin owns through `subprocess.spawnTerminal` (DSH 0.2.1, where a plugin can no
-  // longer join a browser terminal). Resolved once so both consumers agree on the answer, and a
-  // host that faults here must not stop the other five tools from mounting.
+  // here — a `terminalController` with follow/write (browser terminals, the user can watch), the
+  // browser bridge on 0.2.1 (`lib/term-bridge.js`: this plugin's own page holds the Remote
+  // attachment, and the private PTY below is its fallback), or a PTY alone when no page is
+  // available. Resolved once so both consumers agree on the answer, and a host that faults here
+  // must not stop the other five tools from mounting.
   let terminalTransport = null
   try {
     terminalTransport = createTerminalTransport({ ctx, config })
@@ -827,7 +779,7 @@ export function apply(ctx, settings = {}) {
           try {
             // The WSL probes cost a few WSL round trips; they run concurrently and
             // every one of them may fail without failing the request.
-            body = JSON.stringify(await selfInfo(config, runner))
+            body = JSON.stringify(await selfInfo(config, runner, terminalTransport))
           } catch (error) {
             console.warn('dsh-wsl-tool: reading self info failed', error)
             body = JSON.stringify({ name: 'dsh-wsl-tool', version: null, dsh: null, wsl: null })
@@ -998,8 +950,7 @@ export function apply(ctx, settings = {}) {
             response.end()
             return
           }
-          const type = String(requestHeader(request, 'content-type') ?? '').toLowerCase()
-          if (!type.startsWith('application/json')) {
+          if (!isJsonRequest(request)) {
             answerJson(response, 415, { ok: false, detail: 'content-type must be application/json' })
             return
           }
@@ -1027,8 +978,7 @@ export function apply(ctx, settings = {}) {
             response.end()
             return
           }
-          const type = String(requestHeader(request, 'content-type') ?? '').toLowerCase()
-          if (!type.startsWith('application/json')) {
+          if (!isJsonRequest(request)) {
             answerJson(response, 415, { ok: false, detail: 'content-type must be application/json' })
             return
           }

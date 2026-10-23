@@ -163,10 +163,13 @@ wsl-term({ action: "subtask-done", subtask: "跑通 sta 流程", result: "三条
                                                               → 写下结果，并决定这个 shell 的去留
 ```
 
-**它驱动哪个 shell，取决于 DSH 的版本。** 到 DSH 0.2.0 为止，宿主把侧边栏终端暴露给插件，所以 `wsl-term`
-会加入**你自己打开的那个终端**（没有就自己开一个）；它工作期间你的视图是只读的，点 **「接管输入」** 才能继续输入。
-**DSH 0.2.1** 把那个 API 换成了只有 Remote 调用方才能打开的附着方式，插件无法使用，于是 `wsl-term` 改为
-**每个子任务开一个私有的 WSL shell**：动作与记录照旧在输入框上方，但这个 shell 不出现在侧边栏，只有工具会往里输入。
+**它驱动哪个 shell，取决于 DSH 窗口是否开着。** 从 DSH 0.2.1 起宿主不再允许插件直接附着浏览器终端——但本插件
+自己的**浏览器半**运行在页面里，那个附着在页面里是允许的，于是宿主半把 `attach`/`write`/`detach` 命令经两条同源路由
+交给它，页面再把屏幕与输出帧回传（这就是桥接；不额外开端口、不额外起服务）。窗口开着时，`wsl-term` 会加入
+**你自己打开的那个终端**（没有就自己开一个）；它工作期间你的视图是只读的，点 **「接管输入」** 才能继续输入。
+如果没有窗口应答（应用关了，或页面还在加载），同一个工具就改为**每个子任务开一个私有的 WSL shell**：动作与记录
+照旧在输入框上方，但这个 shell 不出现在侧边栏，只有工具会往里输入。到 0.2.0 为止的宿主不用桥接：插件直接通过
+`terminalController.follow`/`write` 驱动浏览器终端。
 
 #### 每件事都留下一条记录
 
@@ -267,9 +270,11 @@ DSH_SUBPROCESS_LOCAL=/path/to/dsh/node_modules npm run test:real
 任务则是无主的。
 
 有一处行为随宿主代际不同。到 0.2.0 为止，终端工具通过 `terminalController.follow`/`write`
-驱动**浏览器终端**；0.2.1 把它们换成了只有 Remote 调用方能打开的附着方式，于是同一个工具改用
-`subprocess.spawnTerminal` 开一个**自己的 PTY**——动作相同、输入框上方的记录相同，只是这个
-shell 是工具私有的。
+直接驱动**浏览器终端**；0.2.1 把它们换成了只有 Remote 调用方能打开的附着方式，于是改由本插件的
+**浏览器半**加入侧边栏终端：宿主把 `attach`/`write`/`detach` 经
+`/dsh-wsl-tool/term-bridge/poll` 与 `/events` 交给页面，页面用结果、屏幕快照与输出作答。窗口关着、
+或宿主不提供这两条路由时，同一个工具改用 `subprocess.spawnTerminal` 开一个**自己的 PTY**——动作相同、
+输入框上方的记录相同，只是这个 shell 是工具私有的。两条路径都有 `npm test` 覆盖。
 
 ## 左侧栏的 WSL 面板
 
@@ -576,7 +581,7 @@ argv 包一层过 `ctx.sandbox`）和文件系统服务（`@deepseek-ai/dsh-fs-s
 ### 测试
 
 ```sh
-npm test          # 965 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 172 项客户端检查
+npm test          # 1017 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 220 项客户端检查
 npm run test:real # 同一套检查改跑真实 provider，外加 seam 事实套件
 ```
 

@@ -1025,6 +1025,451 @@ const dockFetch = context.fetch
 }
 context.fetch = dockFetch
 
+// --- the terminal bridge (the browser half of wsl-term collaboration) -------
+//
+// DSH 0.2.1 removed `terminalController.follow`/`write`: a Host plugin has no Remote
+// invocation, so it cannot drive a browser terminal by itself any more. The Host half
+// therefore parks what it wants done as commands, and this page — which does own a Remote
+// invocation — executes them against `webTerminals` and streams the frames back. That loop
+// is the only thing that keeps a user-visible terminal in the loop, so every shape below is
+// asserted against the contract (`_term-bridge-contract.md`) rather than against the code:
+// one poll route, one event route, an ack after every render frame, dispose (never close) on
+// detach, and silence when the service or the routes are absent.
+
+console.log('\nthe terminal bridge')
+const settleBridge = () => new Promise((resolve) => setImmediate(resolve))
+const BRIDGE_POLL_URL = '/dsh-wsl-tool/term-bridge/poll'
+const BRIDGE_EVENTS_URL = '/dsh-wsl-tool/term-bridge/events'
+
+/** One fake terminal view: a subscribable store plus the calls the worker must make. */
+function makeBridgeView() {
+  const listeners = new Set()
+  const store = {
+    value: {
+      phase: 'connected',
+      writable: true,
+      info: { id: 't-1', title: 'WSL', state: 'running', cols: 120, rows: 30 },
+      render: undefined,
+    },
+    getSnapshot() { return this.value },
+    subscribe(listener) {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+  }
+  return {
+    state: store,
+    mounts: 0,
+    writes: [],
+    acks: [],
+    disposes: 0,
+    closes: 0,
+    listenCount: () => listeners.size,
+    mount() {
+      this.mounts += 1
+      return () => {}
+    },
+    write(data) { this.writes.push(data) },
+    acknowledge(revision) { this.acks.push(revision) },
+    dispose() {
+      this.disposes += 1
+      return Promise.resolve()
+    },
+    close() {
+      this.closes += 1
+      return Promise.resolve()
+    },
+    patch(next) {
+      store.value = { ...store.value, ...next }
+      for (const listener of Array.from(listeners)) listener(store.value)
+    },
+  }
+}
+
+/** A fake `fetch` for the two bridge routes, with a command queue the test refills. */
+function makeBridgeFetch() {
+  const calls = []
+  const commands = []
+  let parked = undefined
+  const fetcher = (url, init) => {
+    const target = String(url)
+    calls.push({ url: target, init: init ?? {}, body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined })
+    if (target === BRIDGE_POLL_URL) {
+      const batch = commands.splice(0, commands.length)
+      if (batch.length > 0) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ ok: true, commands: batch, ttlMs: 15000 }),
+        })
+      }
+      // Park the long poll: the worker only advances when a command is pushed.
+      return new Promise((resolve) => {
+        parked = () => resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, commands: [], ttlMs: 15000 }) })
+      })
+    }
+    if (target === BRIDGE_EVENTS_URL) {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) })
+    }
+    return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) })
+  }
+  const eventCalls = () => calls.filter((call) => call.url === BRIDGE_EVENTS_URL)
+  return {
+    fetcher,
+    calls,
+    pollCalls: () => calls.filter((call) => call.url === BRIDGE_POLL_URL),
+    eventCalls,
+    events: () => eventCalls().flatMap((call) => (Array.isArray(call.body?.events) ? call.body.events : [])),
+    push(command) {
+      commands.push(command)
+      if (parked !== undefined) {
+        const wake = parked
+        parked = undefined
+        wake()
+      }
+    },
+  }
+}
+
+/** Apply the module against a fake client context whose terminal service is this stub. */
+function applyBridge(options) {
+  const previousFetch = context.fetch
+  context.fetch = options.fetch
+  const disposers = []
+  let threw = null
+  const ctx = {
+    slots: { inject: (_seat, callback) => callback(), register: () => () => {} },
+    inject: (deps, callback) => {
+      if (deps.includes('webTerminals')) {
+        callback({
+          webTerminals: options.webTerminals,
+          effect: (setup) => {
+            const dispose = setup()
+            disposers.push(dispose)
+            return () => {}
+          },
+        })
+        return
+      }
+      callback({
+        configForms: {
+          get: () => scope,
+          whileServed: (_namespaces, register) => {
+            const off = register(new Set())
+            return () => { if (typeof off === 'function') off() }
+          },
+        },
+        effect: () => () => {},
+      })
+    },
+  }
+  try {
+    mod.apply(ctx)
+  } catch (error) {
+    threw = error
+  }
+  return {
+    threw,
+    restore: () => {
+      for (const dispose of disposers) {
+        try {
+          if (typeof dispose === 'function') dispose()
+        } catch {}
+      }
+      context.fetch = previousFetch
+    },
+  }
+}
+
+/** Fire the bridge's 50 ms event-flush timer, then let its request settle. */
+const flushBridgeEvents = async () => {
+  fireTimers((timer) => timer.ms === 50)
+  await settleBridge()
+  await settleBridge()
+}
+
+// (1) The service is served: one long poll, JSON, with a client id and the current
+// attachment list. Nothing is attached on the first poll.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const view = makeBridgeView()
+  const applied = applyBridge({ webTerminals: { view: () => view }, fetch: bridgeFetch.fetcher })
+  eq('the bridge starts without throwing', applied.threw, null)
+  await settleBridge()
+  const polls = bridgeFetch.pollCalls()
+  eq('the page long-polls the bridge route', polls.length, 1)
+  eq('the poll is a POST', polls[0]?.init?.method, 'POST')
+  check('the poll asks for JSON', /application\/json/.test(String(polls[0]?.init?.headers?.['content-type'])),
+    JSON.stringify(polls[0]?.init?.headers))
+  check('the poll carries one 16-32 hex client id',
+    /^[0-9a-f]{16,32}$/.test(String(polls[0]?.body?.clientId)), String(polls[0]?.body?.clientId))
+  eq('the poll starts with no attachments', JSON.stringify(polls[0]?.body?.attachments), '[]')
+  applied.restore()
+}
+
+// (2) No terminal service in this composition: the Host falls back to its own PTY, and the
+// page must not start a poll loop against routes it cannot serve.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const applied = applyBridge({ webTerminals: undefined, fetch: bridgeFetch.fetcher })
+  await settleBridge()
+  eq('without the terminal service nothing polls', bridgeFetch.calls.length, 0)
+  eq('and apply still mounts', applied.threw, null)
+  applied.restore()
+}
+
+// (3) A browser with no fetch at all: the same degradation, and no exception.
+{
+  const applied = applyBridge({ webTerminals: { view: () => makeBridgeView() }, fetch: undefined })
+  eq('a page without fetch does not take apply down', applied.threw, null)
+  applied.restore()
+}
+
+// (4) An older Host has no bridge routes: 404 is final, not a retry loop.
+{
+  let pollCount = 0
+  const fetcher = (url) => {
+    if (String(url) === BRIDGE_POLL_URL) {
+      pollCount += 1
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) })
+    }
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ ok: true }) })
+  }
+  const applied = applyBridge({ webTerminals: { view: () => makeBridgeView() }, fetch: fetcher })
+  await settleBridge()
+  eq('a Host without bridge routes is polled once', pollCount, 1)
+  await settleBridge()
+  await settleBridge()
+  eq('a 404 stops the loop permanently', pollCount, 1)
+  applied.restore()
+}
+
+// (5) The whole loop, one attachment: attach, screen frames, input, read-only input,
+// detach. The order matters — frames must arrive in the order the terminal produced them,
+// each one acknowledged, and input only while the user has not taken the keyboard.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const view = makeBridgeView()
+  const opened = []
+  const applied = applyBridge({
+    webTerminals: {
+      view: (...args) => {
+        opened.push(args)
+        return view
+      },
+    },
+    fetch: bridgeFetch.fetcher,
+  })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-1', sessionId: 's-1', terminalId: 't-1' })
+  await settleBridge()
+  eq('an attach opens one view per attachment',
+    JSON.stringify(opened[0]), JSON.stringify(['s-1', 'dsh-wsl-bridge:a-1', 'dsh-wsl-bridge:a-1', 't-1']))
+  eq('and mounts it', view.mounts, 1)
+  check('the attachment is announced to the next poll',
+    bridgeFetch.pollCalls().some((call) => JSON.stringify(call.body?.attachments) === '["a-1"]'),
+    JSON.stringify(bridgeFetch.pollCalls().map((call) => call.body?.attachments)))
+  await flushBridgeEvents()
+  const attachResult = bridgeFetch.events().find((event) => event.type === 'result' && event.commandId === 'c-1')
+  eq('the attach is acknowledged with a result', attachResult?.ok, true)
+  eq('the first state event carries the view writable flag',
+    JSON.stringify(bridgeFetch.events().filter((event) => event.type === 'state').map((event) => event.writable)), '[true]')
+
+  // A snapshot frame: the whole screen, with the info and writable flag the Host needs.
+  view.patch({
+    render: {
+      revision: 1,
+      frame: {
+        type: 'snapshot',
+        screen: '\u001b[32mready\u001b[0m',
+        info: { id: 't-1', title: 'WSL', state: 'running', cols: 120, rows: 30 },
+        writable: true,
+      },
+    },
+  })
+  await flushBridgeEvents()
+  const snapshot = bridgeFetch.events().find((event) => event.type === 'snapshot')
+  eq('a snapshot frame becomes one snapshot event', snapshot?.screen, '\u001b[32mready\u001b[0m')
+  eq('with the terminal info the Host reads', snapshot?.info?.cols, 120)
+  check('the snapshot frame is acknowledged', view.acks.includes(1), JSON.stringify(view.acks))
+
+  // An output frame: only the new text.
+  view.patch({ render: { revision: 2, frame: { type: 'output', data: 'hello' } } })
+  await flushBridgeEvents()
+  const output = bridgeFetch.events().find((event) => event.type === 'output')
+  eq('an output frame becomes one output event', output?.data, 'hello')
+  eq('every render revision is acknowledged exactly once', JSON.stringify(view.acks), '[1,2]')
+
+  // Input while the user still lets the tool type.
+  bridgeFetch.push({ id: 'c-2', kind: 'write', attachmentId: 'a-1', data: 'ls -la\r' })
+  await settleBridge()
+  await flushBridgeEvents()
+  eq('a write command reaches the view with its raw keys', JSON.stringify(view.writes), '["ls -la\\r"]')
+  const wrote = bridgeFetch.events().find((event) => event.type === 'result' && event.commandId === 'c-2')
+  eq('and settles as a successful result', wrote?.ok, true)
+
+  // The user clicked "take input": writable changes, and a write now fails instead of
+  // pretending it typed something.
+  view.patch({ writable: false })
+  await flushBridgeEvents()
+  eq('a writable change is reported as another state event',
+    JSON.stringify(bridgeFetch.events().filter((event) => event.type === 'state').map((event) => event.writable)),
+    '[true,false]')
+  bridgeFetch.push({ id: 'c-3', kind: 'write', attachmentId: 'a-1', data: 'rm -rf /\r' })
+  await settleBridge()
+  await flushBridgeEvents()
+  const refused = bridgeFetch.events().find((event) => event.type === 'result' && event.commandId === 'c-3')
+  eq('writing a read-only view fails', refused?.ok, false)
+  eq('with the contract\'s reason', refused?.error, 'the terminal is read-only (the user took keyboard control)')
+  eq('and nothing is written once control was taken', view.writes.length, 1)
+
+  // Detach releases the bridge's hold on the view — it never closes the user's terminal.
+  bridgeFetch.push({ id: 'c-4', kind: 'detach', attachmentId: 'a-1' })
+  await settleBridge()
+  await flushBridgeEvents()
+  const detached = bridgeFetch.events().find((event) => event.type === 'result' && event.commandId === 'c-4')
+  eq('a detach command succeeds', detached?.ok, true)
+  eq('it disposes the view once', view.disposes, 1)
+  eq('it never closes the user\'s terminal', view.closes, 0)
+  eq('it unsubscribes from the view store', view.listenCount(), 0)
+  await settleBridge()
+  eq('the released attachment is omitted from the next poll',
+    JSON.stringify(bridgeFetch.pollCalls().pop()?.body?.attachments), '[]')
+  applied.restore()
+}
+
+// (6) A view that fails (the terminal was closed or vanished): one error event, once.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const view = makeBridgeView()
+  const applied = applyBridge({ webTerminals: { view: () => view }, fetch: bridgeFetch.fetcher })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-9', sessionId: 's-1', terminalId: 't-9' })
+  await settleBridge()
+  view.patch({ phase: 'failed', error: 'terminal t-9 is gone' })
+  await flushBridgeEvents()
+  const failures = bridgeFetch.events().filter((event) => event.type === 'error')
+  eq('a failed view reports an error event', failures.length, 1)
+  eq('for the right attachment', failures[0]?.attachmentId, 'a-9')
+  check('naming why the connection ended', String(failures[0]?.message).includes('terminal t-9 is gone'),
+    String(failures[0]?.message))
+  view.patch({ phase: 'failed', error: 'a second patch' })
+  await flushBridgeEvents()
+  eq('a repeated failed patch does not repeat the error',
+    bridgeFetch.events().filter((event) => event.type === 'error').length, 1)
+  applied.restore()
+}
+
+// (7) A view that refuses to open: the command fails with a reason and apply stays up.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const applied = applyBridge({
+    webTerminals: { view: () => { throw new Error('no terminal t-7 in this session') } },
+    fetch: bridgeFetch.fetcher,
+  })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-7', sessionId: 's-1', terminalId: 't-7' })
+  await settleBridge()
+  await flushBridgeEvents()
+  const refused = bridgeFetch.events().find((event) => event.type === 'result' && event.commandId === 'c-1')
+  eq('a view that refuses to open fails the command', refused?.ok, false)
+  check('and the reason reaches the Host', String(refused?.error).includes('no terminal t-7'), String(refused?.error))
+  eq('apply itself stayed up', applied.threw, null)
+  applied.restore()
+}
+
+// (8) Event delivery: one retry after a network failure, then the batch is delivered.
+{
+  const bridgeFetch = makeBridgeFetch()
+  let eventAttempts = 0
+  const fetcher = (url, init) => {
+    if (String(url) === BRIDGE_EVENTS_URL) {
+      eventAttempts += 1
+      if (eventAttempts === 1) return Promise.reject(new Error('offline'))
+    }
+    return bridgeFetch.fetcher(url, init)
+  }
+  const applied = applyBridge({ webTerminals: { view: () => makeBridgeView() }, fetch: fetcher })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-1', sessionId: 's-1', terminalId: 't-1' })
+  await settleBridge()
+  await flushBridgeEvents()
+  eq('a failed event batch is retried once', eventAttempts, 2)
+  check('and the retry delivers the command result',
+    bridgeFetch.events().some((event) => event.type === 'result' && event.commandId === 'c-1'),
+    JSON.stringify(bridgeFetch.events()))
+  applied.restore()
+}
+
+// (9) An older store with no `subscribe`: the worker samples it instead, at 100 ms, and
+// still acknowledges what it forwards.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const store = {
+    value: { phase: 'connected', writable: true, info: { id: 't-1', state: 'running' }, render: undefined },
+    getSnapshot() { return this.value },
+  }
+  const view = {
+    state: store,
+    mounts: 0,
+    acks: [],
+    disposes: 0,
+    closes: 0,
+    mount() {
+      this.mounts += 1
+      return () => {}
+    },
+    acknowledge(revision) { this.acks.push(revision) },
+    dispose() {
+      this.disposes += 1
+      return Promise.resolve()
+    },
+    close() { this.closes += 1 },
+  }
+  const applied = applyBridge({ webTerminals: { view: () => view }, fetch: bridgeFetch.fetcher })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-2', sessionId: 's-1', terminalId: 't-2' })
+  await settleBridge()
+  store.value = {
+    ...store.value,
+    render: { revision: 1, frame: { type: 'snapshot', screen: 'sampled', info: store.value.info, writable: true } },
+  }
+  fireTimers((timer) => timer.ms === 100)
+  await settleBridge()
+  await flushBridgeEvents()
+  const sampled = bridgeFetch.events().find((event) => event.type === 'snapshot')
+  eq('a store without subscribe is sampled for frames', sampled?.screen, 'sampled')
+  check('and the sampled frame is acknowledged', view.acks.includes(1), JSON.stringify(view.acks))
+  applied.restore()
+}
+
+// (10) Page unload or plugin reload: the worker registers a `pagehide` hook, and that hook
+// releases the attached views and stops the loop — still without closing any terminal.
+{
+  const added = []
+  const removed = []
+  context.window.addEventListener = (name, handler) => added.push({ name, handler })
+  context.window.removeEventListener = (name, handler) => removed.push({ name, handler })
+  const bridgeFetch = makeBridgeFetch()
+  const view = makeBridgeView()
+  const applied = applyBridge({ webTerminals: { view: () => view }, fetch: bridgeFetch.fetcher })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-1', sessionId: 's-1', terminalId: 't-1' })
+  await settleBridge()
+  const unload = added.find((entry) => entry.name === 'pagehide')
+  check('the worker listens for page unload', unload !== undefined, JSON.stringify(added.map((entry) => entry.name)))
+  const pollsBefore = bridgeFetch.pollCalls().length
+  if (unload !== undefined) unload.handler()
+  await settleBridge()
+  eq('the unload hook releases the attached view', view.disposes, 1)
+  eq('and never closes the user\'s terminal', view.closes, 0)
+  eq('and stops polling', bridgeFetch.pollCalls().length, pollsBefore)
+  eq('and unregisters itself', removed.filter((entry) => entry.name === 'pagehide').length, 1)
+  applied.restore()
+  delete context.window.addEventListener
+  delete context.window.removeEventListener
+}
+
 // The documented counts are hand-written and drift on every commit; this suite knows its own
 // total, so it checks the docs rather than trusting them. Compared after the totals are
 // final, so it does not change the number it checks.

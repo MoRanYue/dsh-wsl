@@ -187,13 +187,18 @@ wsl-term({ action: "subtask-done", subtask: "跑通 sta 流程", result: "三条
                                                                → writes the result and decides the shell
 ```
 
-**Which shell it drives depends on the DSH generation.** Up to DSH 0.2.0 the host
-exposes its browser terminals to plugins, so `wsl-term` joins the one you opened in the
-sidebar (or opens one); while it works there your view is read-only until you press
-接管输入. **DSH 0.2.1** replaced that API with an attachment only a Remote caller can
-open, which a plugin cannot supply, so `wsl-term` opens a **private WSL shell per
-subtask** instead: the same actions and the same records above the composer, but the
-shell does not appear in the sidebar and only the tool types into it.
+**Which shell it drives depends on whether the DSH window is open.** From DSH 0.2.1 the
+host no longer lets a plugin attach to a browser terminal directly — but this plugin's own
+browser half runs in the page, where that attachment is allowed, so the host half queues
+`attach`/`write`/`detach` commands for it over two same-origin routes and the page streams the
+screen and output frames back (the bridge; no extra port and no extra service). While the
+window is open, `wsl-term` joins the terminal you opened in the sidebar (or opens one), and
+while it works there your view is read-only until you press 接管输入. If no window answers —
+the app was closed, or the page is still loading — the same tool opens a **private WSL shell
+per subtask** instead: the same actions and the same records above the composer, but the
+shell does not appear in the sidebar and only the tool types into it. On hosts up to 0.2.0
+the bridge is not used: the plugin drives the browser terminal directly through
+`terminalController.follow`/`write`.
 
 #### Work is recorded as subtasks
 
@@ -326,10 +331,14 @@ is what lets the model read it back with `job_output`/`job_kill` and what keeps
 other sessions out; an execution with no agent starts the job unowned.
 
 One behaviour differs by host generation. Up to 0.2.0 the terminal tool drives a
-browser terminal through `terminalController.follow`/`write`; 0.2.1 replaced
-those with an attachment only a Remote caller can open, so the same tool opens
-its own PTY through `subprocess.spawnTerminal` — same actions, same records above
-the composer, with a shell private to the tool.
+browser terminal directly through `terminalController.follow`/`write`. 0.2.1 replaced
+those with an attachment only a Remote caller can open, so the plugin's browser half
+joins the sidebar terminal instead: the host queues `attach`/`write`/`detach` over
+`/dsh-wsl-tool/term-bridge/poll` + `/events`, and the page answers with results, screen
+snapshots and output. A closed window, or a host that does not serve those routes,
+makes the same tool open its own PTY through `subprocess.spawnTerminal` — same actions,
+same records above the composer, with a shell private to the tool. Both paths are
+checked by `npm test`.
 
 ## The WSL panel (left sidebar)
 
@@ -661,7 +670,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 965 host checks against real WSL (shim for ctx.subprocess) + 172 client checks
+npm test          # 1017 host checks against real WSL (shim for ctx.subprocess) + 220 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
