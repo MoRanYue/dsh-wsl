@@ -868,9 +868,14 @@ export function apply(ctx, settings = {}) {
                 continue
               }
               // A normal subtask that an explicit call recorded on this terminal stays as it
-              // is; the terminal gets its own record beside it.
+              // is; the terminal gets its own record beside it. Titles are unique across the
+              // USER-TERMINAL records, not just this id's: a closed terminal's record keeps its
+              // title (and must read as ended), and a re-created tab with the same shell name
+              // gets a "#2" of its own instead of rewriting the old record in place.
               const base = `用户建立的终端「${info?.title ?? 'WSL'}」`
-              const taken = new Set(mine.map((entry) => entry.title))
+              const taken = new Set(subtasks.list(wanted).entries
+                .filter((entry) => entry.userTerminal === true)
+                .map((entry) => entry.title))
               let title = base
               for (let index = 2; taken.has(title); index += 1) title = `${base} #${index}`
               const created = subtasks.start(wanted, title, {

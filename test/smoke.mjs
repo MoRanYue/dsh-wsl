@@ -4187,6 +4187,17 @@ async function bridgeUnitTests() {
     const ended = payload.sessions['session-1']?.entries?.[0]
     eq('after the user closes it the record reads as ended', ended?.status, 'done')
     eq('and it is marked closed', ended?.terminal, 'closed')
+    // The app re-creates a tab with a new id but the same shell title. That must be a NEW
+    // record: the closed one keeps its ended state, and nothing is rewritten in place.
+    shared.push(browserTerminalOf('shared-term-2', 'session-1'))
+    payload = await readSubtasks('session-1')
+    const entries = payload.sessions['session-1']?.entries ?? []
+    eq('a re-created terminal gets a second record', entries.length, 2)
+    eq('the new record is the running one', entries[0]?.status, 'running')
+    check('and its title is numbered, not reused',
+      entries[0]?.title === '用户建立的终端「WSL」 #2', entries[0]?.title)
+    eq('while the closed one still reads as ended', entries[1]?.status, 'done')
+    eq('and still points at the old terminal', entries[1]?.terminalId, 'shared-term')
     poll.catch(() => {})
   }
 }
