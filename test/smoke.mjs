@@ -4354,6 +4354,32 @@ async function channelUnitTests() {
     eq('the steered line still reaches the controller',
       calls.filter((entry) => entry[0] === 'prompt').length, 2)
 
+    // `dsh insert`: delivery without waiting. `say` cannot be used to write into the very
+    // conversation the caller runs in (steer joins the live turn, whose end waits on the
+    // tool call) — this route hands the prompt over and answers at once.
+    const insertedIdle = await call('POST', '/insert', 'note for later', {
+      'content-type': 'text/plain',
+      'x-dsh-wsl-token': state.token,
+      'x-dsh-wsl-session': 'session-a',
+    })
+    eq('insert answers at once', insertedIdle.status, 200)
+    eq('insert reports where the prompt went', insertedIdle.body.trim(), 'ok\tqueued\tsession-a')
+    check('insert does not stream a turn', !insertedIdle.body.includes('~ack'), insertedIdle.body)
+   eq('an idle conversation is queued',
+      calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.mode, 'queue')
+    eq('the inserted text reaches the controller verbatim',
+      calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.content?.[0]?.text, 'note for later')
+    const insertedBusy = await call('POST', '/insert', 'in line', {
+      'content-type': 'text/plain',
+      'x-dsh-wsl-token': state.token,
+      'x-dsh-wsl-session': 'session-busy',
+    })
+    eq('a busy conversation steers the insertion', insertedBusy.body.trim(), 'ok\tinserted\tsession-busy')
+    eq('the steered insert uses steer mode',
+      calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.mode, 'steer')
+    const insertDenied = await call('POST', '/insert', 'x', { 'content-type': 'text/plain' })
+    eq('insert requires the channel token too', insertDenied.status, 401)
+
     const listed = await call('POST', '/list', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
     check('the list route returns tab-separated sessions',
       listed.body.includes('session-a\t') && listed.body.includes('title of session-a'), listed.body)
@@ -4384,6 +4410,9 @@ async function channelUnitTests() {
     check('the installed shim points at the state file', shim.includes('/dsh-wsl/channel.json') && !shim.includes('.dsh/dsh-wsl/channel.json'), shim.slice(0, 400))
     check('the install command copies and marks the shim executable',
       (wslCalls[wslCalls.length - 1] ?? []).join(' ').includes('install -m 0755'), JSON.stringify(wslCalls[wslCalls.length - 1]))
+    check('the installed shim carries the insert command',
+      shim.includes('cmd_insert') && shim.includes('dsh insert') && shim.includes('post insert'),
+      shim.slice(-900))
 
     const refuseInstall = await createChannel({ ctx, config: { channelEnabled: false } }).install()
     eq('install without a wsl runner is refused', refuseInstall.ok, false)

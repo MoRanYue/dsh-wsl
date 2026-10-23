@@ -474,11 +474,15 @@ same agent reacts immediately and nothing is dropped.
 |---|---|
 | `dsh "问题"` | send to the current session and stream the reply |
 | `dsh <id> "问题"` | send to that session |
+| `dsh insert "消息"` | hand a message to the current session and return at once — no waiting for the turn |
+| `dsh insert <id> "消息"` | the same, into that session |
 | `dsh list` | sessions, newest first; `*` marks the current one |
 | `dsh new <id>` | create a session (it appears in the client) and switch to it |
 | `dsh use <id>` | switch the current session |
 | `dsh rm <id>` | archive a session — the client's own reversible remove |
 | `dsh status` | current session and channel state |
+
+`dsh insert` exists for the one case `say` cannot serve: writing into the conversation that is running the command that is waiting for the answer — the text joins that live turn, so the command returns instead of waiting on itself.
 
 Set it up once in the panel: turn on **启用 dsh 命令** and click **安装 dsh 命令** — the default landing is the most recently active conversation — the one you are looking at (pick another from the list, or create one right there, if you want a different landing); the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
 server to the address WSL uses as its default gateway, on a random port, and demands
@@ -677,7 +681,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1052 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
+npm test          # 1061 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
