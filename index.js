@@ -799,7 +799,7 @@ export function apply(ctx, settings = {}) {
         // this route has no session of its own. A `?session=` names the dock's own conversation
         // so the terminals the USER opened can be listed as records beside the subtasks (owner
         // request), labelled as user-created and ended only once the terminal is gone.
-        publish(SUBTASK_ROUTE, (request, response) => {
+        publish(SUBTASK_ROUTE, async (request, response) => {
           if (request.method !== 'GET') {
             response.writeHead(405, { allow: 'GET' })
             response.end()
@@ -810,7 +810,7 @@ export function apply(ctx, settings = {}) {
           // exists reads as closed, whatever the log last heard. Read once per session; its
           // absence is not an error — the projection falls back to what the log recorded.
           const controller = terminalTransport
-          const listOf = (sessionId) => {
+          const listOf = async (sessionId) => {
             const found = []
             const seen = new Set()
             const add = (info) => {
@@ -832,7 +832,7 @@ export function apply(ctx, settings = {}) {
             // they are very much open.
             if (controller !== null && typeof controller.userTerminals === 'function') {
               try {
-                const listed = controller.userTerminals(sessionId)
+                const listed = await controller.userTerminals(sessionId)
                 if (Array.isArray(listed)) for (const info of listed) add(info)
               } catch {
                 // Same fallback as above.
@@ -850,7 +850,7 @@ export function apply(ctx, settings = {}) {
             let shared = null
             if (controller !== null && typeof controller.userTerminals === 'function') {
               try {
-                const listed = controller.userTerminals(wanted)
+                const listed = await controller.userTerminals(wanted)
                 if (Array.isArray(listed)) shared = listed
               } catch {
                 shared = null
@@ -890,7 +890,7 @@ export function apply(ctx, settings = {}) {
           if (wanted !== '' && !sessionIds.includes(wanted)) sessionIds.push(wanted)
           for (const sessionId of sessionIds) {
             const log = subtasks.list(sessionId)
-            const live = listOf(sessionId)
+            const live = await listOf(sessionId)
             const byId = new Map((Array.isArray(live) ? live : []).map((info) => [String(info?.id), info]))
             const entries = log.entries.map((entry) => (entry.terminalId === null
               ? projectSubtask(entry)

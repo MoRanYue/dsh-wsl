@@ -3670,6 +3670,7 @@ function makeBridgePage(host, { clientId = 'window-a', screen = 'user@host:~/pro
     attachmentId: null,
     writes: [],
     detaches: 0,
+    inventories: 0,
     poll() { return startBridgePoll(host, clientId) },
     send(events) { return postBridgeEvents(host, clientId, events) },
     async handle(command) {
@@ -3697,6 +3698,15 @@ function makeBridgePage(host, { clientId = 'window-a', screen = 'user@host:~/pro
       if (command.kind === 'detach') {
         page.detaches += 1
         await page.send([{ type: 'result', commandId: command.id, ok: true }])
+        return
+      }
+      if (command.kind === 'inventory') {
+        page.inventories += 1
+        await page.send([{
+          type: 'inventory',
+          commandId: command.id,
+          terminals: host.live.map((info) => ({ ...info })),
+        }])
       }
     },
   }
@@ -3723,6 +3733,24 @@ async function driveBridge(page, running) {
   await finished
   if (outcome.error !== undefined) throw outcome.error
   return outcome.value
+}
+
+/**
+ * Drive a page until it has handled the `attach` command, returning that command.
+ *
+ * A collaborative call asks the page for its terminal inventory first, so the attach is no
+ * longer necessarily in the first batch; this helper keeps the tests about the attach itself.
+ */
+async function driveToAttach(page, firstBatch) {
+  let batch = firstBatch
+  for (let round = 0; round < 6; round += 1) {
+    for (const command of batch?.commands ?? []) {
+      await page.handle(command)
+      if (command.kind === 'attach') return command
+    }
+    batch = await page.poll()
+  }
+  return null
 }
 
 async function bridgeUnitTests() {
@@ -3820,8 +3848,9 @@ async function bridgeUnitTests() {
     const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, subtasks, transport: host.transport })
     const running = tool.execute({ action: 'run', command: 'echo collab' }, { agent: { id: 'session-1' } })
     const first = await warm
-    eq('an ad-hoc run attaches to the terminal the user has open', first.commands?.[0]?.terminalId, 'user-term')
-    for (const command of first.commands ?? []) await page.handle(command)
+    // The page is asked for its terminal inventory before the attach can be queued.
+    const attach = await driveToAttach(page, first)
+    eq('an ad-hoc run attaches to the terminal the user has open', attach?.terminalId, 'user-term')
     const result = await driveBridge(page, running)
     check('and the command runs there, visibly', result.summary.includes('bridge says hi'), result.summary.slice(-200))
     check('the header says the call is collaborative',
@@ -3850,6 +3879,49 @@ async function bridgeUnitTests() {
     check('and the subtask was recorded on it',
       subtasks.list('session-1').entries[0]?.terminalId === 'dsh-agent',
       JSON.stringify(subtasks.list('session-1').entries[0]?.terminalId))
+  }
+
+  // The page's inventory is authoritative for what the user sees: a sidebar terminal that the
+  // host controller's ownership table no longer knew (measured after a recomposition) is still
+  // a collaboration target.
+  {
+    const host = makeBridgeHarness({ terminals: [] })
+    const page = makeBridgePage(host)
+    const original = page.handle
+    page.handle = async (command) => {
+      if (command.kind === 'inventory') {
+        page.inventories += 1
+        await page.send([{ type: 'inventory', commandId: command.id, terminals: [browserTerminalOf('page-only', 'session-1')] }])
+        return
+      }
+      await original(command)
+    }
+    const warm = page.poll()
+    await tickMs(5)
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const listedRunning = tool.execute({ action: 'list' }, { agent: { id: 'session-1' } })
+    const batch = await warm
+    for (const command of batch.commands ?? []) await page.handle(command)
+    const listed = await listedRunning
+    check('the page inventory is listed even when the host list is empty',
+      listed.summary.includes('page-only'), listed.summary)
+    warm.catch(() => {})
+  }
+  // A terminal the tool opened is not a collaboration target, whichever list reports it.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')], withPty: false })
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    await tickMs(5)
+    const created = await host.transport.create({ id: 'session-1' }, { id: 'dsh-agent', cols: 80, rows: 24 })
+    eq('the tool-created terminal exists for the controller too', created.id, 'dsh-agent')
+    const usersRunning = host.transport.userTerminals('session-1')
+    const batch = await warm
+    for (const command of batch.commands ?? []) await page.handle(command)
+    const users = await usersRunning
+    eq('a terminal the tool created is not offered as the user\'s',
+      users.map((info) => info.id).join(','), 'user-term')
+    warm.catch(() => {})
   }
 
   // A terminal whose prompt is away — another command owns its foreground, and a streaming
@@ -3965,7 +4037,8 @@ async function bridgeUnitTests() {
     const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
     const running = tool.execute({ action: 'read', timeoutMs: 500 }, { agent: { id: 'session-1' } })
     const batch = await warm
-    for (const command of batch.commands ?? []) await firstPage.handle(command)
+    const attach = await driveToAttach(firstPage, batch)
+    eq('the attachment was opened through the first window', attach?.terminalId, 'user-term')
     const secondPage = makeBridgePage(host, { clientId: 'window-b' })
     const secondBatch = await secondPage.poll()
     eq('a second window waits instead of stealing a live bridge', secondBatch.commands?.length, 0)
@@ -4171,9 +4244,8 @@ async function bridgeUnitTests() {
       && JSON.stringify(Object.keys(info.terminal?.bridge ?? {}).sort()) === '["attachments","client","pending"]',
       JSON.stringify(info.terminal))
     // The user's terminal is listed as a record of its own once the dock asks for its session.
-    const holder = { routes: tools.routes }
-    const poll = startBridgePoll(holder, 'dock-window')
-    await tickMs(5)
+    // No page polls here: the transport then falls back to the host controller's list, which is
+    // the pre-bridge path this fake host provides.
     let payload = await readSubtasks('session-1')
     const record = payload.sessions['session-1']?.entries?.[0]
     check('a terminal the user opened is listed beside the subtasks',
@@ -4201,7 +4273,6 @@ async function bridgeUnitTests() {
       recreated?.title === '用户建立的终端「WSL」 #2', recreated?.title)
     eq('while the closed one still reads as ended', closed?.status, 'done')
     eq('and it still points at the old terminal', closed?.terminalId, 'shared-term')
-    poll.catch(() => {})
   }
 }
 
