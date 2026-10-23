@@ -978,23 +978,36 @@ const dockFetch = context.fetch
   const mounted = mountStateful(dock.component, { sessionId: 'session-1' })
   eq('before the first answer it says nothing at all', textOf(mounted.tree()), '')
   await mounted.flush()
+  const collapsed = textOf(mounted.tree())
+  check('the collapsed dock shows only the count', collapsed.includes('共 2 个子任务') && collapsed.includes('运行 1'), collapsed)
+  check('and offers one control to expand it', collapsed.includes('展开'), collapsed)
+  check('it does not list the subtasks while collapsed',
+    !collapsed.includes('跑通 sta 流程') && !collapsed.includes('修终端就绪竞态'), collapsed)
+  const collapsedClicks = collect(mounted.tree()).filter((node) => typeof node.props?.onClick === 'function')
+  eq('one click target while collapsed', collapsedClicks.length, 1)
+  collapsedClicks[0].props.onClick()
   const text = textOf(mounted.tree())
-  check('the dock names the running subtask', text.includes('跑通 sta 流程') && text.includes('运行中'), text)
-  check('and says how many this conversation ran', text.includes('共 2 个') && text.includes('运行 1'), text)
-  check('a finished subtask is marked done', text.includes('修终端就绪竞态') && text.includes('已结束·关闭'), text)
-  check('commands stay hidden until the subtask is opened',
+  check('expanding names the running subtask', text.includes('跑通 sta 流程') && text.includes('运行中'), text)
+  check('and marks the finished one done', text.includes('修终端就绪竞态') && text.includes('已结束·关闭'), text)
+  check('commands stay hidden until a subtask is opened',
     !text.includes('make sta') && !text.includes('node test/smoke.mjs'), text)
+  check('the expanded dock offers 收起', text.includes('收起'), text)
   const clickables = collect(mounted.tree()).filter((node) => typeof node.props?.onClick === 'function')
-  eq('one click target per subtask', clickables.length, 2)
-  clickables[0].props.onClick()
+  eq('one click target per subtask plus the collapse control', clickables.length, 3)
+  clickables[1].props.onClick()
   const opened = textOf(mounted.tree())
   check('opening a subtask shows the command it ran', opened.includes('$ make sta') && opened.includes('→ 0'), opened)
   check('and the whole terminal it ran in',
     opened.includes('dsh-agent') && opened.includes('Ubuntu-22.04') && opened.includes('120x30'),
     opened)
-  clickables[1].props.onClick()
+  clickables[2].props.onClick()
   const second = textOf(mounted.tree())
   check('opening a finished subtask shows its result', second.includes('结果：已修'), second)
+  // Collapsing again: the count is the only thing left, and the detail closes with it.
+  collect(mounted.tree()).filter((node) => typeof node.props?.onClick === 'function')[0].props.onClick()
+  const recollapsed = textOf(mounted.tree())
+  check('collapsing returns to the count-only row',
+    recollapsed.includes('共 2 个子任务') && !recollapsed.includes('跑通 sta 流程'), recollapsed)
   mounted.unmount()
 
   // A readable log with nothing in it: one faint line, and no card around it.

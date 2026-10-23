@@ -9,9 +9,10 @@ real Linux kernel and bash, exit codes and signals, timeouts, truncation with sp
 files, background jobs the built-in job tools read back, stdin, and automatic
 Windows/WSL path translation.
 
-It can also work the way you would, in a **terminal you can watch**: one shell per piece
-of work, every command visible as it is typed, a record of each piece above the composer,
-and the keyboard back in your hands with one click.
+It can also work the way you would, in a **shell that keeps its state**: one shell per piece
+of work, every command recorded with its exit code, a compact count of that work above the
+composer, and — when you name one of your own terminals — the keyboard back in your hands
+with one click.
 
 Two limits are worth knowing before you rely on it. A `wsl` call runs below DSH's
 sandbox, so a file policy does not confine it (see [Sandboxing](#sandboxing)); and a
@@ -187,44 +188,47 @@ wsl-term({ action: "subtask-done", subtask: "跑通 sta 流程", result: "三条
                                                                → writes the result and decides the shell
 ```
 
-**Which shell it drives depends on whether the DSH window is open.** From DSH 0.2.1 the
-host no longer lets a plugin attach to a browser terminal directly — but this plugin's own
-browser half runs in the page, where that attachment is allowed, so the host half queues
-`attach`/`write`/`detach` commands for it over two same-origin routes and the page streams the
-screen and output frames back (the bridge; no extra port and no extra service). While the
-window is open, `wsl-term` joins the terminal you opened in the sidebar (or opens one), and
-while it works there your view is read-only until you press 接管输入. If no window answers —
-the app was closed, or the page is still loading — the same tool opens a **private WSL shell
-per subtask** instead: the same actions and the same records above the composer, but the
-shell does not appear in the sidebar and only the tool types into it. On hosts up to 0.2.0
-the bridge is not used: the plugin drives the browser terminal directly through
+**Which shell it drives: one the tool opened itself.** `wsl-term` never takes over a terminal
+you opened for your own work — that terminal can be long-lived, and the model typing into it
+would interrupt you. By default it opens a **private WSL shell per subtask**: the same
+actions and the same records above the composer, but the shell does not appear in the
+sidebar and only the tool types into it. A terminal **you** opened is used only when its
+`id` is named explicitly; while that call runs your view is read-only until you press
+接管输入, and the tool never closes it. The bridge exists for exactly that explicit case
+and for hosts without a private-shell provider: from DSH 0.2.1 the host no longer lets a
+plugin attach to a browser terminal directly, but this plugin's own browser half runs in
+the page, where that attachment is allowed, so the host queues `attach`/`write`/`detach`
+commands for it over two same-origin routes (no extra port and no extra service). On hosts
+up to 0.2.0 no bridge is needed: the plugin drives the browser terminal directly through
 `terminalController.follow`/`write`.
 
 #### Work is recorded as subtasks
 
 Naming a `subtask` on `run` opens a record for that piece of work and logs every command
-it ran with its exit code. The dock above the composer lists those records — running ones
+it ran with its exit code. The dock above the composer shows **how many subtasks this
+conversation ran** (and how many are running); one click on 展开 lists them — running ones
 first, then finished ones with their result — and clicking a row opens its detail: the
 terminal's full description, the result, and the commands. `subtask-done` writes the
 result and decides the shell: `keepTerminal: true` (the default) leaves it idle for a
 follow-up step, `false` closes a shell the tool opened. A terminal **you** opened is never
-closed this way, and `close` is the other way to end one. The records live in memory for
-the current DSH run — they describe this conversation's work, and a restart clears them
-along with the terminals.
+closed this way and never selected for a subtask, and `close` is the other way to end one
+(it also refuses terminals the tool did not open). The records live in memory for the
+current DSH run — they describe this conversation's work, and a restart clears them along
+with the terminals.
 
-You do not have to open a terminal first. `run` and `read` work in the newest running
-terminal of this session, and you can watch what happens; if the session has none, the tool
-opens its own — a normal shell for that session, but **not a sidebar tab**, so open your own
-when you want to see or use it. Terminals belong to the current DSH run — restarting DSH
-ends them — and the app can re-create one under a **new id** when its tab is re-created, so
-an id from an earlier answer may no longer exist. The tool then falls back to the newest
-running terminal and says which one it used.
+You do not have to open a terminal first. `run` and `read` use the newest running shell
+**this tool** opened, and open one if there is none — a normal shell for that session, but
+**not a sidebar tab**, so a private shell is something you watch through the tool's results
+rather than in the sidebar. Terminals belong to the current DSH run — restarting DSH ends
+them — and the app can re-create a browser terminal under a **new id**, so an id from an
+earlier answer may no longer exist. The tool then falls back to one of its own shells and
+says which one it used.
 
 Four things worth knowing:
 
-- **The terminal is read-only while the model works in it, and it stays read-only
-  afterwards**: click **「接管输入」** in that terminal to type again. If you are typing
-  when the model calls, the call is refused instead of landing in the middle of your
+- **A terminal you named explicitly is read-only while the model works in it, and it stays
+  read-only afterwards**: click **「接管输入」** in that terminal to type again. If you are
+  typing when the model calls, the call is refused instead of landing in the middle of your
   line.
 - **`read` returns the screen.** Anything that has scrolled away is gone, and
   full-screen programs (`vim`, `htop`) come back as their raw screen.
@@ -330,15 +334,15 @@ A background job is owned by the calling session (`owner: exec.agent.id`), which
 is what lets the model read it back with `job_output`/`job_kill` and what keeps
 other sessions out; an execution with no agent starts the job unowned.
 
-One behaviour differs by host generation. Up to 0.2.0 the terminal tool drives a
+One behaviour differs by host generation. Up to 0.2.0 the terminal tool CAN drive a
 browser terminal directly through `terminalController.follow`/`write`. 0.2.1 replaced
-those with an attachment only a Remote caller can open, so the plugin's browser half
-joins the sidebar terminal instead: the host queues `attach`/`write`/`detach` over
-`/dsh-wsl-tool/term-bridge/poll` + `/events`, and the page answers with results, screen
-snapshots and output. A closed window, or a host that does not serve those routes,
-makes the same tool open its own PTY through `subprocess.spawnTerminal` — same actions,
-same records above the composer, with a shell private to the tool. Both paths are
-checked by `npm test`.
+those with an attachment only a Remote caller can open, so the plugin's browser half does
+it instead when a caller names such a terminal explicitly: the host queues
+`attach`/`write`/`detach` over `/dsh-wsl-tool/term-bridge/poll` + `/events`, and the page
+answers with results, screen snapshots and output. For its own work the tool does not need
+any of that — it opens a private PTY through `subprocess.spawnTerminal`: same actions, same
+records above the composer, with a shell private to the tool and a terminal you opened left
+untouched. Both paths are checked by `npm test`.
 
 ## The WSL panel (left sidebar)
 
@@ -670,7 +674,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1023 host checks against real WSL (shim for ctx.subprocess) + 224 client checks
+npm test          # 1035 host checks against real WSL (shim for ctx.subprocess) + 229 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
