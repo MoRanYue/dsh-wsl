@@ -99,7 +99,7 @@ post() {
 
 cmd_list() {
   local out
-  out=$(post list '')
+  out=$(post list '' "$(current_session)")
   case "$out" in
     err*) die "${out#err	}" ;;
   esac

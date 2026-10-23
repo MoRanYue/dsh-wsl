@@ -3685,6 +3685,11 @@ async function channelUnitTests() {
     check('the list route returns tab-separated sessions',
       listed.body.includes('session-a\t') && listed.body.includes('title of session-a'), listed.body)
     check('the list route marks the current session', /wsl\t[^\n]*\t2\t\*/.test(listed.body), listed.body)
+    // `dsh use X` switches the CLI; the marker must follow the header, not the panel value.
+    const cliListed = await call('POST', '/list', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token, 'x-dsh-wsl-session': 'session-a' })
+    const cliLines = cliListed.body.split('\n')
+    check('the CLI current session is marked', cliLines.some((line) => line.startsWith('session-a\t') && line.endsWith('*')), cliListed.body)
+    check('the panel landing is not marked when the CLI switched', !cliLines.some((line) => line.startsWith('wsl\t') && line.endsWith('*')), cliListed.body)
 
     const created = await call('POST', '/new', 'brand-new', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
     eq('a new session is created', created.body.trim(), 'ok\tbrand-new')
