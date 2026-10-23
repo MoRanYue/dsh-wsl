@@ -127,7 +127,7 @@ function defineConfig(Schema) {
     wsl: Schema.boolean().default(true).description('注册 `wsl` 工具：在 WSL 发行版中执行 Linux 命令。').volatile(),
     path: Schema.boolean().default(true).description('注册 `wsl-path` 工具：在 Windows 路径与 `/mnt/...` 之间互转。').volatile(),
     env: Schema.boolean().default(true).description('注册 `wsl-env` 工具：汇总发行版、内核、systemd、cgroup、GPU 直通、docker 与挂载盘。').volatile(),
-    doctor: Schema.boolean().default(true).description('注册 `wsl-doctor` 工具：对照项目清单与发行版实际能力，指出缺什么，以及哪些命令其实是 Windows 的。').volatile(),
+    doctor: Schema.boolean().default(false).description('注册 `wsl-doctor` 工具：对照项目清单与发行版实际能力，指出缺什么，以及哪些命令其实是 Windows 的。默认关（诊断类，需要时再开）。').volatile(),
     bootstrap: Schema.boolean().default(false).description('注册 `wsl-bootstrap` 工具：在发行版里补装缺失的工具链。默认关；打开后它以 root 执行固定配方，且调用方仍需显式 `dryRun: false`。').volatile(),
   }).description('要注册哪些工具；改动即时生效（面板开关一拨，工具就出现或消失，不需要重启）。'),
   backgroundJobs: Schema.boolean().default(true).description('允许长任务以 `runInBackground` 后台执行，结果由内置 job 工具读取。').volatile(),
@@ -1029,10 +1029,10 @@ export function apply(ctx, settings = {}) {
             answerJson(response, 415, { ok: false, detail: 'content-type must be application/json' })
             return
           }
-          try {
-            await readJsonBody(request)
-          } catch {
-            answerJson(response, 400, { ok: false, detail: 'the body is not valid JSON' })
+          // `readJsonBody` RESOLVES with `{ value }` or `{ error }`; it does not throw.
+          const installBody = await readJsonBody(request)
+          if (installBody.error !== undefined) {
+            answerJson(response, 400, { ok: false, detail: installBody.error })
             return
           }
           if (channel === null) {
@@ -1057,11 +1057,9 @@ export function apply(ctx, settings = {}) {
             answerJson(response, 415, { ok: false, detail: 'content-type must be application/json' })
             return
           }
-          let body
-          try {
-            body = await readJsonBody(request)
-          } catch {
-            answerJson(response, 400, { ok: false, detail: 'the body is not valid JSON' })
+          const body = await readJsonBody(request)
+          if (body.error !== undefined) {
+            answerJson(response, 400, { ok: false, detail: body.error })
             return
           }
           if (channel === null) {
@@ -1069,7 +1067,9 @@ export function apply(ctx, settings = {}) {
             return
           }
           try {
-            const result = await channel.createSession(typeof body?.sessionId === 'string' ? body.sessionId.trim() : '')
+            const result = await channel.createSession(
+              typeof body.value?.sessionId === 'string' ? body.value.sessionId.trim() : '',
+            )
             answerJson(response, 200, result)
           } catch (error) {
             answerJson(response, 500, { ok: false, detail: String(error?.message ?? error) })

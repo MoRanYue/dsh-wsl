@@ -1072,8 +1072,8 @@ eq('the channel session defaults to unset', resolveConfig({}, {}).channelSession
   // is asserted here rather than left to the schema's word. `wsl-term` has no switch at
   // all — opening a terminal in the sidebar is the consent it needs — so it is not in
   // this object and cannot be switched off.
-  eq('the tool switches default to the read-only set on and the installer off',
-    Object.values(resolveConfig({}, {}).tools).join(','), 'true,true,true,true,false')
+  eq('the tool switches default to the core read-only tools; the diagnostics and installer are opt-in',
+    Object.values(resolveConfig({}, {}).tools).join(','), 'true,true,true,false,false')
   check('and the terminal tool has no switch of its own',
     resolveConfig({}, {}).tools.term === undefined
     && resolveConfig({}, { tools: { term: false } }).tools.term === undefined)
@@ -1375,7 +1375,10 @@ async function terminalUnitTests() {
 
   // The helper is what keeps the line the USER reads readable: one short call per command
   // instead of the markers spelled out around it.
-  const definition = helperDefinition()
+  const definition = helperDefinition('session-c9ad')
+  check('the definition carries the caller session so a self-targeting dsh can be refused',
+    definition.includes("DSH_WSL_CALLER_SESSION='session-c9ad'")
+    && definition.includes('unset DSH_WSL_CALLER_SESSION'), definition.slice(0, 220))
   check('the helper definition names the helper and both markers',
     definition.startsWith(`${HELPER_NAME}()`) && definition.includes(START_PREFIX) && definition.includes(END_PREFIX),
     definition.slice(0, 80))
@@ -1427,6 +1430,8 @@ async function terminalUnitTests() {
   // "command not found").
   check('a shell prompt looks ready', looksReady('xiny@host:~$ '))
   check('a root prompt looks ready too', looksReady('root@host:/# '))
+  check('a custom arrow prompt (zsh/starship) is recognised, so collaboration can type there',
+    looksReady('~/proj → ') && looksReady('~/proj λ ') && looksReady('~/proj ❯ '))
   check('a shell that is still starting does not',
     looksReady('wsl: localhost proxy is not mirrored into WSL.\n') === false)
   check('an empty screen is not ready', looksReady('') === false && looksReady(undefined) === false)
@@ -1610,7 +1615,7 @@ async function toolTests(tools, shim) {
   // optional and not switchable — a terminal the user opens is the consent it needs.
   const optInTools = makeCtx(shim, { settings: { tools: { bootstrap: true } } })
   eq('the installer switch registers exactly its own tool',
-    Object.keys(optInTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-doctor,wsl-env,wsl-path,wsl-term')
+    Object.keys(optInTools).sort().join(','), 'wsl,wsl-bootstrap,wsl-env,wsl-path,wsl-term')
 
   // A volatile field is written into the same object the loader handed `apply` and
   // then announced, so the behaviour switches must take effect with no remount. The
@@ -1684,6 +1689,20 @@ async function toolTests(tools, shim) {
     check("a terminal the tool did not open is marked as the user's",
       done.entries.some((entry) => entry.terminalCreated === false))
     check("the other conversation stays empty", log.list("s2").total === 0)
+  }
+  {
+    const log = createSubtaskLog()
+    const entry = log.start("s3", "dies", { terminalId: "t", terminalCreated: false })
+    const exited = projectSubtask(entry, { id: "t", state: "exited", exitCode: 7 })
+    check("a shell that exited ends its record even while its tab exists",
+      exited.status === "done" && exited.terminal === "closed" && exited.result === "终端已退出",
+      JSON.stringify(exited))
+    eq("a running shell keeps the record open", projectSubtask(entry, { id: "t", state: "running" }).status, "running")
+    const totalBefore = log.list("s3").total
+    const phantom = log.finish("s3", "never-started", { terminalKept: true })
+    check("finishing a title that never started is a no-op, not a phantom record",
+      phantom === null && log.list("s3").total === totalBefore && log.list("s3").entries.length === 1,
+      JSON.stringify(log.list("s3")))
   }
   // Three original routes plus three WSL-channel routes: state for the panel, install for
   // the shim, and the picker's create-a-session action. The channel's own server is
@@ -2865,12 +2884,22 @@ async function toolTests(tools, shim) {
     check('the summary says Ctrl-C was sent', interrupt.summary.includes('Ctrl-C'), interrupt.summary)
   }
   {
+    // A pre-bridge host cannot report ownership, so `close` is limited to the shells this tool
+    // mounted itself; an existing browser terminal could be the user's.
     const stub = makeTerminalStub({ terminals: [termInfoOf('t1')] })
     const tool = makeTermTool(stub)
     await rejects('close needs an explicit id', () => tool.execute({ action: 'close' }, { agent: termAgent }), /close needs an explicit/)
-    const closed = await tool.execute({ action: 'close', id: 't1' }, { agent: termAgent })
-    eq('close closes the terminal it was told to close', stub.calls.close[0], 't1')
-    check('the summary confirms it', closed.summary.includes('closed.'), closed.summary)
+    await rejects('close refuses a pre-bridge terminal the tool did not mount',
+      () => tool.execute({ action: 'close', id: 't1' }, { agent: termAgent }), /not opened by this tool/)
+    // A terminal this call opened itself is still the tool's to close.
+    const ownStub = makeTerminalStub({ terminals: [] })
+    const ownTool = makeTermTool(ownStub)
+    const opened = await ownTool.execute({ action: 'run', command: 'echo hi', timeoutMs: 300 }, { agent: termAgent })
+    const ownId = /terminal (\S+) "/.exec(opened.summary)?.[1]
+    eq('the pre-bridge shell was created for the call', typeof ownId, 'string')
+    const closed = await ownTool.execute({ action: 'close', id: ownId }, { agent: termAgent })
+    check('and closing it is allowed', closed.summary.includes('closed.') && ownStub.calls.close.includes(ownId),
+      `${closed.summary} closes=${JSON.stringify(ownStub.calls.close)}`)
   }
   {
     const stub = makeTerminalStub({
@@ -3119,10 +3148,16 @@ async function toolTests(tools, shim) {
     check('and the keyboard is still handed back',
       stub.calls.detached >= 1 && elapsed < 5000, `${elapsed} ms detached=${stub.calls.detached}`)
   }
-  await rejects('an explicit close that never answers is reported, not waited out',
-    () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')], stallOnClose: true }))
-      .execute({ action: 'close', id: 't1', timeoutMs: 300 }, { agent: termAgent }),
-    /did not answer/)
+  {
+    // A close the tool is allowed to send (its own shell) but the service never answers.
+    const stub = makeTerminalStub({ terminals: [], stallOnClose: true })
+    const tool = makeTermTool(stub)
+    const opened = await tool.execute({ action: 'run', command: 'echo hi', timeoutMs: 300 }, { agent: termAgent })
+    const ownId = /terminal (\S+) "/.exec(opened.summary)?.[1]
+    await rejects('an explicit close that never answers is reported, not waited out',
+      () => tool.execute({ action: 'close', id: ownId, timeoutMs: 300 }, { agent: termAgent }),
+      /did not answer/)
+  }
   {
     // The close a `subtask-done` sends is a courtesy: the record is already finished, so a silent
     // service has to be reported in the summary instead of turning that into a failed call.
@@ -3273,6 +3308,15 @@ async function toolTests(tools, shim) {
   await rejects('close with an unknown id is still refused (it never ends a terminal nobody named)',
     () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'close', id: 'zz' }, { agent: termAgent }),
     /no terminal with id/)
+  // A pre-bridge host cannot report ownership: a browser terminal the tool did not open is
+  // treated as the user's, so close refuses it instead of ending their shell.
+  {
+    const legacyHost = makeTerminalStub({ terminals: [termInfoOf('user-browser')] })
+    await rejects('a pre-bridge host still refuses to close a terminal it did not open',
+      () => makeTermTool(legacyHost).execute({ action: 'close', id: 'user-browser' }, { agent: termAgent }),
+      /not opened by this tool/)
+    eq('and no close reached the controller', legacyHost.calls.close.length, 0)
+  }
   await rejects('a non-positive timeout is refused',
     () => makeTermTool(makeTerminalStub({ terminals: [termInfoOf('t1')] })).execute({ action: 'run', command: 'ls', timeoutMs: -1 }, { agent: termAgent }),
     /positive number/)
@@ -3937,11 +3981,24 @@ async function bridgeUnitTests() {
     const first = await warm
     for (const command of first.commands ?? []) await page.handle(command)
     const run = await driveBridge(page, running)
-    check('a busy terminal is not typed into', run.summary.includes('nothing was typed: this terminal is busy'),
+    check('a busy terminal is not typed into', run.summary.includes('no prompt this tool recognises'),
       run.summary.slice(-420))
     check('the refusal names the dsh case and the way out',
-      run.summary.includes('dsh insert') && run.summary.includes('private shell'), run.summary.slice(-420))
+      run.summary.includes('streaming `dsh` reply') && run.summary.includes('private shell'), run.summary.slice(-420))
     eq('and no keystrokes reached it', page.writes.length, 0)
+  }
+
+  // Raw keystrokes/Ctrl-C are never auto-aimed at a terminal the user opened: an explicit id
+  // is the consent, because neither action can be taken back once it lands.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    await rejects('input without an id refuses to aim raw keys at the user terminal',
+      () => tool.execute({ action: 'input', data: 'x' }, { agent: { id: 'session-1' } }),
+      /explicit `id`/)
+    await rejects('interrupt without an id is refused the same way',
+      () => tool.execute({ action: 'interrupt' }, { agent: { id: 'session-1' } }),
+      /explicit `id`/)
   }
 
   // `read` over the bridge: the snapshot is the screen, and the call still detaches.
@@ -4460,34 +4517,27 @@ async function channelUnitTests() {
     eq('the steered line still reaches the controller',
       calls.filter((entry) => entry[0] === 'prompt').length, 2)
 
-    // `dsh insert`: delivery without waiting. `say` cannot be used to write into the very
-    // conversation the caller runs in (steer joins the live turn, whose end waits on the
-    // tool call) — this route hands the prompt over and answers at once.
-    const insertedIdle = await call('POST', '/insert', 'note for later', {
-      'content-type': 'text/plain',
-      'x-dsh-wsl-token': state.token,
-      'x-dsh-wsl-session': 'session-a',
-    })
-    eq('insert answers at once', insertedIdle.status, 200)
-    eq('insert reports where the prompt went', insertedIdle.body.trim(), 'ok\tqueued\tsession-a')
-    check('insert does not stream a turn', !insertedIdle.body.includes('~ack'), insertedIdle.body)
-   eq('an idle conversation is queued',
-      calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.mode, 'queue')
-    check('insert hands the controller an abort signal (the host reads throwIfAborted on it)',
-      calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[2] instanceof AbortSignal,
-      String(calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[2]))
-    eq('the inserted text reaches the controller verbatim, behind the terminal marker',
-      calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.content?.[0]?.text, SAY_PREFIX + 'note for later')
-    const insertedBusy = await call('POST', '/insert', 'in line', {
+    // Self-lock: a tool call inside session X asks the terminal to send a prompt to X. The
+    // prompt would join X's live turn, whose end waits for this command — refuse with the
+    // reason instead of hanging until the deadline.
+    const selfLock = await call('POST', '/say', 'hello self', {
       'content-type': 'text/plain',
       'x-dsh-wsl-token': state.token,
       'x-dsh-wsl-session': 'session-busy',
+      'x-dsh-wsl-caller': 'session-busy',
     })
-    eq('a busy conversation steers the insertion', insertedBusy.body.trim(), 'ok\tinserted\tsession-busy')
-    eq('the steered insert uses steer mode',
-      calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.mode, 'steer')
-    const insertDenied = await call('POST', '/insert', 'x', { 'content-type': 'text/plain' })
-    eq('insert requires the channel token too', insertDenied.status, 401)
+    eq('a prompt aimed back at the waiting session is refused', selfLock.status, 409)
+    check('and the refusal says why, instead of hanging',
+      /无法执行/.test(selfLock.body) && /自锁/.test(selfLock.body), selfLock.body)
+    eq('and nothing reached the controller', calls.filter((entry) => entry[0] === 'prompt').length, 2)
+    // A caller that is a DIFFERENT conversation (or no caller header at all) still works.
+    const callerElsewhere = await call('POST', '/say', 'from another session', {
+      'content-type': 'text/plain',
+      'x-dsh-wsl-token': state.token,
+      'x-dsh-wsl-session': 'session-busy',
+      'x-dsh-wsl-caller': 'session-a',
+    })
+    eq('a prompt from another session still streams', callerElsewhere.status, 200)
 
     const listed = await call('POST', '/list', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
     check('the list route returns tab-separated sessions',
@@ -4519,9 +4569,10 @@ async function channelUnitTests() {
     check('the installed shim points at the state file', shim.includes('/dsh-wsl/channel.json') && !shim.includes('.dsh/dsh-wsl/channel.json'), shim.slice(0, 400))
     check('the install command copies and marks the shim executable',
       (wslCalls[wslCalls.length - 1] ?? []).join(' ').includes('install -m 0755'), JSON.stringify(wslCalls[wslCalls.length - 1]))
-    check('the installed shim carries the insert command',
-      shim.includes('cmd_insert') && shim.includes('dsh insert') && shim.includes('post insert'),
-      shim.slice(-900))
+    check('the installed shim forwards the caller session, so self-lock can be diagnosed',
+      shim.includes('x-dsh-wsl-caller') && shim.includes('DSH_WSL_CALLER_SESSION')
+      && !shim.includes('cmd_insert'),
+      shim.slice(-1200))
 
     const refuseInstall = await createChannel({ ctx, config: { channelEnabled: false } }).install()
     eq('install without a wsl runner is refused', refuseInstall.ok, false)
@@ -4666,9 +4717,12 @@ const shim = useReal ? await makeRealBackend(modulesRoot) : makeShim(spillDir)
 const jobs = makeJobs()
 console.log(`backend: ${useReal ? `real DSH provider (${modulesRoot})` : 'local shim'}`)
 try {
-  const tools = makeCtx(shim, { jobs })
-  check('the default mount registers the read-only tools and the terminal tool, not the installer',
-    Object.keys(tools).sort().join(',') === 'wsl,wsl-doctor,wsl-env,wsl-path,wsl-term', Object.keys(tools).join(','))
+  // The diagnostics tool is opt-in, so the CONTROL mount asks for it explicitly (the tests
+  // below exercise it); the default mount is checked without it.
+  const tools = makeCtx(shim, { jobs, settings: { tools: { doctor: true } } })
+  const defaultMount = makeCtx(shim, { jobs })
+  check('the default mount registers the core tools and the terminal tool, not the opt-in ones',
+    Object.keys(defaultMount).sort().join(',') === 'wsl,wsl-env,wsl-path,wsl-term', Object.keys(defaultMount).join(','))
   await unitTests()
   await terminalUnitTests()
   await bridgeUnitTests()

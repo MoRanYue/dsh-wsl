@@ -13,7 +13,18 @@ set -u
 # Filled in by the plugin when it installs this script (a /mnt/<drive>/... path).
 CONFIG='__CHANNEL_CONFIG__'
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dsh-wsl"
-CURRENT_FILE="$STATE_DIR/current"
+# The current session is per TERMINAL: one shared file made `dsh use`/`new` in one window
+# silently retarget another window (both are the same user, different conversations).
+# `tty` is the pty name; a redirected/pipe run falls back to the shared name.
+tty_key() {
+  local t
+  t=$(tty 2>/dev/null || true)
+  case "$t" in
+    /dev/*) printf '%s' "$(basename "$t")" ;;
+    *) printf '%s' 'shared' ;;
+  esac
+}
+CURRENT_FILE="$STATE_DIR/current.$(tty_key)"
 
 die() { printf 'dsh: %s\n' "$*" >&2; exit 1; }
 
@@ -22,8 +33,6 @@ usage() {
 用法：
   dsh "问题"                把问题发给当前会话，流式显示思考与回复
   dsh <会话id> "问题"       发给指定会话
-  dsh insert "消息"         把消息插入当前对话，不等待回复（正在进行的回合会直接看到）
-  dsh insert <会话id> "消息" 插入指定会话，不等待回复
   dsh list                  列出会话（* 表示当前）
   dsh new <会话id>          新建会话并设为当前
   dsh use <会话id>          切换当前会话
@@ -31,8 +40,9 @@ usage() {
   dsh status                当前会话与通道状态
 
 说明：回复来自 DSH 客户端里的同一段对话；在终端按 Ctrl+C 只是停止等待，
-那一轮会在客户端里继续跑完。`dsh insert` 用于避免等待：它把消息交给会话就返回，
-消息会出现在那段对话里（若回合已经在跑，则插进当前回合）。
+那一轮会在客户端里继续跑完。若目标会话正是正在等待这条命令的会话（模型在
+自己的会话里执行 dsh），命令会直接报「无法执行」并说明原因，而不是卡住。
+当前会话按终端分别保存：两个终端里的 `dsh use` 互不影响。
 EOF
 }
 
@@ -72,6 +82,11 @@ load_channel() {
 current_session() {
   local saved=''
   [ -r "$CURRENT_FILE" ] && saved=$(tr -d '[:space:]' < "$CURRENT_FILE")
+  # A terminal that has never chosen one adopts the old shared value once (upgrade path);
+  # after its first `use`/`new` the per-terminal file is the only source.
+  if [ -z "$saved" ] && [ -r "$STATE_DIR/current" ]; then
+    saved=$(tr -d '[:space:]' < "$STATE_DIR/current")
+  fi
   [ -n "$saved" ] && { printf '%s' "$saved"; return; }
   # Empty means auto: the host keeps a dedicated session for the terminal.
   printf '%s' "${DEFAULT_SESSION:-}"
@@ -84,11 +99,16 @@ set_current() {
 
 # POST a body to one route; prints the response body. `say` streams for as long as the
 # turn runs, so it carries no client-side deadline; the management routes are quick.
+# The caller header is only set when THIS shell was started by the plugin's terminal tool:
+# it is what lets the Host refuse a prompt aimed back at the session waiting for it.
 post() {
   local route=$1 body=$2 session=${3:-}
   local timeout=60
   local extra=()
   [ "$route" = say ] && { timeout=0; extra=(-N); }
+  if [ -n "${DSH_WSL_CALLER_SESSION:-}" ]; then
+    extra+=(-H "x-dsh-wsl-caller: $DSH_WSL_CALLER_SESSION")
+  fi
   if [ -n "$session" ]; then
     "$CURL" -sS "${extra[@]}" --max-time "$timeout" -X POST \
       -H "x-dsh-wsl-token: $TOKEN" \
@@ -113,14 +133,18 @@ cmd_list() {
 }
 
 cmd_new() {
-  local id=$1 out
+  local id=$1 out created
   [ -n "$id" ] || die "用法：dsh new <会话id>"
   out=$(post new "$id" "$id")
   case "$out" in
     err*) die "${out#err	}" ;;
   esac
-  set_current "$id"
-  printf '已新建并切换到会话 %s\n' "$id"
+  # The Host may mint its own id; switching to the requested one would point every later
+  # command at a session that does not exist. Use what it answered with.
+  created=$(printf '%s\n' "$out" | cut -f2)
+  [ -n "${created:-}" ] || created=$id
+  set_current "$created"
+  printf '已新建并切换到会话 %s\n' "$created"
 }
 
 cmd_use() {
@@ -141,26 +165,18 @@ cmd_rm() {
   printf '已归档会话 %s\n' "$id"
 }
 
-# Hand a message to a conversation and return at once. `dsh "问题"` waits for the turn to
-# end, which cannot work when the caller IS that conversation; this command is the way in.
-cmd_insert() {
-  local session=$1 prompt=$2 out
-  [ -n "$prompt" ] || die "用法：dsh insert \"消息\" 或 dsh insert <会话id> \"消息\""
-  out=$(post insert "$prompt" "$session")
-  case "$out" in
-    err*) die "${out#err	}" ;;
-  esac
-  printf '已插入对话 %s\n' "$(printf '%s\n' "$out" | tr '\t' ' ')"
-}
-
 cmd_status() {
-  local state session_line
+  local state session_line landing
   state=$("$CURL" -sS --max-time 10 "$BASE/state" 2>/dev/null) || die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？"
   session_line=$(current_session)
   [ -n "$session_line" ] || session_line='默认（最近活跃会话）'
   CURRENT_SESSION=$session_line
+  # The Host's channel landing (panel setting) and this shell's current session can differ;
+  # naming them apart is what stops one being mistaken for the other.
+  landing=$(printf '%s\n' "$state" | sed -n 's/.*session=\([^ ]*\).*/\1/p')
   printf '当前会话：%s\n' "${CURRENT_SESSION:-$(current_session)}"
   printf '通道：%s\n' "$(printf '%s\n' "$state" | tr '\n' ' ')"
+  if [ -n "${landing:-}" ]; then printf '面板落点：%s（未用 dsh use 指定时的目标）\n' "$landing"; fi
   printf 'shim：%s\n' "$(command -v dsh || printf '未知')"
   printf '客户端：%s\n' "$CURL"
 }
@@ -183,6 +199,9 @@ cmd_say() {
     if [ "$had" = 1 ]; then printf '\033[0m\n'; fi
     reason=2
   }
+  # A host crash or a closed connection ends the stream WITHOUT the frames that stop the
+  # clock; without this the ticker would keep printing on this terminal forever.
+  trap 'stop_reason' INT TERM
   local -a rest
   while IFS= read -r line; do
     case "$line" in
@@ -228,7 +247,7 @@ cmd_say() {
       *) printf '%s\n' "$line" ;;
     esac
   done < <(post say "$prompt" "$session")
-  [ "$reason" = 1 ] && printf '\033[0m'
+  stop_reason
   [ "$ended" = 1 ] || { printf '\n' >&2; die "连接在回合结束前断开"; }
 }
 
@@ -247,10 +266,6 @@ case "$1" in
   use) cmd_use "${2:-}"; exit 0 ;;
   rm|archive) cmd_rm "${2:-}"; exit 0 ;;
   status) cmd_status; exit 0 ;;
-  insert)
-    if [ $# -ge 3 ]; then cmd_insert "$2" "${*:3}"; else cmd_insert "$(current_session)" "${2:-}"; fi
-    exit 0
-    ;;
 esac
 
 # A bare first word that names no command is either a session id (two or more args) or

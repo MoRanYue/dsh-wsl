@@ -32,7 +32,7 @@ OFF by default):
 | `wsl` | Run a Linux command and return `stdout`/`stderr` with exit-code, timeout and truncation markers. |
 | `wsl-path` | Convert between Windows and WSL paths via `wslpath`. |
 | `wsl-env` | Summarize the WSL environment (distros, kernel, cpu, mem, disk). |
-| `wsl-doctor` | Compare what a project needs with what the distribution has — including commands that are really Windows binaries. Read-only. |
+| `wsl-doctor` | Compare what a project needs with what the distribution has — including commands that are really Windows binaries. Read-only. **Off by default** (turn it on when diagnosing a project). |
 | `wsl-bootstrap` | Install the missing toolchain inside the distribution, from a fixed recipe list, plan first. |
 | `wsl-term` | Work in the session's terminal: one shell per piece of work, with a record of each above the composer. |
 
@@ -240,8 +240,8 @@ Five things worth knowing:
 - **A busy terminal is never typed into.** If its prompt is not back — another command
   owns the foreground, and a `dsh` reply still streaming is one such command — `run` waits
   out its deadline and then declines instead of typing, so nothing is sent and the running
-  command is not disturbed. Wait for it, send a message with `dsh insert` (it returns at
-  once), or use a private shell for that work.
+  command is not disturbed. Wait for it, type the command yourself in that terminal, or use a
+  private shell for that work.
 - **Long output is not thrown away.** A build or synthesis log's answer is at the
   bottom, so what comes back is the end of the output; the complete text is written
   to a file and the result names it.
@@ -363,7 +363,7 @@ explanation.
 | `wsl` 命令执行 | registers the `wsl` tool |
 | `wsl-path` 路径转换 | registers the `wsl-path` tool |
 | `wsl-env` 能力体检 | registers the `wsl-env` tool |
-| `wsl-doctor` 项目体检 | registers `wsl-doctor` |
+| `wsl-doctor` 项目体检 | registers `wsl-doctor`. **Off by default**: the diagnostics tool is opt-in |
 | `wsl-bootstrap` 安装工具链 | registers `wsl-bootstrap`, which may install into the distribution. **Off by default**, and its `dryRun` still has to be turned off per call |
 | 后台任务 | whether `wsl` accepts `runInBackground` |
 | 自动转换路径 | the default for the per-call `translatePaths` |
@@ -479,8 +479,6 @@ same agent reacts immediately and nothing is dropped.
 |---|---|
 | `dsh "问题"` | send to the current session and stream the reply |
 | `dsh <id> "问题"` | send to that session |
-| `dsh insert "消息"` | hand a message to the current session and return at once — no waiting for the turn |
-| `dsh insert <id> "消息"` | the same, into that session |
 | `dsh list` | sessions, newest first; `*` marks the current one |
 | `dsh new <id>` | create a session (it appears in the client) and switch to it |
 | `dsh use <id>` | switch the current session |
@@ -489,7 +487,7 @@ same agent reacts immediately and nothing is dropped.
 
 Messages typed in the terminal arrive in the conversation marked **【WSL 终端】**, so a terminal turn is never mistaken for something typed in the client, and the ⏱ thinking clock keeps ticking while the model works instead of freezing at its first number.
 
-`dsh insert` exists for the one case `say` cannot serve: writing into the conversation that is running the command that is waiting for the answer — the text joins that live turn, so the command returns instead of waiting on itself.
+A `dsh "…"` aimed at the very conversation whose tool call is running it cannot be sent: the prompt would join that live turn, whose end waits for the command to return — a self-lock. The channel refuses it and says why instead of hanging until the deadline; wait for the turn, or type it in the client. The shim passes its caller session (`x-dsh-wsl-caller`) only when the plugin's terminal tool started that shell, so a person typing at a terminal is never affected.
 
 Set it up once in the panel: turn on **启用 dsh 命令** and click **安装 dsh 命令** — the default landing is the most recently active conversation — the one you are looking at (pick another from the list, or create one right there, if you want a different landing); the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
 server to the address WSL uses as its default gateway, on a random port, and demands
@@ -688,7 +686,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1075 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
+npm test          # 1079 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
