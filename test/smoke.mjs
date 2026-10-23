@@ -4238,8 +4238,8 @@ async function channelUnitTests() {
   const emit = (name, ...args) => { for (const fn of listeners.get(name) ?? []) fn(...args) }
   const services = {
     sessionController: {
-      async prompt(request) {
-        calls.push(['prompt', request])
+      async prompt(request, signal) {
+        calls.push(['prompt', request, signal])
         const id = request.sessionId
         setTimeout(() => {
           emit('agent/assistant-stream', { agent: { session: { id } }, frame: { type: 'start' } })
@@ -4387,6 +4387,9 @@ async function channelUnitTests() {
     check('insert does not stream a turn', !insertedIdle.body.includes('~ack'), insertedIdle.body)
    eq('an idle conversation is queued',
       calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.mode, 'queue')
+    check('insert hands the controller an abort signal (the host reads throwIfAborted on it)',
+      calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[2] instanceof AbortSignal,
+      String(calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[2]))
     eq('the inserted text reaches the controller verbatim',
       calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.content?.[0]?.text, 'note for later')
     const insertedBusy = await call('POST', '/insert', 'in line', {
