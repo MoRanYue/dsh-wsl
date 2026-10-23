@@ -169,24 +169,54 @@ cmd_status() {
 cmd_say() {
   local session=$1 prompt=$2
   local reason=0 ended=0 line ms steps tin tout breason ok text_reason
+  local ticker='' reason_start=0
+  # The first `~r` only says WHEN reasoning began: the elapsed time up to that point would stay
+  # frozen on screen while the model keeps thinking. Keep a live clock instead — it ticks on the
+  # same line (carriage return) until the first text arrives.
+  stop_reason() {
+    local had=$reason
+    if [ -n "$ticker" ]; then
+      kill "$ticker" 2>/dev/null
+      wait "$ticker" 2>/dev/null
+      ticker=''
+    fi
+    if [ "$had" = 1 ]; then printf '\033[0m\n'; fi
+    reason=2
+  }
   local -a rest
   while IFS= read -r line; do
     case "$line" in
       '~ack') ;;
-      '~r '*) ms=${line#'~r '}; printf '\033[2m⏱ 思考中… %d.%01ds\033[0m' $((ms / 1000)) $(((ms % 1000) / 100)); reason=1 ;;
-      '~t '*) if [ "$reason" = 1 ]; then printf '\033[0m\n'; fi; reason=2 ;;
-      '~a '*) if [ "$reason" = 1 ]; then printf '\033[0m\n'; fi; reason=2; printf '%s' "${line#'~a '}" | base64 -d ;;
+      '~r '*)
+        ms=${line#'~r '}
+        if [ "$reason" != 1 ]; then
+          reason=1
+          reason_start=$(date +%s%3N)
+          (
+            while :; do
+              now=$(date +%s%3N)
+              elapsed=$((now - reason_start + ms))
+              printf '\r\033[2m⏱ 思考中… %d.%01ds\033[0m' $((elapsed / 1000)) $(((elapsed % 1000) / 100))
+              sleep 0.2
+            done
+          ) &
+          ticker=$!
+        fi
+        ;;
+      '~t '*) stop_reason ;;
+      '~a '*) stop_reason; printf '%s' "${line#'~a '}" | base64 -d ;;
       '~step '*) ;;
       '~p') ;;
       '~x '*)
+        stop_reason
         text_reason=$(printf '%s' "${line#'~x '}" | base64 -d)
         printf '\ndsh: %s\n' "$text_reason" >&2
         exit 1
         ;;
       '~e '*)
+        stop_reason
         read -r _ ok ms steps tin tout breason <<< "$line"
         text_reason=$(printf '%s' "${breason:-}" | base64 -d 2>/dev/null)
-        [ "$reason" = 1 ] && printf '\033[0m'
         printf '\n'
         printf '✓ 完成 %d.%01ds · %s 步 · in %s / out %s tok%s\n' \
           $((ms / 1000)) $(((ms % 1000) / 100)) "$steps" "$tin" "$tout" \

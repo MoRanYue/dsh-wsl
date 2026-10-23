@@ -487,6 +487,8 @@ same agent reacts immediately and nothing is dropped.
 | `dsh rm <id>` | archive a session — the client's own reversible remove |
 | `dsh status` | current session and channel state |
 
+Messages typed in the terminal arrive in the conversation marked **【WSL 终端】**, so a terminal turn is never mistaken for something typed in the client, and the ⏱ thinking clock keeps ticking while the model works instead of freezing at its first number.
+
 `dsh insert` exists for the one case `say` cannot serve: writing into the conversation that is running the command that is waiting for the answer — the text joins that live turn, so the command returns instead of waiting on itself.
 
 Set it up once in the panel: turn on **启用 dsh 命令** and click **安装 dsh 命令** — the default landing is the most recently active conversation — the one you are looking at (pick another from the list, or create one right there, if you want a different landing); the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
@@ -686,7 +688,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1074 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
+npm test          # 1075 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

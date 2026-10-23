@@ -26,7 +26,7 @@ import { resolveConfig } from '../lib/config.js'
 import { pickSchemaBuilder } from '../lib/schema.js'
 import { buildCdCommand, quotePath, shellQuote, windowsPathToWsl } from '../lib/paths.js'
 import { destructiveReason } from '../lib/guard.js'
-import { channelSessionOf, createChannel, firstUserLine, sessionRecordOf, titlesOf } from '../lib/channel.js'
+import { channelSessionOf, createChannel, firstUserLine, SAY_PREFIX, sessionRecordOf, titlesOf } from '../lib/channel.js'
 import { cleanStderr, formatResult, normalizeExitCode, streamFacts } from '../lib/result.js'
 import { assertLauncherReachable, collectForwardEnv, resolveDistro, sessionCwdOf } from '../lib/runner.js'
 import { capabilityLines, launcherSummary, parseFacts, workspaceLine } from '../lib/diagnostics.js'
@@ -4442,7 +4442,8 @@ async function channelUnitTests() {
     eq('the end frame names the reason', Buffer.from(end.slice(6).join(' '), 'base64').toString('utf8'), 'completed')
     const prompted = calls.find((entry) => entry[0] === 'prompt')
     eq('the prompt goes through the client session controller', prompted?.[1]?.sessionId, 'wsl')
-    eq('the prompt is forwarded verbatim', prompted?.[1]?.content?.[0]?.text, 'hi')
+    eq('the prompt is forwarded verbatim behind the terminal marker', prompted?.[1]?.content?.[0]?.text, SAY_PREFIX + 'hi')
+    check('the terminal marker is the documented one', SAY_PREFIX.length > 0 && SAY_PREFIX !== ' ', SAY_PREFIX)
     eq('an idle conversation starts a normal turn', prompted?.[1]?.mode, 'queue')
     check('the prompt carries a request id', typeof prompted?.[1]?.requestId === 'string' && prompted[1].requestId !== '')
 
@@ -4475,8 +4476,8 @@ async function channelUnitTests() {
     check('insert hands the controller an abort signal (the host reads throwIfAborted on it)',
       calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[2] instanceof AbortSignal,
       String(calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[2]))
-    eq('the inserted text reaches the controller verbatim',
-      calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.content?.[0]?.text, 'note for later')
+    eq('the inserted text reaches the controller verbatim, behind the terminal marker',
+      calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.content?.[0]?.text, SAY_PREFIX + 'note for later')
     const insertedBusy = await call('POST', '/insert', 'in line', {
       'content-type': 'text/plain',
       'x-dsh-wsl-token': state.token,
