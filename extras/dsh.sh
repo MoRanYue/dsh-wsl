@@ -302,7 +302,7 @@ cmd_say() {
   local session=$1 prompt=$2
   local reason=0 ended=0 line ms steps tin tout breason ok text_reason
   local ticker='' reason_start=0 ack_ticker='' ack_start=0
-  local balance_pid='' balance_file=''
+  local shell_pid=$$ balance_pid='' balance_file=''
   # The account wallet is fetched in the background from the moment the Host accepts the turn,
   # so the end-of-turn line costs nothing: by the time the reply finishes it is already there.
   prefetch_balance() {
@@ -345,7 +345,7 @@ cmd_say() {
   start_ack_ticker() {
     ack_start=$(date +%s%3N)
     (
-      while :; do
+      while kill -0 "$shell_pid" 2>/dev/null; do
         now=$(date +%s%3N)
         printf '\r\033[2m… 已送达，等待模型 %ds\033[0m' $(( (now - ack_start) / 1000 ))
         sleep 0.2
@@ -381,7 +381,7 @@ cmd_say() {
           reason=1
           reason_start=$(date +%s%3N)
           (
-            while :; do
+            while kill -0 "$shell_pid" 2>/dev/null; do
               now=$(date +%s%3N)
               elapsed=$((now - reason_start + ms))
               printf '\r\033[2m⏱ 思考中… %d.%01ds\033[0m' $((elapsed / 1000)) $(((elapsed % 1000) / 100))
