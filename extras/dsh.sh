@@ -347,7 +347,8 @@ cmd_say() {
     (
       while kill -0 "$shell_pid" 2>/dev/null; do
         now=$(date +%s%3N)
-        printf '\r\033[2m… 已送达，等待模型 %ds\033[0m' $(( (now - ack_start) / 1000 ))
+        total=$(( (now - ack_start) / 1000 ))
+        printf '\r\033[2m… 已送达，等待模型 %d分%02d秒\033[0m' $((total / 60)) $((total % 60))
         sleep 0.2
       done
     ) &
@@ -384,7 +385,8 @@ cmd_say() {
             while kill -0 "$shell_pid" 2>/dev/null; do
               now=$(date +%s%3N)
               elapsed=$((now - reason_start + ms))
-              printf '\r\033[2m⏱ 思考中… %d.%01ds\033[0m' $((elapsed / 1000)) $(((elapsed % 1000) / 100))
+              total=$((elapsed / 1000))
+              printf '\r\033[2m⏱ 思考中… %d分%02d秒\033[0m' $((total / 60)) $((total % 60))
               sleep 0.2
             done
           ) &

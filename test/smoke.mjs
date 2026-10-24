@@ -4646,6 +4646,8 @@ async function channelUnitTests() {
       shim.includes('post balance') && shim.includes('账户余额'), shim.slice(-1200))
     check('the installed shim names a large landing conversation as the cost of a slow turn',
       shim.includes('等待模型') && shim.includes('上下文较大'), shim.slice(-900))
+    check('the installed shim shows the thinking clock as minutes and seconds',
+      shim.includes('分%02d秒') && shim.includes('思考中'), shim.slice(-900))
 
     const refuseInstall = await createChannel({ ctx, config: { channelEnabled: false } }).install()
     eq('install without a wsl runner is refused', refuseInstall.ok, false)
