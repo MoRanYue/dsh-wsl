@@ -5344,6 +5344,18 @@ async function channelUnitTests() {
     check('the insert usage documents the waiting and the --nowait form',
       shim.includes('dsh insert --nowait') && shim.includes('dsh insert <会话id>'),
       shim.slice(0, 900))
+    // A turn in flight holds the terminal, but not the person: a typed line plus Enter is
+    // delivered as an insert into the same conversation. Pipes and tool shells must never be
+    // read from (the command that owns their stdin needs it), and the switch lets a person
+    // turn the reader off.
+    check('a running turn can be steered from the same terminal',
+      shim.includes('等待中：输入内容回车') && shim.includes('start_steer_reader')
+      && shim.includes('[ -t 0 ]') && /post insert "\$steer_text"/.test(shim)
+      && shim.includes('DSH_WSL_NO_STEER'),
+      shim.slice(shim.indexOf('start_steer_reader'), shim.indexOf('start_steer_reader') + 900))
+    check('the steer reader is stopped on every exit path',
+      /cleanup_say\(\)[\s\S]{0,160}stop_steer_reader/.test(shim) && shim.includes('已插入当前对话'),
+      shim.slice(-1400))
     check('the installed shim resolves its transport once per channel start, not per command',
       shim.includes('TRANSPORT_FILE') && shim.includes('--connect-timeout 0.25'),
       shim.slice(0, 500))

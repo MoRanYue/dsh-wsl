@@ -49,10 +49,12 @@ usage() {
   dsh status                当前会话与通道状态
 
 说明：回复来自 DSH 客户端里的同一段对话；在终端按 Ctrl+C 会停止等待，并且
-客户端里那一轮也会一起中止。`dsh "…"` 若目标正是正在等待这条命令的会话会
-自锁，此时会直接报「无法执行」并说明原因；要往正在进行的对话里送消息，
-用 `dsh insert --nowait`（立即返回）——从工具调用里发起的 insert 也始终立即
-返回，不会自锁。当前会话按终端分别保存：两个终端互不影响。
+客户端里那一轮也会一起中止。等待回复期间终端仍可输入：敲一行内容回车，就会
+插入当前对话（等同 `dsh insert --nowait`），不必另开窗口；设 DSH_WSL_NO_STEER=1
+可关掉这个输入。`dsh "…"` 若目标正是正在等待这条命令的会话会自锁，此时会直接
+报「无法执行」并说明原因；要往正在进行的对话里送消息，用 `dsh insert --nowait`
+（立即返回）——从工具调用里发起的 insert 也始终立即返回，不会自锁。当前会话
+按终端分别保存：两个终端互不影响。
 EOF
 }
 
@@ -327,10 +329,11 @@ cmd_say() {
   local session=$1 prompt=$2
   local reason=0 ended=0 line ms steps tin tout breason ok text_reason
   local ticker='' reason_start=0 ack_ticker='' ack_start=0
-  local shell_pid=$$ balance_pid='' balance_file='' say_status='' tick_fd=''
+  local shell_pid=$$ balance_pid='' balance_file='' tick_fd=''
   local got_frame=0 attempt=0 say_exit=0
   local start_us=0 last_status_us=0 step_count=0 last_reason_ms=0
   local DURATION='' TOKENS='' sec='' frac='' tin_text='' tout_text='' reason_note=''
+  local steer_pid=''
   # The account wallet is fetched in the background from the moment the Host accepts the turn,
   # so the end-of-turn line normally costs nothing. It has its own 3 s budget and is never
   # retried: a slow account service must not hold the prompt open after the answer is printed.
@@ -352,10 +355,7 @@ cmd_say() {
     fi
   }
   cleanup_say() {
-    if [ -n "${say_status:-}" ]; then
-      rm -f "$say_status"
-      say_status=''
-    fi
+    stop_steer_reader
   }
   report_balance() {
     [ -n "$balance_pid" ] || return
@@ -539,10 +539,54 @@ cmd_say() {
   trap 'on_interrupt 143' TERM
   trap 'on_interrupt 129' HUP
   trap 'stop_reason; cleanup_balance; cleanup_say' EXIT
+  # While a turn streams the terminal has no prompt — which used to be the only place a person
+  # could type `dsh insert`. A background reader hands a typed line to the same insert route
+  # (fire-and-forget, marked like every terminal prompt), so a running `dsh "…"` can be steered
+  # without a second window. Only a real terminal gets this: a pipe or a tool shell must not
+  # have its stdin read out from under the command that owns it.
+  start_steer_reader() {
+    [ -t 0 ] || return
+    [ "${DSH_WSL_NO_STEER:-}" = 1 ] && return
+    printf '\033[2m（等待中：输入内容回车 = 插入当前对话；Ctrl+C 中止本轮）\033[0m\n'
+    (
+      trap 'exit 0' INT TERM HUP
+      while IFS= read -r steer_text; do
+        steer_text=${steer_text%$'\r'}
+        [ -n "${steer_text//[[:space:]]/}" ] || continue
+        inserted=$(post insert "$steer_text" "$session")
+        case "$inserted" in
+          err*) printf '\r\033[2K[dsh] 插入失败：%s\n' "${inserted#err	}" ;;
+          '') printf '\r\033[2K[dsh] 插入没有回应\n' ;;
+          *) printf '\r\033[2K[dsh] 已插入当前对话\n' ;;
+        esac
+      done
+      # A background job in a shell without job control gets /dev/null as stdin, so the
+      # terminal is re-attached explicitly; without this the reader saw EOF at once and
+      # typed lines disappeared into the line discipline.
+    ) </dev/tty &
+    steer_pid=$!
+  }
+  stop_steer_reader() {
+    if [ -n "${steer_pid:-}" ]; then
+      kill "$steer_pid" 2>/dev/null
+      steer_pid=''
+    fi
+  }
+  start_steer_reader
   stream_turn() {
     got_frame=0
-    say_status="$STATE_DIR/say.$$"
+    say_exit=0
     while IFS= read -r line; do
+      # `post say` appends this after its stream closes: the exit code reaches the main shell
+      # as a frame instead of a temp file, so a turn that ends in `~e` cannot leave a
+      # `say.<pid>` file behind for a writer that runs after this shell already exited.
+      case "$line" in
+        '~exit '*)
+          say_exit=${line#'~exit '}
+          say_exit=${say_exit//[!0-9]/}
+          continue
+          ;;
+      esac
       got_frame=1
       case "$line" in
         '~ack') start_ack_ticker; prefetch_balance ;;
@@ -620,10 +664,9 @@ cmd_say() {
         'err'*) stop_reason; cleanup_balance; cleanup_say; die "${line#err	}" ;;
         *) printf '%s\n' "$line" ;;
       esac
-    done < <(post say "$prompt" "$session"; printf '%s' "$?" > "$say_status")
+    done < <(post say "$prompt" "$session"; printf '~exit %s\n' "$?")
   }
   stream_turn
-  if [ -r "$say_status" ]; then IFS= read -r say_exit < "$say_status"; fi
   cleanup_say
   # No frame at all + curl failed means the cached transport is wrong, not the turn: forget it,
   # re-probe, and try once more (management routes already recover from a stale cache this way).
@@ -632,7 +675,6 @@ cmd_say() {
     rm -f "$TRANSPORT_FILE"
     load_channel || return 1
     stream_turn
-    if [ -r "$say_status" ]; then IFS= read -r say_exit < "$say_status"; fi
     cleanup_say
   fi
   stop_reason
