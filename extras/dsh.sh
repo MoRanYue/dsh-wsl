@@ -509,14 +509,27 @@ cmd_say() {
   clock_us
   start_us=$CLOCK_US
   last_status_us=$CLOCK_US
+  # An interrupted terminal is not a failure: say so instead of "the connection dropped", and
+  # exit with the signal's conventional code. The trap also runs the same cleanup the normal
+  # paths use, so no status line, ticker or balance temp file is left behind.
+  interrupted=0
+  on_interrupt() {
+    interrupted=$1
+    stop_reason
+    cleanup_balance
+    cleanup_say
+    printf '\ndsh: 已在终端中断，客户端本轮也已停止\n' >&2
+    exit "$1"
+  }
   # A host crash or a closed connection ends the stream WITHOUT the frames that stop the
   # clock; without this the ticker would keep printing on this terminal forever. The same
   # handler releases the balance request and its temp file on every interruption path.
   # EXIT covers the paths that never reach the cleanup below (a `die` after the stream, an
-  # `exit` from a frame branch); HUP covers a terminal tab closing rather than Ctrl+C. Left
-  # behind once, a `balance.<pid>` file names a wallet this shell no longer holds.
-  trap 'stop_reason; cleanup_balance; cleanup_say' INT TERM EXIT
-  trap 'stop_reason; cleanup_balance; cleanup_say; exit 129' HUP
+  # `exit` from a frame branch).
+  trap 'on_interrupt 130' INT
+  trap 'on_interrupt 143' TERM
+  trap 'on_interrupt 129' HUP
+  trap 'stop_reason; cleanup_balance; cleanup_say' EXIT
   stream_turn() {
     got_frame=0
     say_status="$STATE_DIR/say.$$"

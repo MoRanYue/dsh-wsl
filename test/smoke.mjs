@@ -4858,6 +4858,8 @@ async function channelUnitTests() {
   const home = mkdtempSync(join(tmpdir(), 'dsh-wsl-channel-'))
   const listeners = new Map()
   const calls = []
+  /** Every `sessionController.cancel` the channel issued (a terminal Ctrl+C must issue one). */
+  const cancelCalls = []
   // One-shot script for the next `prompt` call, so a test can emit exactly the events its
   // scenario is about (multi-step usage, a stream-only usage, ...). Null = the default answer.
   let promptScript = null
@@ -4896,6 +4898,10 @@ async function channelUnitTests() {
           emit('session/event', { id }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
         }, 25)
         return { accepted: true }
+      },
+      /** The GUI's own stop path; a terminal Ctrl+C must go through exactly this. */
+      async cancel(request) {
+        cancelCalls.push(request)
       },
       async list() {
         return {
@@ -4975,6 +4981,38 @@ async function channelUnitTests() {
     eq('the state file advertises the session', state.sessionId, 'wsl')
     eq('the state file carries a 64-char token', state.token.length, 64)
     eq('the token is this channel instance\'s', state.token, channel.token)
+
+    /** Number of ctx event listeners the channel currently holds (every event name). */
+    const listenerCount = () => [...listeners.values()].reduce((sum, set) => sum + set.size, 0)
+    /**
+     * Start a `/say` and destroy the response socket as soon as it is acknowledged — exactly what
+     * Ctrl+C does in a terminal. The request dies; the turn would otherwise keep running in the
+     * client conversation, which is why the host has to be told to cancel it.
+     */
+    const disconnectSay = (target) => new Promise((resolve, reject) => {
+      let destroyed = false
+      const guard = setTimeout(() => reject(new Error('the /say stream never acknowledged')), 2_000)
+      if (typeof guard.unref === 'function') guard.unref()
+      const request = httpRequest({
+        host: '127.0.0.1', port, method: 'POST', path: '/say',
+        headers: { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token, 'x-dsh-wsl-session': target },
+      }, (response) => {
+        let buffer = ''
+        response.setEncoding('utf8')
+        response.on('data', (chunk) => {
+          buffer += chunk
+          if (destroyed || !buffer.includes('~ack')) return
+          destroyed = true
+          clearTimeout(guard)
+          response.destroy()
+          resolve()
+        })
+        response.on('error', () => {})
+      })
+      request.on('error', () => {})
+      request.write('ctrl-c')
+      request.end()
+    })
 
     // `/state` authenticates like every other route: the shim holds the token before it probes,
     // and an unauthenticated status line would hand the port/session to anything on 127.0.0.1.
@@ -5099,6 +5137,80 @@ async function channelUnitTests() {
       eq('without step usage the streamed usage is the fallback', streamEnd.usage, '7/3')
       check('and it is not reported as a free turn', streamEnd.usage !== '0/0', streamEnd.usage)
       promptScript = null
+    }
+
+    // Ctrl+C in the terminal kills the stream, but the turn itself keeps running inside the
+    // client conversation. The host's own `sessionController.cancel` (the GUI stop button's
+    // path) is what stops it — exactly once, for exactly that conversation, and with the
+    // prompt's AbortSignal already aborted. The stream must also leave no listeners or
+    // heartbeat interval behind, or every interruption would leak one of each.
+    {
+      const beforeListeners = listenerCount()
+      const beforeCancel = cancelCalls.length
+      const intervals = { created: 0, cleared: 0 }
+      const liveIntervals = new Set()
+      const realSetInterval = globalThis.setInterval
+      const realClearInterval = globalThis.clearInterval
+      globalThis.setInterval = (callback, ms, ...args) => {
+        const handle = realSetInterval(callback, ms, ...args)
+        intervals.created += 1
+        liveIntervals.add(handle)
+        return handle
+      }
+      globalThis.clearInterval = (handle) => {
+        if (liveIntervals.delete(handle)) intervals.cleared += 1
+        return realClearInterval(handle)
+      }
+      try {
+        promptScript = () => { /* accepted; this turn is expected to keep running */ }
+        await disconnectSay('session-a')
+        await tickMs(120)
+        eq('a client disconnect cancels the running turn exactly once', cancelCalls.length - beforeCancel, 1)
+        eq('and the cancel names the conversation the turn belongs to',
+          cancelCalls.at(-1)?.sessionId, 'session-a')
+        const promptSignal = calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[2]
+        eq('and the prompt signal was aborted with the stream', promptSignal?.aborted, true)
+        eq('and the stream left no event listeners behind', listenerCount(), beforeListeners)
+        eq('and its heartbeat interval was cleared', intervals.created - intervals.cleared, 0)
+      } finally {
+        globalThis.setInterval = realSetInterval
+        globalThis.clearInterval = realClearInterval
+        promptScript = null
+      }
+    }
+    // Control: a turn that ends on its own closes the response for a different reason, and that
+    // must not be reported to the host as a cancellation.
+    {
+      const beforeCancel = cancelCalls.length
+      const normal = await call('POST', '/say', 'finishes normally', {
+        'content-type': 'text/plain', 'x-dsh-wsl-token': state.token, 'x-dsh-wsl-session': 'session-a',
+      })
+      eq('a normally finished turn is not cancelled', cancelCalls.length, beforeCancel)
+      check('and it still reports its end frame', normal.body.includes('~e 1'), normal.body.slice(-90))
+    }
+    // A host whose controller has no `cancel` at all: the disconnect path must stay quiet (no
+    // throw, no unhandled rejection), and the channel must keep serving the next turn.
+    {
+      promptScript = () => { /* leave this turn running */ }
+      const savedCancel = services.sessionController.cancel
+      delete services.sessionController.cancel
+      const unhandled = []
+      const onUnhandled = (reason) => unhandled.push(reason)
+      process.on('unhandledRejection', onUnhandled)
+      try {
+        await disconnectSay('session-a')
+        await tickMs(120)
+        eq('a controller without cancel does not throw or leak', unhandled.length, 0)
+        promptScript = null
+        const after = await call('POST', '/say', 'still works', {
+          'content-type': 'text/plain', 'x-dsh-wsl-token': state.token, 'x-dsh-wsl-session': 'session-a',
+        })
+        check('and the next turn still streams', after.body.includes('~e 1'), after.body.slice(-90))
+      } finally {
+        services.sessionController.cancel = savedCancel
+        process.off('unhandledRejection', onUnhandled)
+        promptScript = null
+      }
     }
 
     // `dsh insert`: the supported way to put a message into a conversation without waiting for
@@ -5271,9 +5383,58 @@ async function channelUnitTests() {
         && /^'err'\*\) stop_reason/.test(errArm),
         `${JSON.stringify(xArm.slice(0, 90))} | ${JSON.stringify(errArm.slice(0, 60))}`)
     }
+    // Ctrl+C / SIGTERM in the terminal is its own outcome: the shim says the turn was stopped
+    // (rather than "the connection dropped") and exits with the signal's conventional code. A
+    // plain connection loss keeps its own wording, because that one is a different problem.
+    {
+      const interruptFn = shim.slice(shim.indexOf('on_interrupt()'))
+      check('an interrupted terminal says the turn was stopped, not dropped',
+        shim.includes('已在终端中断') && shim.includes('客户端本轮也已停止')
+        && /trap 'on_interrupt 130' INT/.test(shim) && /trap 'on_interrupt 143' TERM/.test(shim),
+        shim.slice(-1200))
+      check('the interrupt path cleans up before it exits with the signal code',
+        interruptFn.indexOf('stop_reason') >= 0
+        && interruptFn.indexOf('stop_reason') < interruptFn.indexOf('已在终端中断')
+        && interruptFn.includes('cleanup_balance') && /exit "\$1"/.test(interruptFn),
+        interruptFn.slice(0, 260))
+      check('a plain dropped connection keeps its own wording',
+        shim.includes('连接在回合结束前断开'), shim.slice(-400))
+    }
 
     const refuseInstall = await createChannel({ ctx, config: { channelEnabled: false } }).install()
     eq('install without a wsl runner is refused', refuseInstall.ok, false)
+
+    // Last, because it tears the channel down: a plugin unmount / hot reload destroys in-flight
+    // streams, but that is NOT a Ctrl+C — cancelling there would kill a turn the user is still
+    // watching in the client. (The `finally` below stops the already-stopped channel; that is a
+    // no-op by design.)
+    {
+      promptScript = () => { /* leave the turn open */ }
+      const beforeCancel = cancelCalls.length
+      await new Promise((resolve, reject) => {
+        const guard = setTimeout(() => reject(new Error('the in-flight /say was never acknowledged')), 2_000)
+        if (typeof guard.unref === 'function') guard.unref()
+        const request = httpRequest({
+          host: '127.0.0.1', port, method: 'POST', path: '/say',
+          headers: { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token, 'x-dsh-wsl-session': 'session-a' },
+        }, (response) => {
+          response.setEncoding('utf8')
+          response.on('data', (chunk) => {
+            if (!String(chunk).includes('~ack')) return
+            clearTimeout(guard)
+            resolve()
+          })
+          response.on('error', () => {})
+        })
+        request.on('error', () => {})
+        request.write('in flight')
+        request.end()
+      })
+      await channel.stop()
+      await tickMs(120)
+      eq('a channel teardown does not cancel the running turn', cancelCalls.length, beforeCancel)
+      promptScript = null
+    }
   } finally {
     await channel.stop()
     try { rmSync(home, { recursive: true, force: true }) } catch {}
