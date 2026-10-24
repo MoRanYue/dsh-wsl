@@ -1,7 +1,7 @@
 {
   "name": "dsh-wsl-tool",
   "version": "2.0.0",
-  "description": "Linux-native DSH, extended to WSL. One long-lived shell for multi-step work, a clean one for everything else; subtasks above the composer. From a WSL prompt, `dsh \"…\"` speaks into the conversation you choose and streams the reply back with thinking time; `dsh list/use/new/rm` manage sessions. Ad-hoc commands run in the terminal you have open — visible, read-only while the tool types, keyboard one click away — while tracked subtasks use private shells. Exit codes, path conversion, environment checks, background jobs; destructive commands ask first. Runs as you, below the DSH sandbox (it does not confine it).",
+  "description": "Linux-native DSH, extended to WSL. Multi-step work shares one long-lived shell (subtasks above the composer); one-off commands start clean, in parallel, with timeouts. A terminal you opened can be shared: visible, read-only until you take the keyboard back; from WSL, `dsh` speaks into a chosen conversation. Path conversion, environment checks; destructive commands ask first. Runs as you, below the DSH sandbox (it does not confine it).",
   "type": "module",
   "main": "index.js",
   "exports": {
