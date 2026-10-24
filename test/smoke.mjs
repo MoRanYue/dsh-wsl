@@ -5332,6 +5332,18 @@ async function channelUnitTests() {
       shim.includes('x-dsh-wsl-caller') && shim.includes('DSH_WSL_CALLER_SESSION')
       && shim.includes('cmd_insert'),
       shim.slice(-1200))
+    // `dsh insert` typed by a person streams the turn like `dsh "…"` (clock and reply); only a
+    // tool-invoked insert (caller session present) or an explicit `--nowait` hands the message
+    // over and returns. The tool split is what keeps the self-lock case possible, and the
+    // terminal split is what keeps `insert` from looking like it silently did nothing.
+    check('a terminal insert streams like a prompt, a tool insert returns at once',
+      /cmd_insert\(\)[\s\S]{0,1200}cmd_say "\$session" "\$prompt"/.test(shim)
+      && shim.includes('nowait')
+      && shim.includes('DSH_WSL_CALLER_SESSION'),
+      shim.slice(shim.indexOf('cmd_insert()'), shim.indexOf('cmd_insert()') + 1200))
+    check('the insert usage documents the waiting and the --nowait form',
+      shim.includes('dsh insert --nowait') && shim.includes('dsh insert <会话id>'),
+      shim.slice(0, 900))
     check('the installed shim resolves its transport once per channel start, not per command',
       shim.includes('TRANSPORT_FILE') && shim.includes('--connect-timeout 0.25'),
       shim.slice(0, 500))

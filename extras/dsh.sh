@@ -39,18 +39,20 @@ usage() {
 用法：
   dsh "问题"                把问题发给当前会话，流式显示思考与回复
   dsh <会话id> "问题"       发给指定会话
-  dsh insert "消息"         把消息插入当前对话，不等待回复（正在进行的回合会直接看到）
-  dsh insert <会话id> "消息" 插入指定会话，不等待回复
+  dsh insert "消息"         插入当前对话并流式显示那一轮（与 dsh "问题" 同格式）
+  dsh insert --nowait "消息" 只插入、立即返回（往正在进行的回合里插话时用）
+  dsh insert <会话id> "消息" 插入指定会话，同样流式显示
   dsh list                  列出会话（* 表示当前）
   dsh new <会话id>          新建会话并设为当前
   dsh use <会话id>          切换当前会话
   dsh rm <会话id>           归档会话（可恢复）
   dsh status                当前会话与通道状态
 
-说明：回复来自 DSH 客户端里的同一段对话；在终端按 Ctrl+C 只是停止等待，
-那一轮会在客户端里继续跑完。`dsh "…"` 若目标正是正在等待这条命令的会话会
+说明：回复来自 DSH 客户端里的同一段对话；在终端按 Ctrl+C 会停止等待，并且
+客户端里那一轮也会一起中止。`dsh "…"` 若目标正是正在等待这条命令的会话会
 自锁，此时会直接报「无法执行」并说明原因；要往正在进行的对话里送消息，
-用 `dsh insert`（立即返回）。当前会话按终端分别保存：两个终端互不影响。
+用 `dsh insert --nowait`（立即返回）——从工具调用里发起的 insert 也始终立即
+返回，不会自锁。当前会话按终端分别保存：两个终端互不影响。
 EOF
 }
 
@@ -265,11 +267,18 @@ cmd_rm() {
   printf '已归档会话 %s\n' "$id"
 }
 
-# Hand a message to a conversation and return at once; the supported way to put text into a
-# conversation that is currently waiting for this shell (where `say` would self-lock).
+# Hand a message to a conversation. A person typing at a terminal gets the same live turn as
+# `dsh "…"` — streaming reply, thinking clock, completion line — because that is what they
+# asked the conversation to do. There is one caller that must NOT wait: a tool call inside the
+# very conversation it writes into (the turn cannot end until the command returns, so waiting
+# would deadlock), and `--nowait` asks for that at-once behaviour from a terminal too.
 cmd_insert() {
-  local session=$1 prompt=$2 out
-  [ -n "$prompt" ] || die "用法：dsh insert \"消息\" 或 dsh insert <会话id> \"消息\""
+  local session=$1 prompt=$2 nowait=${3:-0} out
+  [ -n "$prompt" ] || die "用法：dsh insert [--nowait] \"消息\" 或 dsh insert [--nowait] <会话id> \"消息\""
+  if [ "$nowait" != 1 ] && [ -z "${DSH_WSL_CALLER_SESSION:-}" ]; then
+    cmd_say "$session" "$prompt"
+    return
+  fi
   out=$(post insert "$prompt" "$session")
   case "$out" in
     err*) die "${out#err	}" ;;
@@ -656,7 +665,15 @@ case "$1" in
   rm|archive) cmd_rm "${2:-}"; exit 0 ;;
   status) cmd_status; exit 0 ;;
   insert)
-    if [ $# -ge 3 ]; then cmd_insert "$2" "${*:3}"; else cmd_insert "$(current_session)" "${2:-}"; fi
+    # `--nowait` first, then the optional session id: `dsh insert [--nowait] [<id>] "消息"`.
+    shift
+    insert_nowait=0
+    if [ "${1:-}" = '--nowait' ] || [ "${1:-}" = '-n' ]; then insert_nowait=1; shift; fi
+    if [ $# -ge 2 ]; then
+      cmd_insert "$1" "${*:2}" "$insert_nowait"
+    else
+      cmd_insert "$(current_session)" "${1:-}" "$insert_nowait"
+    fi
     exit 0
     ;;
 esac
