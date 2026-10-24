@@ -5344,15 +5344,24 @@ async function channelUnitTests() {
     check('the insert usage documents the waiting and the --nowait form',
       shim.includes('dsh insert --nowait') && shim.includes('dsh insert <会话id>'),
       shim.slice(0, 900))
-    // A turn in flight holds the terminal, but not the person: a typed line plus Enter is
-    // delivered as an insert into the same conversation. Pipes and tool shells must never be
-    // read from (the command that owns their stdin needs it), and the switch lets a person
-    // turn the reader off.
+    // A turn in flight holds the terminal, but not the person: one Enter holds the answer back
+    // so the compose line is typed on a quiet terminal, the second delivers it as an insert.
+    // Pipes and tool shells must never be read from, and the switch lets a person turn the
+    // reader off.
     check('a running turn can be steered from the same terminal',
-      shim.includes('等待中：输入内容回车') && shim.includes('start_steer_reader')
+      shim.includes('回车暂停输出并插话') && shim.includes('start_steer_reader')
       && shim.includes('[ -t 0 ]') && /post insert "\$steer_text"/.test(shim)
       && shim.includes('DSH_WSL_NO_STEER'),
       shim.slice(shim.indexOf('start_steer_reader'), shim.indexOf('start_steer_reader') + 900))
+    // The compose handshake: the reader owns the pause flag, the frame loop buffers only while
+    // it exists, and every way out of the turn releases it so the held answer is never lost.
+    check('a compose line holds the answer back and releases it on every exit',
+      shim.includes('插入内容（回车发送；空行取消）') && shim.includes('已取消插入')
+      && shim.includes('pause_flag') && shim.includes('pause_text+=')
+      && shim.includes('resume_output')
+      && /'~e '\*\)[\s\S]{0,400}resume_output/.test(shim)
+      && /'err'\*\) stop_reason; resume_output/.test(shim),
+      shim.slice(shim.indexOf('start_steer_reader'), shim.indexOf('start_steer_reader') + 2400))
     check('the steer reader is stopped on every exit path',
       /cleanup_say\(\)[\s\S]{0,160}stop_steer_reader/.test(shim) && shim.includes('已插入当前对话'),
       shim.slice(-1400))

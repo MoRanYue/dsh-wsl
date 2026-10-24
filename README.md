@@ -491,7 +491,7 @@ Messages typed in the terminal arrive in the conversation marked **【WSL 终端
 
 A `dsh "…"` aimed at the very conversation whose tool call is running it cannot be sent: the prompt would join that live turn, whose end waits for the command to return — a self-lock. The channel refuses it and says why instead of hanging until the deadline; use `dsh insert --nowait` for that case (it hands the message over and returns at once), wait for the turn, or type it in the client. An `insert` issued *from a tool call* always returns at once for the same reason; `insert` typed by a person streams the turn like `dsh "…"`. The shim passes its caller session (`x-dsh-wsl-caller`) only when the plugin's terminal tool started that shell, so a person typing at a terminal is never affected.
 
-While a turn streams, the terminal has no prompt — but it is still yours to type into: a line plus Enter is delivered to the same conversation as an insert (steer), announced with `已插入当前对话`, so a running `dsh "…"` does not need a second window. Set `DSH_WSL_NO_STEER=1` to turn that reader off (scripts and pipes never get it; only a real terminal does).
+While a turn streams, the terminal has no prompt — but it is still yours: press Enter once and the answer is held back (the live clock stops painting, the input line is clean), type the message, press Enter again and it is delivered to the same conversation as an insert (steer), after which the answer resumes (`已插入当前对话，继续输出`). A second empty Enter cancels. Set `DSH_WSL_NO_STEER=1` to turn that reader off (scripts and pipes never get it; only a real terminal does).
 
 Set it up once in the panel: turn on **启用 dsh 命令** and click **安装 dsh 命令** — the default landing is the most recently active conversation — the one you are looking at (pick another from the list, or create one right there, if you want a different landing); the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
 server to the address WSL uses as its default gateway, on a random port, and demands
@@ -692,7 +692,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1217 host checks against real WSL (shim for ctx.subprocess) + 301 client checks
+npm test          # 1218 host checks against real WSL (shim for ctx.subprocess) + 301 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

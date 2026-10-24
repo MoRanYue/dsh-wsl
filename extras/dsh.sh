@@ -49,12 +49,13 @@ usage() {
   dsh status                当前会话与通道状态
 
 说明：回复来自 DSH 客户端里的同一段对话；在终端按 Ctrl+C 会停止等待，并且
-客户端里那一轮也会一起中止。等待回复期间终端仍可输入：敲一行内容回车，就会
-插入当前对话（等同 `dsh insert --nowait`），不必另开窗口；设 DSH_WSL_NO_STEER=1
-可关掉这个输入。`dsh "…"` 若目标正是正在等待这条命令的会话会自锁，此时会直接
-报「无法执行」并说明原因；要往正在进行的对话里送消息，用 `dsh insert --nowait`
-（立即返回）——从工具调用里发起的 insert 也始终立即返回，不会自锁。当前会话
-按终端分别保存：两个终端互不影响。
+客户端里那一轮也会一起中止。等待回复期间终端仍可输入：**先按一次回车暂停输出**，
+敲完内容再回车即插入当前对话（等同 `dsh insert --nowait`），随后继续输出；
+第二次回车留空则取消插入。设 DSH_WSL_NO_STEER=1 可关掉这个输入。`dsh "…"` 若
+目标正是正在等待这条命令的会话会自锁，此时会直接报「无法执行」并说明原因；
+要往正在进行的对话里送消息，用 `dsh insert --nowait`（立即返回）——从工具调用
+里发起的 insert 也始终立即返回，不会自锁。当前会话按终端分别保存：两个终端
+互不影响。
 EOF
 }
 
@@ -333,7 +334,10 @@ cmd_say() {
   local got_frame=0 attempt=0 say_exit=0
   local start_us=0 last_status_us=0 step_count=0 last_reason_ms=0
   local DURATION='' TOKENS='' sec='' frac='' tin_text='' tout_text='' reason_note=''
-  local steer_pid=''
+  local steer_pid='' pause_text=''
+  # The reader and the frame loop are different processes; a flag file is the channel between
+  # them: while it exists the answer is held back so the person can type a clean line.
+  pause_flag="$STATE_DIR/pause.$$"
   # The account wallet is fetched in the background from the moment the Host accepts the turn,
   # so the end-of-turn line normally costs nothing. It has its own 3 s budget and is never
   # retried: a slow account service must not hold the prompt open after the answer is printed.
@@ -356,6 +360,22 @@ cmd_say() {
   }
   cleanup_say() {
     stop_steer_reader
+    rm -f "$pause_flag" 2>/dev/null
+    pause_text=''
+  }
+  # True while the terminal reader holds the answer back for a compose line.
+  paused() { [ -e "$pause_flag" ]; }
+  flush_paused_output() {
+    if [ -n "${pause_text:-}" ]; then
+      printf '%s' "$pause_text"
+      pause_text=''
+    fi
+  }
+  # The turn is over (or being torn down): whatever was held back is the answer, so print it
+  # and release the pause before any completion line follows.
+  resume_output() {
+    rm -f "$pause_flag" 2>/dev/null
+    flush_paused_output
   }
   report_balance() {
     [ -n "$balance_pid" ] || return
@@ -394,7 +414,8 @@ cmd_say() {
       kill "$ack_ticker" 2>/dev/null
       wait "$ack_ticker" 2>/dev/null
       ack_ticker=''
-      printf '\r\033[2K'
+      # Never wipe the line the person is typing on.
+      if ! paused; then printf '\r\033[2K'; fi
     fi
   }
   # One microsecond clock read without a fork: bash 5's $EPOCHREALTIME is a special variable
@@ -466,6 +487,7 @@ cmd_say() {
     ack_start=$CLOCK_US
     (
       while kill -0 "$shell_pid" 2>/dev/null; do
+        if paused; then tick_wait; continue; fi
         clock_us
         total=$(( (CLOCK_US - ack_start) / 1000000 ))
         printf '\r\033[2m… 已送达，等待模型 %d分%02d秒\033[0m' $((total / 60)) $((total % 60))
@@ -485,7 +507,7 @@ cmd_say() {
       wait "$ticker" 2>/dev/null
       ticker=''
     fi
-    if [ "$had" = 1 ]; then printf '\033[0m\n'; fi
+    if [ "$had" = 1 ] && ! paused; then printf '\033[0m\n'; fi
     reason=2
   }
   # The first text frame ends the thinking phase: close the live clock with one honest summary
@@ -500,8 +522,10 @@ cmd_say() {
       elapsed_ms=$(( (CLOCK_US - start_us) / 1000 ))
     fi
     stop_reason
-    format_clock_ms "$elapsed_ms"
-    printf '\033[2m⏱ 思考 %s · 开始输出\033[0m\n' "$DURATION"
+    if ! paused; then
+      format_clock_ms "$elapsed_ms"
+      printf '\033[2m⏱ 思考 %s · 开始输出\033[0m\n' "$DURATION"
+    fi
     last_status_us=$CLOCK_US
   }
   # After the text started, a step boundary is the natural place for a progress line. The 10 s
@@ -509,6 +533,7 @@ cmd_say() {
   # read is a builtin, so no `date` process appears in the tick period).
   maybe_step_status() {
     [ "$reason" = 2 ] || return
+    paused && return
     clock_us
     [ $(( (CLOCK_US - last_status_us) / 1000 )) -ge 10000 ] || return
     format_clock_ms $(( (CLOCK_US - start_us) / 1000 ))
@@ -547,12 +572,39 @@ cmd_say() {
   start_steer_reader() {
     [ -t 0 ] || return
     [ "${DSH_WSL_NO_STEER:-}" = 1 ] && return
-    printf '\033[2m（等待中：输入内容回车 = 插入当前对话；Ctrl+C 中止本轮）\033[0m\n'
+    printf '\033[2m（等待中：回车暂停输出并插话，输入完再回车；Ctrl+C 中止本轮）\033[0m\n'
     (
       trap 'exit 0' INT TERM HUP
       while IFS= read -r steer_text; do
         steer_text=${steer_text%$'\r'}
-        [ -n "${steer_text//[[:space:]]/}" ] || continue
+        if [ -z "${steer_text//[[:space:]]/}" ]; then
+          # A bare Enter holds the answer back so the next line is typed on a quiet terminal;
+          # a second empty line cancels. The frame loop sees the flag and buffers instead of
+          # printing, the tickers stop painting, and the reader prints the input prompt.
+          if [ -e "$pause_flag" ]; then
+            rm -f "$pause_flag"
+            printf '\r\033[2K已取消插入，继续输出\n'
+            continue
+          fi
+          mkdir -p "$STATE_DIR" 2>/dev/null
+          : > "$pause_flag"
+          printf '\r\033[2K\033[2m插入内容（回车发送；空行取消）：\033[0m'
+          IFS= read -r steer_text || steer_text=''
+          steer_text=${steer_text%$'\r'}
+          if [ -z "${steer_text//[[:space:]]/}" ]; then
+            rm -f "$pause_flag"
+            printf '\r\033[2K已取消插入，继续输出\n'
+            continue
+          fi
+          inserted=$(post insert "$steer_text" "$session")
+          case "$inserted" in
+            err*) printf '\r\033[2K[dsh] 插入失败：%s\n' "${inserted#err	}" ;;
+            '') printf '\r\033[2K[dsh] 插入没有回应\n' ;;
+            *) printf '\r\033[2K[dsh] 已插入当前对话，继续输出\n' ;;
+          esac
+          rm -f "$pause_flag"
+          continue
+        fi
         inserted=$(post insert "$steer_text" "$session")
         case "$inserted" in
           err*) printf '\r\033[2K[dsh] 插入失败：%s\n' "${inserted#err	}" ;;
@@ -587,6 +639,9 @@ cmd_say() {
           continue
           ;;
       esac
+      # A buffer left by a compose line is the answer: once the reader released the pause,
+      # the next frame flushes it before printing more.
+      if [ -n "$pause_text" ] && ! paused; then flush_paused_output; fi
       got_frame=1
       case "$line" in
         '~ack') start_ack_ticker; prefetch_balance ;;
@@ -603,6 +658,7 @@ cmd_say() {
             reason_start=$CLOCK_US
             (
               while kill -0 "$shell_pid" 2>/dev/null; do
+                if paused; then tick_wait; continue; fi
                 clock_us
                 elapsed=$(( (CLOCK_US - reason_start) / 1000 + ms ))
                 total=$((elapsed / 1000))
@@ -614,7 +670,17 @@ cmd_say() {
           fi
           ;;
         '~t '*) finish_thinking ;;
-        '~a '*) stop_ack_ticker; finish_thinking; printf '%s' "${line#'~a '}" | base64 -d ;;
+        '~a '*)
+          stop_ack_ticker
+          finish_thinking
+          if paused; then
+            # The person is composing: hold the answer in memory and print it after the insert
+            # so their line stays clean (a compose is seconds, so the buffer stays small).
+            pause_text+="$(printf '%s' "${line#'~a '}" | base64 -d)"
+          else
+            printf '%s' "${line#'~a '}" | base64 -d
+          fi
+          ;;
         '~step '*)
           step_count=$((step_count + 1))
           maybe_step_status
@@ -622,6 +688,7 @@ cmd_say() {
         '~p') ;;
         '~x '*)
           stop_reason
+          resume_output
           cleanup_balance
           cleanup_say
           text_reason=$(printf '%s' "${line#'~x '}" | base64 -d)
@@ -630,6 +697,8 @@ cmd_say() {
           ;;
         '~e '*)
           stop_reason
+          # Anything held back by a compose line is the answer; print it before the summary.
+          resume_output
           read -r _ ok ms steps tin tout breason <<< "$line"
           ms=${ms:-0}
           ms=${ms//[!0-9]/}
@@ -661,7 +730,7 @@ cmd_say() {
           ended=1
           [ "$ok" = 1 ] && exit 0 || exit 1
           ;;
-        'err'*) stop_reason; cleanup_balance; cleanup_say; die "${line#err	}" ;;
+        'err'*) stop_reason; resume_output; cleanup_balance; cleanup_say; die "${line#err	}" ;;
         *) printf '%s\n' "$line" ;;
       esac
     done < <(post say "$prompt" "$session"; printf '~exit %s\n' "$?")
