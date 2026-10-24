@@ -52,7 +52,7 @@ import { createWslEnvTool } from './lib/tools/wsl-env.js'
 import { createWslDoctorTool } from './lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from './lib/tools/wsl-bootstrap.js'
 import { createWslTermTool } from './lib/tools/wsl-term.js'
-import { createTerminalTransport } from './lib/pty-transport.js'
+import { createLazyTerminalTransport } from './lib/pty-transport.js'
 import { answerJson, isJsonRequest, readJsonBody } from './lib/http.js'
 import { createSubtaskLog, projectSubtask } from './lib/subtasks.js'
 import { createChannel } from './lib/channel.js'
@@ -602,17 +602,22 @@ async function selfInfo(config, runner, terminalTransport) {
   let terminal = null
   if (terminalTransport !== null && terminalTransport !== undefined) {
     const bridge = typeof terminalTransport.status === 'function' ? terminalTransport.status() : null
-    terminal = {
-      // 'bridge' when a page is driving the sidebar terminal, 'pty' when only this plugin can.
-      kind: typeof terminalTransport.kind === 'string' ? terminalTransport.kind : null,
-      bridgeCapable: terminalTransport.bridgeCapable === true,
-      bridge: bridge !== null && typeof bridge === 'object'
-        ? {
-            client: bridge.client === true,
-            attachments: typeof bridge.attachments === 'number' ? bridge.attachments : 0,
-            pending: typeof bridge.pending === 'number' ? bridge.pending : 0,
-          }
-        : null,
+    // A lazy handle with no resolved generation yet (a host that offers neither a browser
+    // terminal nor a PTY provider) reports no terminal at all, exactly like the old null did.
+    const kind = typeof terminalTransport.kind === 'string' ? terminalTransport.kind : null
+    if (kind !== null) {
+      terminal = {
+        // 'bridge' when a page is driving the sidebar terminal, 'pty' when only this plugin can.
+        kind,
+        bridgeCapable: terminalTransport.bridgeCapable === true,
+        bridge: bridge !== null && typeof bridge === 'object'
+          ? {
+              client: bridge.client === true,
+              attachments: typeof bridge.attachments === 'number' ? bridge.attachments : 0,
+              pending: typeof bridge.pending === 'number' ? bridge.pending : 0,
+            }
+          : null,
+      }
     }
   }
   return {
@@ -653,11 +658,13 @@ export function apply(ctx, settings = {}) {
   // here — a `terminalController` with follow/write (browser terminals, the user can watch), the
   // browser bridge on 0.2.1 (`lib/term-bridge.js`: this plugin's own page holds the Remote
   // attachment, and the private PTY below is its fallback), or a PTY alone when no page is
-  // available. Resolved once so both consumers agree on the answer, and a host that faults here
-  // must not stop the other five tools from mounting.
+  // available. It is a LAZY handle: the host may mount its web-app rows after this plugin's
+  // apply (0.2.1-rc.3 does), and resolving once here would freeze the private-PTY fallback in
+  // place for the whole run. `upgradeTerminalTransport` below re-resolves when the service is
+  // really there.
   let terminalTransport = null
   try {
-    terminalTransport = createTerminalTransport({ ctx, config })
+    terminalTransport = createLazyTerminalTransport({ ctx, config })
   } catch (error) {
     console.warn('dsh-wsl-tool: no usable terminal transport', error)
     terminalTransport = null
@@ -714,6 +721,44 @@ export function apply(ctx, settings = {}) {
     }
   }
   syncTools()
+
+  // The transport resolved above may be the private-PTY fallback only because the host had not
+  // mounted its web-app rows (and `terminalController`) yet — 0.2.1-rc.3 mounts them after a
+  // profile plugin's apply, which silently demoted every browser-terminal feature for the whole
+  // run. Upgrade as soon as the service is really there, then re-register `wsl-term` so its
+  // description stops claiming the sidebar terminal cannot be joined.
+  let transportUpgraded = false
+  const upgradeTerminalTransport = () => {
+    if (transportUpgraded || terminalTransport === null || typeof terminalTransport.upgrade !== 'function') return
+    // Already a bridge (an older ordering, or a host that had everything up): nothing to do.
+    if (terminalTransport.bridgeCapable === true) {
+      transportUpgraded = true
+      return
+    }
+    if (terminalTransport.upgrade() !== true) return
+    transportUpgraded = true
+    const mounted = mountedTools.get('term')
+    if (mounted !== undefined) {
+      mountedTools.delete('term')
+      try {
+        mounted()
+      } catch (error) {
+        console.warn('dsh-wsl-tool: re-mounting the terminal tool after the transport upgrade failed', error)
+      }
+      syncTools()
+    }
+    console.info('dsh-wsl-tool: the browser terminal bridge became available; terminal transport upgraded')
+  }
+  try {
+    if (typeof ctx?.inject === 'function') {
+      // Both services, so the bridge's routes go up with a web server that can serve them.
+      ctx.inject(['terminalController', 'webServer'], () => upgradeTerminalTransport())
+    }
+  } catch {
+    // A host without inject keeps the transport it resolved; the timer below is the fallback.
+  }
+  const upgradeTimer = setTimeout(upgradeTerminalTransport, 2_500)
+  if (typeof upgradeTimer.unref === 'function') upgradeTimer.unref()
 
   // ------------------------------------------------------------ WSL channel
   //

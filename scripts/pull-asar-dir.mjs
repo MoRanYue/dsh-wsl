@@ -34,7 +34,10 @@ try {
   const jsonBuf = Buffer.alloc(jsonSize)
   readSync(fd, jsonBuf, 0, jsonSize, 16)
   const header = JSON.parse(jsonBuf.toString('utf8'))
-  const dataOffset = 16 + jsonSize
+  // The file area starts after the JSON header, padded so the first file is 4-byte aligned.
+  // A header whose length is not already aligned (0.2.1-rc.3 ships one: 16 + 4748087 bytes)
+  // would otherwise shift every extracted byte by the padding and truncate each file's tail.
+  const dataOffset = Math.ceil((16 + jsonSize) / 4) * 4
 
   const wanted = prefix.replace(/^\/+|\/+$/g, '').split('/')
   let node = header
