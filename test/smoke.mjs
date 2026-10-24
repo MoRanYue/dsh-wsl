@@ -4612,6 +4612,9 @@ async function channelUnitTests() {
     balanceReply = { status: 'ready', value: [{ currency: 'USD', balance: '0.004' }], bonusWallets: [] }
     const subCent = await call('POST', '/balance', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
     eq('a sub-cent balance reads as <0.01', subCent.body.trim(), 'ok\t余额 <$0.01')
+    balanceReply = { status: 'ready', value: [{ currency: 'CNY', balance: '1.6' }], bonusWallets: [{ currency: 'CNY', balance: '0' }] }
+    const spentBonus = await call('POST', '/balance', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('a spent bonus wallet is not printed as a fraction of a cent', spentBonus.body.trim(), 'ok\t余额 ¥1.60')
     const balanceDenied = await call('POST', '/balance', '', { 'content-type': 'text/plain' })
     eq('the balance route needs the channel token', balanceDenied.status, 401)
 
