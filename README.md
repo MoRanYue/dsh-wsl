@@ -484,7 +484,7 @@ same agent reacts immediately and nothing is dropped.
 | `dsh rm <id>` | archive a session — the client's own reversible remove |
 | `dsh status` | current session and channel state |
 
-Messages typed in the terminal arrive in the conversation marked **【WSL 终端】**, so a terminal turn is never mistaken for something typed in the client, and the ⏱ thinking clock keeps ticking while the model works instead of freezing at its first number.
+Messages typed in the terminal arrive in the conversation marked **【WSL 终端】**, so a terminal turn is never mistaken for something typed in the client, and the ⏱ thinking clock keeps ticking while the model works instead of freezing at its first number. The shim resolves its transport once per channel start (it used to probe the blocked path on every command) and prints **… 已送达，等待回复** as soon as the Host accepts the request, so `dsh` answers immediately while the model is still thinking.
 
 A `dsh "…"` aimed at the very conversation whose tool call is running it cannot be sent: the prompt would join that live turn, whose end waits for the command to return — a self-lock. The channel refuses it and says why instead of hanging until the deadline; use `dsh insert` for that case (it hands the message over and returns at once), wait for the turn, or type it in the client. The shim passes its caller session (`x-dsh-wsl-caller`) only when the plugin's terminal tool started that shell, so a person typing at a terminal is never affected.
 
@@ -685,7 +685,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1087 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
+npm test          # 1088 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

@@ -25,6 +25,11 @@ tty_key() {
   esac
 }
 CURRENT_FILE="$STATE_DIR/current.$(tty_key)"
+# The working client/base for the CURRENT channel instance (startedAt changes on every start).
+# Probed once per channel start instead of on every command: the probe is what made `dsh`
+# feel slow (an in-WSL curl that the firewall silently drops costs seconds before falling
+# back to `curl.exe`).
+TRANSPORT_FILE="$STATE_DIR/transport"
 
 die() { printf 'dsh: %s\n' "$*" >&2; exit 1; }
 
@@ -57,28 +62,51 @@ load_channel() {
   PORT=$(cfg_num port)
   ENABLED=$(grep -o '"enabled"[[:space:]]*:[[:space:]]*true' "$CONFIG" >/dev/null 2>&1 && echo 1 || echo 0)
   DEFAULT_SESSION=$(cfg_json sessionId)
+  STARTED=$(cfg_num startedAt)
   [ -n "${TOKEN:-}" ] && [ -n "${PORT:-}" ] || die "通道配置不完整 —— 在 DSH 面板里重新安装一次 dsh 命令"
   [ "$ENABLED" = 1 ] || die "WSL 通道没有启用 —— 在 DSH 侧边栏的 WSL 面板里打开「启用 dsh 命令」"
-  GW=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
-  [ -n "${GW:-}" ] || die "WSL 没有默认网关，无法连到 DSH 宿主机"
-  BASE="http://$GW:$PORT"
-  # Windows Firewall may block inbound connections that originate inside the WSL VM.
-  # Windows' own curl reaches the same address over the host adapter, so probe with
-  # the in-WSL client first and switch over when it cannot get through (interop keeps
-  # the pipes, so streaming still works).
-  CURL=curl
-  if ! curl -sS --max-time 3 "$BASE/state" >/dev/null 2>&1; then
-    if command -v curl.exe >/dev/null 2>&1 && curl.exe -sS --max-time 3 "$BASE/state" >/dev/null 2>&1; then
-      # Windows 自己的 curl 能过宿主网卡；interop 保留管道，流式仍可用。
-      CURL=curl.exe
-    elif command -v curl.exe >/dev/null 2>&1 && curl.exe -sS --max-time 3 "http://127.0.0.1:$PORT/state" >/dev/null 2>&1; then
-      # 服务若绑在 127.0.0.1/0.0.0.0，Windows 的环回就是宿主自己。
-      CURL=curl.exe
-      BASE="http://127.0.0.1:$PORT"
-    else
-      die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？通道在面板里启用了吗？"
+  # Reuse the transport that worked for this exact channel instance. This is the hot path:
+  # no network probe, no `ip route` spawn.
+  if [ -r "$TRANSPORT_FILE" ] && [ -n "${STARTED:-}" ]; then
+    local cached_started cached_client cached_base
+    IFS=$'\t' read -r cached_started cached_client cached_base < "$TRANSPORT_FILE" || true
+    if [ "${cached_started:-}" = "$STARTED" ] && [ -n "${cached_client:-}" ] \
+      && [ -n "${cached_base:-}" ] && command -v "$cached_client" >/dev/null 2>&1; then
+      CURL=$cached_client
+      BASE=$cached_base
+      return
     fi
   fi
+  # First command after a (re)start: resolve the address once and probe with a SHORT connect
+  # timeout, so a blocked path costs ~0.5 s instead of seconds.
+  local host
+  host=$(cfg_json host)
+  if [ -n "${host:-}" ]; then
+    BASE="http://$host:$PORT"
+  else
+    GW=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
+    [ -n "${GW:-}" ] || die "WSL 没有默认网关，无法连到 DSH 宿主机"
+    BASE="http://$GW:$PORT"
+  fi
+  CURL=''
+  local candidate
+  for candidate in curl curl.exe; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if "$candidate" -sS --connect-timeout 0.25 --max-time 1 "$BASE/state" >/dev/null 2>&1; then
+      CURL=$candidate
+      break
+    fi
+  done
+  # Windows' own curl can reach a host that only listens on the host adapter, and the
+  # service may bind loopback instead; try the Windows loopback last.
+  if [ -z "$CURL" ] && command -v curl.exe >/dev/null 2>&1 \
+    && curl.exe -sS --connect-timeout 0.25 --max-time 1 "http://127.0.0.1:$PORT/state" >/dev/null 2>&1; then
+    CURL=curl.exe
+    BASE="http://127.0.0.1:$PORT"
+  fi
+  [ -n "$CURL" ] || die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？通道在面板里启用了吗？"
+  mkdir -p "$STATE_DIR"
+  printf '%s\t%s\t%s\n' "${STARTED:-0}" "$CURL" "$BASE" > "$TRANSPORT_FILE"
 }
 
 current_session() {
@@ -99,27 +127,44 @@ set_current() {
   printf '%s\n' "$1" > "$CURRENT_FILE"
 }
 
-# POST a body to one route; prints the response body. `say` streams for as long as the
-# turn runs, so it carries no client-side deadline; the management routes are quick.
-# The caller header is only set when THIS shell was started by the plugin's terminal tool:
-# it is what lets the Host refuse a prompt aimed back at the session waiting for it.
-post() {
+# One POST with the CURRENT client/base. Kept separate so a failed request can forget a stale
+# transport, re-resolve, and retry with the new token/base.
+post_once() {
   local route=$1 body=$2 session=${3:-}
   local timeout=60
   local extra=()
   [ "$route" = say ] && { timeout=0; extra=(-N); }
-  if [ -n "${DSH_WSL_CALLER_SESSION:-}" ]; then
-    extra+=(-H "x-dsh-wsl-caller: $DSH_WSL_CALLER_SESSION")
-  fi
+  [ -n "${DSH_WSL_CALLER_SESSION:-}" ] && extra+=(-H "x-dsh-wsl-caller: $DSH_WSL_CALLER_SESSION")
   if [ -n "$session" ]; then
     "$CURL" -sS "${extra[@]}" --max-time "$timeout" -X POST \
       -H "x-dsh-wsl-token: $TOKEN" \
       -H "x-dsh-wsl-session: $session" \
       --data-binary "$body" "$BASE/$route"
   else
-    "$CURL" -sS "${extra[@]}" --max-time "$timeout" -X POST -H "x-dsh-wsl-token: $TOKEN" \
+    "$CURL" -sS "${extra[@]}" --max-time "$timeout" -X POST \
+      -H "x-dsh-wsl-token: $TOKEN" \
       --data-binary "$body" "$BASE/$route"
   fi
+}
+
+# POST a body to one route; prints the response body. `say` streams for as long as the
+# turn runs, so it carries no client-side deadline and is not retried mid-stream. The
+# management routes are quick, so a connection failure there is recovered once: a stale
+# cached transport (WSL restart, firewall change) must not require a manual step.
+post() {
+  local route=$1 body=$2 session=${3:-}
+  if [ "$route" = say ]; then
+    post_once "$route" "$body" "$session"
+    return
+  fi
+  local out
+  out=$(post_once "$route" "$body" "$session")
+  if [ $? -ne 0 ]; then
+    rm -f "$TRANSPORT_FILE"
+    load_channel || return 1
+    out=$(post_once "$route" "$body" "$session") || die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？"
+  fi
+  printf '%s' "$out"
 }
 
 cmd_list() {
@@ -181,7 +226,14 @@ cmd_insert() {
 
 cmd_status() {
   local state session_line landing
-  state=$("$CURL" -sS --max-time 10 "$BASE/state" 2>/dev/null) || die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？"
+  state=$("$CURL" -sS --connect-timeout 1 --max-time 3 "$BASE/state" 2>/dev/null) || {
+    # The cached transport can go stale between two commands (channel restarted, firewall
+    # changed): forget it and settle the current one instead of failing once.
+    rm -f "$TRANSPORT_FILE"
+    load_channel
+    state=$("$CURL" -sS --connect-timeout 1 --max-time 3 "$BASE/state" 2>/dev/null) \
+      || die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？"
+  }
   session_line=$(current_session)
   [ -n "$session_line" ] || session_line='默认（最近活跃会话）'
   CURRENT_SESSION=$session_line
@@ -199,12 +251,22 @@ cmd_status() {
 cmd_say() {
   local session=$1 prompt=$2
   local reason=0 ended=0 line ms steps tin tout breason ok text_reason
-  local ticker='' reason_start=0
+  local ticker='' reason_start=0 ack_note=0
+  # `~ack` arrives as soon as the Host accepted the request, long before the model's first
+  # token. Saying so on that line is what makes the command feel immediate; the first timer or
+  # text frame erases it.
+  clear_ack_note() {
+    if [ "$ack_note" = 1 ]; then
+      printf '\r\033[2K'
+      ack_note=0
+    fi
+  }
   # The first `~r` only says WHEN reasoning began: the elapsed time up to that point would stay
   # frozen on screen while the model keeps thinking. Keep a live clock instead — it ticks on the
   # same line (carriage return) until the first text arrives.
   stop_reason() {
     local had=$reason
+    clear_ack_note
     if [ -n "$ticker" ]; then
       kill "$ticker" 2>/dev/null
       wait "$ticker" 2>/dev/null
@@ -219,8 +281,14 @@ cmd_say() {
   local -a rest
   while IFS= read -r line; do
     case "$line" in
-      '~ack') ;;
+      '~ack')
+        if [ "$ack_note" = 0 ]; then
+          printf '\033[2m… 已送达，等待回复\033[0m'
+          ack_note=1
+        fi
+        ;;
       '~r '*)
+        clear_ack_note
         ms=${line#'~r '}
         if [ "$reason" != 1 ]; then
           reason=1
@@ -242,6 +310,7 @@ cmd_say() {
       '~p') ;;
       '~x '*)
         stop_reason
+        clear_ack_note
         text_reason=$(printf '%s' "${line#'~x '}" | base64 -d)
         printf '\ndsh: %s\n' "$text_reason" >&2
         exit 1
@@ -257,7 +326,7 @@ cmd_say() {
         ended=1
         [ "$ok" = 1 ] && exit 0 || exit 1
         ;;
-      'err'*) die "${line#err	}" ;;
+      'err'*) clear_ack_note; die "${line#err	}" ;;
       *) printf '%s\n' "$line" ;;
     esac
   done < <(post say "$prompt" "$session")

@@ -4606,6 +4606,9 @@ async function channelUnitTests() {
       shim.includes('x-dsh-wsl-caller') && shim.includes('DSH_WSL_CALLER_SESSION')
       && shim.includes('cmd_insert'),
       shim.slice(-1200))
+    check('the installed shim resolves its transport once per channel start, not per command',
+      shim.includes('TRANSPORT_FILE') && shim.includes('--connect-timeout 0.25'),
+      shim.slice(0, 500))
 
     const refuseInstall = await createChannel({ ctx, config: { channelEnabled: false } }).install()
     eq('install without a wsl runner is refused', refuseInstall.ok, false)
