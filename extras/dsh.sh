@@ -111,7 +111,17 @@ read_config() {
 }
 
 load_channel() {
-  [ -r "$CONFIG" ] || die "找不到通道配置 $CONFIG —— 先在 DSH 侧边栏的 WSL 面板里打开「启用 dsh 命令」并安装 dsh 命令"
+  # The Host writes this file when its channel starts and removes it on unmount, so during a
+  # desktop restart it is briefly absent. A command typed in that window waits a moment instead
+  # of reporting "never installed" — the file comes back by itself once DSH is up.
+  if [ ! -r "$CONFIG" ]; then
+    local waited=0
+    while [ "$waited" -lt 6 ] && [ ! -r "$CONFIG" ]; do
+      sleep 0.25 2>/dev/null || sleep 1
+      waited=$((waited + 1))
+    done
+  fi
+  [ -r "$CONFIG" ] || die "找不到通道配置 $CONFIG —— DSH 桌面版没在运行，或者正在启动/重启；它启动后会自动写回这个文件。仍然没有的话，在面板里确认「启用 dsh 命令」已打开，并重装一次 dsh 命令"
   read_config
   [ -n "${TOKEN:-}" ] && [ -n "${PORT:-}" ] || die "通道配置不完整 —— 在 DSH 面板里重新安装一次 dsh 命令"
   [ "$ENABLED" = 1 ] || die "WSL 通道没有启用 —— 在 DSH 侧边栏的 WSL 面板里打开「启用 dsh 命令」"
