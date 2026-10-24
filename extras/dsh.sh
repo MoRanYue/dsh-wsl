@@ -173,7 +173,7 @@ set_current() {
 # One POST with the CURRENT client/base. Kept separate so a failed request can forget a stale
 # transport, re-resolve, and retry with the new token/base.
 post_once() {
-  local route=$1 body=$2 session=${3:-}
+  local route=$1 body=${2:-} session=${3:-}
   local timeout=60
   local extra=()
   [ "$route" = say ] && { timeout=0; extra=(-N); }
@@ -195,7 +195,7 @@ post_once() {
 # management routes are quick, so a connection failure there is recovered once: a stale
 # cached transport (WSL restart, firewall change) must not require a manual step.
 post() {
-  local route=$1 body=$2 session=${3:-}
+  local route=$1 body=${2:-} session=${3:-}
   if [ "$route" = say ]; then
     post_once "$route" "$body" "$session"
     return
