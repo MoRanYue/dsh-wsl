@@ -33,6 +33,8 @@ usage() {
 用法：
   dsh "问题"                把问题发给当前会话，流式显示思考与回复
   dsh <会话id> "问题"       发给指定会话
+  dsh insert "消息"         把消息插入当前对话，不等待回复（正在进行的回合会直接看到）
+  dsh insert <会话id> "消息" 插入指定会话，不等待回复
   dsh list                  列出会话（* 表示当前）
   dsh new <会话id>          新建会话并设为当前
   dsh use <会话id>          切换当前会话
@@ -40,9 +42,9 @@ usage() {
   dsh status                当前会话与通道状态
 
 说明：回复来自 DSH 客户端里的同一段对话；在终端按 Ctrl+C 只是停止等待，
-那一轮会在客户端里继续跑完。若目标会话正是正在等待这条命令的会话（模型在
-自己的会话里执行 dsh），命令会直接报「无法执行」并说明原因，而不是卡住。
-当前会话按终端分别保存：两个终端里的 `dsh use` 互不影响。
+那一轮会在客户端里继续跑完。`dsh "…"` 若目标正是正在等待这条命令的会话会
+自锁，此时会直接报「无法执行」并说明原因；要往正在进行的对话里送消息，
+用 `dsh insert`（立即返回）。当前会话按终端分别保存：两个终端互不影响。
 EOF
 }
 
@@ -165,6 +167,18 @@ cmd_rm() {
   printf '已归档会话 %s\n' "$id"
 }
 
+# Hand a message to a conversation and return at once; the supported way to put text into a
+# conversation that is currently waiting for this shell (where `say` would self-lock).
+cmd_insert() {
+  local session=$1 prompt=$2 out
+  [ -n "$prompt" ] || die "用法：dsh insert \"消息\" 或 dsh insert <会话id> \"消息\""
+  out=$(post insert "$prompt" "$session")
+  case "$out" in
+    err*) die "${out#err	}" ;;
+  esac
+  printf '已插入对话 %s\n' "$(printf '%s\n' "$out" | tr '\t' ' ')"
+}
+
 cmd_status() {
   local state session_line landing
   state=$("$CURL" -sS --max-time 10 "$BASE/state" 2>/dev/null) || die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？"
@@ -266,6 +280,10 @@ case "$1" in
   use) cmd_use "${2:-}"; exit 0 ;;
   rm|archive) cmd_rm "${2:-}"; exit 0 ;;
   status) cmd_status; exit 0 ;;
+  insert)
+    if [ $# -ge 3 ]; then cmd_insert "$2" "${*:3}"; else cmd_insert "$(current_session)" "${2:-}"; fi
+    exit 0
+    ;;
 esac
 
 # A bare first word that names no command is either a session id (two or more args) or

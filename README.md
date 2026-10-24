@@ -205,8 +205,8 @@ for that session, but **not a sidebar tab**. The bridge makes the collaborative 
 on DSH 0.2.1: the host no longer lets a plugin attach to a browser terminal directly, but this
 plugin's own browser half runs in the page, where that attachment is allowed, so the host
 queues `attach`/`write`/`detach` commands for it over two same-origin routes (no extra port and
-no extra service). On hosts up to 0.2.0 no bridge is needed: the plugin drives the browser
-terminal directly through `terminalController.follow`/`write`.
+no extra service). Older DSH builds (≤0.2.0) are not supported by the terminal tool any more;
+the other tools still run there.
 
 #### Work is recorded as subtasks
 
@@ -314,25 +314,24 @@ forever.
 
 ## Compatibility
 
-The manifest declares the DSH it needs — `"engines": { "dsh": ">=0.1.7-rc.2" }` —
-which is the floor this section documents. Two readers act on that declaration:
-the plugin market shows it as a requirement on the entry (`DSH >=0.1.7-rc.2`) and
-warns before an install onto an older host, and the host's own install gate
-refuses a release whose declared range excludes the running DSH. Both evaluate
-prereleases, so `0.2.1-rc.2` is inside this range. The `-rc.2` is load-bearing:
-`>=0.1.7` alone excludes the `0.1.7-rc.2` release this line was verified on, and
-the market would then report the plugin as incompatible with its own verified
-host.
+The manifest declares the DSH it needs — `"engines": { "dsh": ">=0.2.1-rc.2" }`.
+Two readers act on that declaration: the plugin market shows it as a requirement on
+the entry and warns before an install onto an older host, and the host's own
+install gate refuses a release whose declared range excludes the running DSH.
+Only 0.2.1 and newer is supported: the pre-bridge terminal generation (DSH ≤0.2.0,
+where a plugin could drive a browser terminal through `terminalController.follow` /
+`write`) was removed, so the terminal tool reports that it cannot drive a terminal
+on those hosts instead of reaching into the user's shell. The other five tools are
+plain subprocess calls and still run there, but the package itself does not claim
+that support.
 
-Verified against DSH **0.2.1-rc.2** and **0.1.7-rc.2** (earlier releases of this
-plugin were verified on 0.1.5-rc.2): the tool schemas pass DSH's own
+Verified against DSH **0.2.1-rc.2**: the tool schemas pass DSH's own
 `assertSupportedJsonSchema`, the subprocess seam is exercised against the real
 provider rather than a shim, and the background-job path is checked against the
-real job registry, including the session-id ownership fence that 0.1.7 tightened
-(0.2.1 hands out `kind-<16 hex>` job ids, so the check reads the registry's own
-id instead of assuming a shape). `test/real-seam.mjs` is that check and it
-re-verifies a host in about a minute, so point it at any DSH installation after
-an upgrade:
+real job registry, including the session-id ownership fence (0.2.1 hands out
+`kind-<16 hex>` job ids, so the check reads the registry's own id instead of
+assuming a shape). `test/real-seam.mjs` is that check and it re-verifies a host in
+about a minute, so point it at any DSH installation after an upgrade:
 
 ```sh
 DSH_SUBPROCESS_LOCAL=/path/to/dsh/node_modules npm run test:real
@@ -342,15 +341,13 @@ A background job is owned by the calling session (`owner: exec.agent.id`), which
 is what lets the model read it back with `job_output`/`job_kill` and what keeps
 other sessions out; an execution with no agent starts the job unowned.
 
-One behaviour differs by host generation. Up to 0.2.0 the terminal tool CAN drive a
-browser terminal directly through `terminalController.follow`/`write`. 0.2.1 replaced
-those with an attachment only a Remote caller can open, so the plugin's browser half does
-it instead when a caller names such a terminal explicitly: the host queues
-`attach`/`write`/`detach` over `/dsh-wsl-tool/term-bridge/poll` + `/events`, and the page
-answers with results, screen snapshots and output. For its own work the tool does not need
-any of that — it opens a private PTY through `subprocess.spawnTerminal`: same actions, same
-records above the composer, with a shell private to the tool and a terminal you opened left
-untouched. Both paths are checked by `npm test`.
+The terminal tool has two supported drives: the browser bridge (0.2.1: the
+plugin's browser half joins a sidebar terminal the user opened, while the host
+queues `attach`/`write`/`detach` over `/dsh-wsl-tool/term-bridge/poll` + `/events`
+and the page answers with results, screen snapshots and output) and a private PTY
+through `subprocess.spawnTerminal` for the tool's own work (same actions, same
+records above the composer, a shell private to the tool, and a terminal you opened
+left untouched). Both are checked by `npm test`.
 
 ## The WSL panel (left sidebar)
 
@@ -479,6 +476,8 @@ same agent reacts immediately and nothing is dropped.
 |---|---|
 | `dsh "问题"` | send to the current session and stream the reply |
 | `dsh <id> "问题"` | send to that session |
+| `dsh insert "消息"` | hand a message to the current session and return at once — the way to write into a conversation without waiting for its turn |
+| `dsh insert <id> "消息"` | the same, into that session |
 | `dsh list` | sessions, newest first; `*` marks the current one |
 | `dsh new <id>` | create a session (it appears in the client) and switch to it |
 | `dsh use <id>` | switch the current session |
@@ -487,7 +486,7 @@ same agent reacts immediately and nothing is dropped.
 
 Messages typed in the terminal arrive in the conversation marked **【WSL 终端】**, so a terminal turn is never mistaken for something typed in the client, and the ⏱ thinking clock keeps ticking while the model works instead of freezing at its first number.
 
-A `dsh "…"` aimed at the very conversation whose tool call is running it cannot be sent: the prompt would join that live turn, whose end waits for the command to return — a self-lock. The channel refuses it and says why instead of hanging until the deadline; wait for the turn, or type it in the client. The shim passes its caller session (`x-dsh-wsl-caller`) only when the plugin's terminal tool started that shell, so a person typing at a terminal is never affected.
+A `dsh "…"` aimed at the very conversation whose tool call is running it cannot be sent: the prompt would join that live turn, whose end waits for the command to return — a self-lock. The channel refuses it and says why instead of hanging until the deadline; use `dsh insert` for that case (it hands the message over and returns at once), wait for the turn, or type it in the client. The shim passes its caller session (`x-dsh-wsl-caller`) only when the plugin's terminal tool started that shell, so a person typing at a terminal is never affected.
 
 Set it up once in the panel: turn on **启用 dsh 命令** and click **安装 dsh 命令** — the default landing is the most recently active conversation — the one you are looking at (pick another from the list, or create one right there, if you want a different landing); the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
 server to the address WSL uses as its default gateway, on a random port, and demands
@@ -686,7 +685,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1079 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
+npm test          # 1087 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
