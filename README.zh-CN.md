@@ -297,7 +297,7 @@ DSH_SUBPROCESS_LOCAL=/path/to/dsh/node_modules npm run test:real
 | 后台任务 | `wsl` 是否接受 `runInBackground` |
 | 自动转换路径 | 每次调用的 `translatePaths` 默认值 |
 | 默认跟随会话工作区 | 未传 `workdir` 时从会话目录开始，而不是 `~`。**默认开**：关掉的话，agent 写的相对路径都会落进 Linux 家目录 —— 那儿在资源管理器里看不见，还会撑大 WSL 磁盘镜像 |
-| Linux 默认工作目录 | 未传 `workdir` 时使用的固定 Linux 目录（如 `/mnt/d/project`）。填了就优先于上面的开关；清空则回到跟随会话 |
+| Linux 默认工作目录 | 未传 `workdir` 时使用的固定 Linux 目录（如 `/mnt/d/project`）。填了就优先于上面的开关；清空则先看 `DSH_WSL_WORKDIR`，没设才回到跟随会话 |
 | WSL 终端启动路径 | 可选的侧边栏终端从哪个目录启动 —— 写进你 **profile patch** 里 `terminal-controller` 那一行的 `--cd <目录>`（见[可选：在侧边栏开一个 WSL 终端](#可选在侧边栏开一个-wsl-终端)）。留空则删掉该参数；当前值也是从这个文件读的 |
 | 终端历史行数 | 那个终端保留多少行输出（同一行上的 `scrollback`）。平台默认 1000；填 `0` 不保留，留空回到默认。这两项都在重启 DSH 后生效 |
 | 危险命令守卫 | 危险命令是否必须显式 `allowDangerous` |
@@ -305,7 +305,8 @@ DSH_SUBPROCESS_LOCAL=/path/to/dsh/node_modules npm run test:real
 
 面板改的是插件自己的配置，所以同样的值也可以手写进 profile patch（`- id: tool-wsl` 加 `config:`）
 或用环境变量设。优先级由 `lib/config.js` 定：**插件配置 > 环境变量 > 内置默认值**；开关停在默认值时
-下层说了算 —— 这正是"从没打开过面板的人，`DSH_WSL_WORKDIR=session` 依然生效"的原因。
+下层说了算。所以从没打开过面板的人设 `DSH_WSL_WORKDIR` 依然生效——即使「跟随会话工作区」还停在默认的
+开：环境变量是显式的部署决定，说话比开关的默认值响。
 
 「WSL 终端启动路径」是唯一的例外：侧边栏终端属于另一个插件，所以那个输入框改的是你 profile 的
 patch 层 —— 每次写入前先备份该文件，只重写终端那一行的 `args`，写后还会读回来核对，只要不是"只改了
@@ -426,7 +427,7 @@ token）。按 `Ctrl+C` 只是停止等待，那一轮会在客户端里继续�
 | `DSH_WSL_TIMEOUT_MS` | `600000` | 模型命令的默认超时；单次调用可用 `timeoutMs` 覆盖 |
 | `DSH_WSL_MAX_TIMEOUT_MS` | `86400000` | 单次 `timeoutMs` 的上限，对齐平台 shell 工具的 `maxTimeoutMs`；默认超时也受它约束 |
 | `DSH_WSL_MAX_OUTPUT_BYTES` | `65536` | 每条流的内存窗口（1 KiB – 8 MiB）；设到 64 MiB 以上时也会抬高落盘上限 |
-| `DSH_WSL_WORKDIR` | `home` | 不传 `workdir` 时的起点：`home`（Linux 的 `~`）、`session`（会话工作目录，Windows 检出对应 `/mnt/<盘>/...`），或任意显式路径 |
+| `DSH_WSL_WORKDIR` | （未设：交给开关） | 不传 `workdir` 时的起点：`home`（Linux 的 `~`）、`session`（会话工作目录，Windows 检出对应 `/mnt/<盘>/...`），或任意显式路径（Windows 路径同样会被转换）。显式设置时优先于「跟随会话工作区」的默认开；不设时由开关决定 |
 
 无法解析或越界的值会回退到默认值——一个写错的环境变量不该让所有工具一起挂掉。
 **改动即时生效**（包括工具开关）：注册工具时会拿到它自己的 disposer，所以每次设置更新都会把期望的工具集
@@ -440,7 +441,8 @@ token）。按 `Ctrl+C` 只是停止等待，那一轮会在客户端里继续�
 - **stdin 默认是 `/dev/null`，除非传 `stdin`**：交互式命令（`read`、`cat`、不带 `-S`
   的 `sudo` 密码提示）否则会立刻收到 EOF，无法等待输入；本插件不会、也无法弹出任何提示。
   通过 `stdin` 传的密码会被记进会话记录。
-- `workdir` 默认 `~`；设 `DSH_WSL_WORKDIR=session` 可改为从会话工作目录开始（见"配置"）。
+- 什么都不配时从会话工作目录开始（「跟随会话工作区」默认开）；要落到 `~` 就设
+  `DSH_WSL_WORKDIR=home`，也可显式写 `session` 或固定路径（见“配置”）。
 - 发行版取调用参数 → `DSH_WSL_DISTRO` → 系统默认，代码里不再硬编码兜底名称。
 - 发行版不存在时会给出明确报错（`distribution "X" is not registered`），而不是
   一个原始 `-1` 退出码；其他启动器错误（`Wsl/Service/WSL_E_*`）也会带错误码上报，
@@ -449,11 +451,12 @@ token）。按 `Ctrl+C` 只是停止等待，那一轮会在客户端里继续�
   并把工作登记进宿主任务注册表，`job_output` 读它（标记与前台一致）、`job_kill` 停它。
   后台模式下 10 分钟默认超时**不适用**，但显式 `timeoutMs` 仍然生效；非零退出与前台一样
   报成 `completed` 并把退出码写进 detail。
-- `command` 与 `workdir` 中的 Windows 路径会自动转换为 `/mnt/...`：
+- `command`、`workdir` 以及配置/`DSH_WSL_WORKDIR` 给出的默认目录中的 Windows 路径会自动转换为 `/mnt/...`：
   - `C:\Users\me\a.txt` → `/mnt/c/Users/me/a.txt`；含空格、括号的路径与一行多个路径都支持
     （`C:\Program Files\Git`、`C:/Program Files/Git`、`C:\Program Files (x86)\Steam`、
     `cp C:\a.txt D:\b.txt` 两个路径都会转换）；
-  - `\\wsl.localhost\<发行版>\home\x` 与 `\\wsl$\<发行版>\home\x` → `/home/x`；
+  - `\\wsl.localhost\<发行版>\home\x` 与 `\\wsl$\<发行版>\home\x` → `/home/x`；指向**别的发行版**的
+    UNC 路径保持原样（否则 `/home/x` 会变成当前发行版的目录，读错东西）；
   - 只是"看起来像"盘符的文本不会被动：单个小写字母后跟 `/`（如 `a:/b`）、其他表达式里的
     盘符（如 `sed "s/C:\x/y/"`）、URL 里的疑似盘符段；
   - 当路径要交给**Windows 程序**（经 interop 调用）时请传 `translatePaths: false`：
@@ -593,7 +596,7 @@ argv 包一层过 `ctx.sandbox`）和文件系统服务（`@deepseek-ai/dsh-fs-s
 ### 测试
 
 ```sh
-npm test          # 1098 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 232 项客户端检查
+npm test          # 1192 项宿主检查（跑在真实 WSL 上，仅用 shim 顶替 ctx.subprocess）+ 301 项客户端检查
 npm run test:real # 同一套检查改跑真实 provider，外加 seam 事实套件
 ```
 

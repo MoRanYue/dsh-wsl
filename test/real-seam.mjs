@@ -118,8 +118,19 @@ try {
     check('the job completes in the real registry', final?.status === 'completed', String(final?.status))
     check('the real registry carries the exit detail', /exit code 0/.test(final?.detail ?? ''), String(final?.detail))
     const read = jobs.read(started.jobId)
-    check('the real registry returns the job output',
-      JSON.stringify(read ?? '').includes('real-job-output'), JSON.stringify(read).slice(0, 160))
+    // The registry hands the producer's terminal payload to the model through `result`, exactly
+    // once, on the first read after settlement. Asserting on the whole projection would pass on
+    // the job LABEL alone (it contains the command text), which is how an `output`-named field
+    // kept the command's real output invisible while this suite stayed green.
+    check('the real registry returns the job output through result',
+      typeof read?.result === 'string' && read.result.includes('real-job-output'),
+      JSON.stringify(read).slice(0, 220))
+    // And the reverse control: nothing rode the output RING. This is what proves the text came
+    // from `result` and not from a stream the plugin never feeds.
+    check('and it rode result, not the output ring',
+      Array.isArray(read?.chunks) && read.chunks.length === 0
+      && typeof read?.result === 'string' && read.result.includes('real-job-output'),
+      JSON.stringify({ chunks: read?.chunks?.length, result: read?.result }))
 
     // Cancel through the registry, exactly as `job_kill` would.
     const longOne = await toolSet.wsl.execute({
@@ -148,8 +159,10 @@ try {
     }
     const ownedFinal = await jobs.wait(owned.jobId, 30_000, OWNER)
     check('the owning session sees its job complete', ownedFinal?.status === 'completed', String(ownedFinal?.status))
-    check('the owning session reads its job output',
-      JSON.stringify(jobs.read(owned.jobId, OWNER) ?? '').includes('owned-output'), '')
+    const ownedRead = jobs.read(owned.jobId, OWNER)
+    check('the owning session reads its job output from result',
+      typeof ownedRead?.result === 'string' && ownedRead.result.includes('owned-output'),
+      JSON.stringify(ownedRead?.result))
 
     // Control: the same registry REFUSES an agent handle where a session id
     // belongs. This is exactly how 1.8.0 failed inside DSH 0.1.7, so it proves

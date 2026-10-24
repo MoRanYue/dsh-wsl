@@ -43,6 +43,22 @@ check('it never asks for a service by bare global', !/\bself\./.test(source))
 const loaded = []
 // What the feedback entry copies, recorded from the clipboard stub the panel uses.
 const copiedTexts = []
+// The page document, as much of it as the client half touches: `hidden` for the dock's
+// background-tab gate, and a listener registry so a test can raise `visibilitychange`.
+const documentListeners = new Map()
+const pageDocument = {
+  hidden: false,
+  addEventListener: (name, handler) => {
+    if (!documentListeners.has(name)) documentListeners.set(name, new Set())
+    documentListeners.get(name).add(handler)
+  },
+  removeEventListener: (name, handler) => {
+    documentListeners.get(name)?.delete(handler)
+  },
+}
+const dispatchDocument = (name, event = {}) => {
+  for (const handler of Array.from(documentListeners.get(name) ?? [])) handler(event)
+}
 const context = createContext({
   window: { __ModuleLoader__: { load: (mod) => loaded.push(mod) } },
   console: silent,
@@ -54,6 +70,7 @@ const context = createContext({
       },
     },
   },
+  document: pageDocument,
 })
 // Timers: the panel arms two (a bounded wait for the settings scope, and an abort for the
 // feedback read). Recording them lets a check fire one on demand instead of sleeping.
@@ -73,6 +90,10 @@ const fireTimers = (predicate) => {
     timers.delete(id)
     timer.fn()
   }
+}
+/** Let the promise chains a timer started settle (one macrotask turn is enough per link). */
+const settleTicks = async (rounds = 3) => {
+  for (let round = 0; round < rounds; round += 1) await new Promise((resolve) => setImmediate(resolve))
 }
 runInContext(source, context, { filename: clientPath })
 eq('the loader received exactly one module', loaded.length, 1)
@@ -1000,6 +1021,9 @@ const dockFetch = context.fetch
     !collapsed.includes('跑通 sta 流程') && !collapsed.includes('修终端就绪竞态'), collapsed)
   const collapsedClicks = collect(mounted.tree()).filter((node) => typeof node.props?.onClick === 'function')
   eq('one click target while collapsed', collapsedClicks.length, 1)
+  check('the click targets are keyboard controls, not bare divs',
+    collapsedClicks.every((node) => node.props.role === 'button' && node.props.tabIndex === 0),
+    JSON.stringify(collapsedClicks.map((node) => node.props)))
   collapsedClicks[0].props.onClick()
   const text = textOf(mounted.tree())
   check('a terminal the user opened is shown as one of the records',
@@ -1009,6 +1033,9 @@ const dockFetch = context.fetch
   check('commands stay hidden until a subtask is opened',
     !text.includes('make sta') && !text.includes('node test/smoke.mjs'), text)
   check('the expanded dock offers 收起', text.includes('收起'), text)
+  // The running count belongs to the summary line only; the first row used to repeat it as
+  // "运行 1 · 详情" directly under the summary.
+  eq('the running count is not repeated on the first row', (text.match(/运行 1/g) ?? []).length, 1)
   const clickables = collect(mounted.tree()).filter((node) => typeof node.props?.onClick === 'function')
   eq('one click target per record plus the collapse control', clickables.length, 4)
   clickables[2].props.onClick()
@@ -1080,6 +1107,386 @@ const dockFetch = context.fetch
   noSession.unmount()
 }
 context.fetch = dockFetch
+
+// --- the dock's poll cadence, background-tab gate and re-render gate ---------
+//
+// The row above the composer used to be read every 2 s forever and re-rendered on every
+// answer, even when nothing had changed. The three properties asserted here are the fix:
+// 2 s only while a subtask runs, 10 s when the log has settled, 30 s while the page is
+// hidden (with an immediate catch-up when it becomes visible), and no re-render at all for
+// an answer equal to the previous one.
+console.log('\nthe dock polls as often as the work needs')
+{
+  const dockPayload = (running, commands = 1) => ({
+    sessions: {
+      'session-1': {
+        total: 3,
+        running,
+        entries: [
+          {
+            id: 'e-1', title: '跑通 sta 流程', status: running > 0 ? 'running' : 'done',
+            result: running > 0 ? null : '已修', terminal: running > 0 ? 'attached' : 'idle',
+            terminalCreated: true, userTerminal: false, terminalId: 't-1',
+            terminalInfo: {
+              id: 't-1', title: 'WSL', shell: 'bash', args: [], cwd: '/home', cols: 120, rows: 30,
+              state: 'running', stale: false,
+            },
+            commands: Array.from({ length: commands }, (_value, index) => ({ command: 'make sta ' + index, exitCode: 0 })),
+            finishedAt: null,
+          },
+          {
+            id: 'e-2', title: '修终端就绪竞态', status: 'done', result: '已修', terminal: 'idle',
+            terminalCreated: true, userTerminal: false, terminalId: 't-2',
+            terminalInfo: null, commands: [], finishedAt: 1,
+          },
+        ],
+      },
+    },
+  })
+  const polls = []
+  let answer = dockPayload(1)
+  context.fetch = (url) => {
+    polls.push(String(url))
+    return Promise.resolve({ ok: true, json: () => Promise.resolve(answer) })
+  }
+  const dockView = mountStateful(dock.component, { sessionId: 'session-1' })
+  await dockView.flush()
+  eq('the dock reads once on mount', polls.length, 1)
+  const firstTree = dockView.tree()
+  fireTimers((timer) => timer.ms === 2_000)
+  await settleTicks()
+  eq('a running subtask is polled again after 2 s', polls.length, 2)
+  check('an unchanged answer does not re-render the dock', dockView.tree() === firstTree)
+  // A command landing while the subtask runs is a change: the detail must follow it.
+  answer = dockPayload(1, 2)
+  fireTimers((timer) => timer.ms === 2_000)
+  await settleTicks()
+  eq('a changed answer is read again', polls.length, 3)
+  check('and it is rendered', dockView.tree() !== firstTree)
+  // The log settles: the next read must arm the slow cadence, not 2 s.
+  answer = dockPayload(0)
+  fireTimers((timer) => timer.ms === 2_000)
+  await settleTicks()
+  eq('the settling answer is read', polls.length, 4)
+  check('no 2 s timer is armed once nothing runs',
+    !Array.from(timers.values()).some((timer) => timer.ms === 2_000))
+  check('a 10 s timer is armed instead',
+    Array.from(timers.values()).some((timer) => timer.ms === 10_000))
+  // Background tabs do not need a 2 s heartbeat (and the browser throttles it anyway).
+  pageDocument.hidden = true
+  fireTimers((timer) => timer.ms === 10_000)
+  await settleTicks()
+  eq('a hidden page still reads when its own timer fires', polls.length, 5)
+  check('the next hidden timer is the long one',
+    Array.from(timers.values()).some((timer) => timer.ms === 30_000))
+  check('no fast timer is armed while hidden',
+    !Array.from(timers.values()).some((timer) => timer.ms === 2_000 || timer.ms === 10_000))
+  // Coming back to the page catches up at once instead of waiting out the 30 s.
+  pageDocument.hidden = false
+  dispatchDocument('visibilitychange')
+  await settleTicks()
+  eq('showing the page reads at once', polls.length, 6)
+  dockView.unmount()
+  eq('the visibility hook is released with the dock', (documentListeners.get('visibilitychange') ?? new Set()).size, 0)
+}
+
+// --- panel route reads: stale answers, read failures, and error wording -------
+console.log('\npanel route reads settle in the right order')
+{
+  /** A settings model that really applies writes, so the panel can read its own value back. */
+  const makePanelModel = (initial) => {
+    const value = { tools: {}, channelSession: '', ...initial }
+    const writes = []
+    return {
+      value,
+      writes,
+      model: {
+        read: () => ({ status: 'ready', value, base: {}, user: {}, writable: true, revision: 3 }),
+        subscribe: () => () => {},
+        hasService: () => true,
+        write: async (ops) => {
+          for (const op of (Array.isArray(ops) ? ops : [ops])) {
+            writes.push(op)
+            if (op.op === 'set') value.channelSession = op.value
+          }
+          return true
+        },
+      },
+    }
+  }
+  const routeFetch = (routes) => (url, options) => {
+    const target = String(url)
+    const method = options !== undefined && options.method !== undefined ? options.method : 'GET'
+    const answer = routes[target] ?? routes[target.split('?')[0]]
+    if (answer === undefined) return Promise.resolve({ ok: true, json: () => Promise.resolve({}) })
+    return Promise.resolve(typeof answer === 'function' ? answer(target, method) : answer)
+  }
+  const terminalAnswer = { ok: true, json: () => Promise.resolve({ path: '', scrollback: 1000, available: true }) }
+  const channelAnswer = (sessions) => ({
+    ok: true,
+    json: () => Promise.resolve({
+      available: true, shim: { installed: true }, port: 47001, host: '192.168.1.1',
+      sessions, sessionMeta: { records: sessions.length, members: sessions.length },
+    }),
+  })
+
+  // (1) Creating a session: the Host's picker list is stale-while-revalidate, so its own
+  // answer can still omit the session that was just created. The panel must not call its own
+  // fresh session "unavailable".
+  const created = makePanelModel({})
+  const stale = [{ id: 's-old', title: '旧会话', activityAt: 1, workspace: '' }]
+  context.fetch = routeFetch({
+    '/dsh-wsl-tool/terminal-cwd': terminalAnswer,
+    '/dsh-wsl-tool/channel': channelAnswer(stale),
+    '/dsh-wsl-tool/channel-new': {
+      ok: true,
+      json: () => Promise.resolve({ ok: true, sessionId: 's-new' }),
+    },
+  })
+  const channelPanel = mountStateful(main.component, { model: created.model })
+  await channelPanel.flush()
+  const nameInput = collect(channelPanel.tree()).find((node) => node.type === 'input'
+    && node.props?.placeholder === '新会话名，例如 wsl')
+  nameInput.props.onChange({ target: { value: 'wsl' } })
+  collect(channelPanel.tree()).find((node) => node.type === 'button' && textOf(node) === '新建并选用').props.onClick()
+  await settleTicks(6)
+  eq('creating a session writes the chosen id', created.value.channelSession, 's-new')
+  const createdText = textOf(channelPanel.tree())
+  check('the freshly created session is not reported as unavailable',
+    !createdText.includes('所选会话不可用'), createdText.slice(0, 260))
+  check('the picker label names the new session', createdText.includes('wsl'), createdText.slice(0, 260))
+  channelPanel.unmount()
+
+  // (2) A directory listing must not be overwritten by a slower, older one.
+  const browserModel = makePanelModel({})
+  const listings = []
+  const deferredListing = (target) => new Promise((resolve) => {
+    listings.push({ target: decodeURIComponent(target), resolve })
+  })
+  context.fetch = routeFetch({
+    '/dsh-wsl-tool/terminal-cwd': terminalAnswer,
+    '/dsh-wsl-tool/channel': channelAnswer([]),
+    '/dsh-wsl-tool/dirs': (target) => deferredListing(target),
+  })
+  const browserPanel = mountStateful(main.component, { model: browserModel.model })
+  await browserPanel.flush()
+  collect(browserPanel.tree()).find((node) => node.type === 'button' && textOf(node) === '浏览…').props.onClick()
+  await settleTicks()
+  eq('the browser asks for the home directory', listings.length, 1)
+  listings.shift().resolve({
+    ok: true,
+    json: () => Promise.resolve({
+      path: '/home/u', parent: '/home',
+      entries: [{ name: 'a', path: '/home/u/a' }, { name: 'b', path: '/home/u/b' }],
+    }),
+  })
+  await settleTicks()
+  const entries = collect(browserPanel.tree()).filter((node) => node.type === 'button' && textOf(node).startsWith('📁'))
+  eq('both child directories are offered', entries.length, 2)
+  entries[0].props.onClick()
+  entries[1].props.onClick()
+  await settleTicks()
+  eq('two listings are in flight', listings.length, 2)
+  const requestFor = (path) => listings.find((entry) => entry.target.includes(path))
+  requestFor('/home/u/b').resolve({ ok: true, json: () => Promise.resolve({ path: '/home/u/b', parent: '/home/u', entries: [] }) })
+  await settleTicks()
+  requestFor('/home/u/a').resolve({ ok: true, json: () => Promise.resolve({ path: '/home/u/a', parent: '/home/u', entries: [] }) })
+  await settleTicks()
+  const shownPath = textOf(browserPanel.tree())
+  check('the newest choice wins over a late older answer',
+    shownPath.includes('/home/u/b') && !shownPath.includes('/home/u/a'), shownPath.slice(0, 200))
+  browserPanel.unmount()
+
+  // (3) A read failure (`available: false` plus an `error`) is not a missing terminal row:
+  // the save must stay offered, because the note promises the write is still attempted.
+  const failedModel = makePanelModel({})
+  context.fetch = routeFetch({
+    '/dsh-wsl-tool/terminal-cwd': {
+      ok: true,
+      json: () => Promise.resolve({
+        path: '', scrollback: null, available: false,
+        error: '宿主既没有 profileContext.patchPath 也没有 DSH_PROFILE_DIR，读不到 profile 的 patch 文件',
+      }),
+    },
+    '/dsh-wsl-tool/channel': channelAnswer([]),
+  })
+  const failedPanel = mountStateful(main.component, { model: failedModel.model })
+  await failedPanel.flush()
+  const failedText = textOf(failedPanel.tree())
+  check('the read failure is reported', failedText.includes('读取失败'), failedText.slice(0, 260))
+  check('and the note promises the save is still attempted', failedText.includes('保存仍会尝试写入'))
+  check('so the startup-path save stays enabled', fieldIn(failedPanel.tree()).save?.props?.disabled !== true,
+    JSON.stringify(fieldIn(failedPanel.tree()).save?.props?.disabled))
+  check('and the history save stays enabled too', historyFieldIn(failedPanel.tree()).save?.props?.disabled !== true)
+  check('a missing row is still called out as the opt-in problem',
+    !failedText.includes('当前配置未启用 WSL 终端'), failedText.slice(0, 260))
+  failedPanel.unmount()
+
+  // (4) A route that answers an error page surfaces a readable, Chinese reason - never a
+  // raw JSON SyntaxError in the panel.
+  const errorModel = makePanelModel({})
+  context.fetch = routeFetch({
+    '/dsh-wsl-tool/terminal-cwd': terminalAnswer,
+    '/dsh-wsl-tool/channel': {
+      ok: false,
+      status: 500,
+      json: () => Promise.reject(new SyntaxError("Unexpected token '<'")),
+    },
+  })
+  const errorPanel = mountStateful(main.component, { model: errorModel.model })
+  await errorPanel.flush()
+  const errorText = textOf(errorPanel.tree())
+  check('an error route reads as a readable Chinese error', errorText.includes('插件接口返回错误 500'), errorText.slice(0, 260))
+  check('and never leaks the JSON parser message', !errorText.includes('Unexpected token'), errorText.slice(0, 260))
+  errorPanel.unmount()
+
+  // (5) Two channel reads can settle out of order (a refresh pressed twice): only the newest
+  // answer may write the picker.
+  const sequenceModel = makePanelModel({})
+  const channelReads = []
+  context.fetch = routeFetch({
+    '/dsh-wsl-tool/terminal-cwd': terminalAnswer,
+    '/dsh-wsl-tool/channel': () => new Promise((resolve) => { channelReads.push(resolve) }),
+  })
+  const sequencePanel = mountStateful(main.component, { model: sequenceModel.model })
+  await sequencePanel.flush()
+  eq('the mount reads the channel once', channelReads.length, 1)
+  channelReads[0]({ ok: true, json: () => Promise.resolve({ available: true, sessions: [{ id: 's-old', title: '旧列表', activityAt: 1 }] }) })
+  await settleTicks()
+  const refreshButton = collect(sequencePanel.tree()).find((node) => node.type === 'button' && textOf(node) === '刷新')
+  refreshButton.props.onClick()
+  refreshButton.props.onClick()
+  await settleTicks()
+  eq('two refreshes are in flight', channelReads.length, 3)
+  channelReads[2]({ ok: true, json: () => Promise.resolve({ available: true, sessions: [{ id: 's-newest', title: '新列表', activityAt: 2 }] }) })
+  await settleTicks()
+  channelReads[1]({ ok: true, json: () => Promise.resolve({ available: true, sessions: [{ id: 's-stale', title: '旧列表', activityAt: 1 }] }) })
+  await settleTicks()
+  const picker = collect(sequencePanel.tree()).find((node) => node.type === 'button' && node.props?.['aria-expanded'] !== undefined)
+  picker.props.onClick()
+  await settleTicks()
+  const sequenceText = textOf(sequencePanel.tree())
+  check('the newest channel answer wins', sequenceText.includes('新列表') && !sequenceText.includes('旧列表'),
+    sequenceText.slice(0, 260))
+  sequencePanel.unmount()
+
+  // (6) The cold-start retry exists for a channel server that is not up yet, and only for that:
+  // an available host with no sessions is not read again (each read spawns a `wsl.exe`).
+  let retryCalls = 0
+  context.fetch = routeFetch({
+    '/dsh-wsl-tool/terminal-cwd': terminalAnswer,
+    '/dsh-wsl-tool/channel': () => {
+      retryCalls += 1
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve(retryCalls === 1
+          ? { available: false, sessions: [] }
+          : { available: true, sessions: [{ id: 's-1', title: '会话', activityAt: 1 }] }),
+      })
+    },
+  })
+  const retryPanel = mountStateful(main.component, { model: makePanelModel({}).model })
+  await retryPanel.flush()
+  eq('an unavailable channel is read once on mount', retryCalls, 1)
+  fireTimers((timer) => timer.ms === 900)
+  await settleTicks()
+  eq('and retried once the host may be up', retryCalls, 2)
+  retryPanel.unmount()
+  let emptyCalls = 0
+  context.fetch = routeFetch({
+    '/dsh-wsl-tool/terminal-cwd': terminalAnswer,
+    '/dsh-wsl-tool/channel': () => {
+      emptyCalls += 1
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ available: true, sessions: [] }) })
+    },
+  })
+  const quietPanel = mountStateful(main.component, { model: makePanelModel({}).model })
+  await quietPanel.flush()
+  fireTimers((timer) => timer.ms === 900)
+  await settleTicks()
+  eq('an available host with no sessions is not re-read', emptyCalls, 1)
+  quietPanel.unmount()
+
+  // (7) The 「?」 popover closes on Escape and on an outside pointer press.
+  context.fetch = routeFetch({
+    '/dsh-wsl-tool/terminal-cwd': terminalAnswer,
+    '/dsh-wsl-tool/channel': channelAnswer([]),
+  })
+  const helpPanel = mountStateful(main.component, { model: makePanelModel({}).model })
+  await helpPanel.flush()
+  // The tree keeps the HelpTip as an unexpanded element; mount that element on its own to drive
+  // its state (the panel's other state does not take part).
+  const helpElement = collect(helpPanel.tree()).find((node) => typeof node.type === 'function'
+    && typeof node.props?.text === 'string' && node.props.text !== '')
+  check('the panel renders an explanation control', helpElement !== undefined)
+  const tip = mountStateful(helpElement.type, helpElement.props)
+  await tip.flush()
+  const helpButton = collect(tip.tree()).find((node) => node.type === 'button' && node.props?.['aria-label'] === '说明')
+  const helpText = () => textOf(tip.tree()).includes('开关改动即时生效')
+  helpButton.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  await tip.flush()
+  check('the 「?」 popover opens', helpText())
+  dispatchDocument('keydown', { key: 'Escape' })
+  await settleTicks()
+  check('Escape closes it', !helpText())
+  helpButton.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  await tip.flush()
+  check('it opens again', helpText())
+  dispatchDocument('pointerdown', {})
+  await settleTicks()
+  check('an outside press closes it too', !helpText())
+  tip.unmount()
+  helpPanel.unmount()
+}
+
+// --- a configuration service that arrives after the panel -------------------
+//
+// `hasService()` is part of what the panel renders. A service injected a moment after the
+// seat used to leave the "this DSH has no configuration forms" note on screen for good —
+// the wrong diagnosis, which is exactly what the waiting note exists to avoid.
+console.log('\na late configuration service is not reported as missing')
+{
+  const lateRegistered = []
+  const deferredConfigForms = []
+  const lateCtx = {
+    slots: {
+      inject: (_seat, callback) => callback(),
+      register: (seat, component) => {
+        lateRegistered.push({ seat, component })
+        return () => {}
+      },
+    },
+    inject: (deps, callback) => {
+      // The terminal service stays absent (no polling); configForms is captured and answered
+      // by the test, after the panel has already rendered once.
+      if (deps.includes('configForms')) deferredConfigForms.push(callback)
+    },
+  }
+  mod.apply(lateCtx)
+  const lateMain = lateRegistered.find((row) => row.seat.name === 'main')
+  const lateProps = lateMain.seat.inject()
+  context.fetch = (url) => {
+    const target = String(url)
+    if (target === '/dsh-wsl-tool/terminal-cwd') {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ path: '', scrollback: 1000, available: true }) })
+    }
+    if (target === '/dsh-wsl-tool/channel') {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ available: true, sessions: [] }) })
+    }
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({}) })
+  }
+  const latePanel = mountStateful(lateMain.component, { ...lateProps })
+  await latePanel.flush()
+  check('before the service exists the panel says so', textOf(latePanel.tree()).includes('未提供配置表单服务'),
+    textOf(latePanel.tree()).slice(0, 200))
+  eq('the service callback really was deferred', deferredConfigForms.length, 1)
+  deferredConfigForms[0]({ configForms: { get: () => scope, whileServed: () => () => {} }, effect: () => () => {} })
+  await settleTicks()
+  const lateText = textOf(latePanel.tree())
+  check('an arriving service flips the note to waiting', lateText.includes('正在等待 Host'), lateText.slice(0, 260))
+  check('and the wrong diagnosis is gone', !lateText.includes('未提供配置表单服务'))
+  latePanel.unmount()
+}
 
 // --- the terminal bridge (the browser half of wsl-term collaboration) -------
 //
@@ -1320,7 +1727,8 @@ const flushBridgeEvents = async () => {
   bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-1', sessionId: 's-1', terminalId: 't-1' })
   await settleBridge()
   eq('an attach opens one view per attachment',
-    JSON.stringify(opened[0]), JSON.stringify(['s-1', 'dsh-wsl-bridge:a-1', 'dsh-wsl-bridge:a-1', 't-1']))
+    JSON.stringify(opened[0]),
+    JSON.stringify(['s-1', 'dsh-wsl-bridge:a-1', 'dsh-wsl-bridge:content:t-1', 't-1']))
   eq('and mounts it', view.mounts, 1)
   check('the attachment is announced to the next poll',
     bridgeFetch.pollCalls().some((call) => JSON.stringify(call.body?.attachments) === '["a-1"]'),
@@ -1486,14 +1894,17 @@ const flushBridgeEvents = async () => {
   applied.restore()
 }
 
-// (8) Event delivery: one retry after a network failure, then the batch is delivered.
+// (8) Event delivery: one retry after a network failure, then the batch is delivered. Priority
+// events (the command results) travel in their own batch, ahead of the screen frames, so the
+// first request is the one that gets retried and it must carry the result.
 {
   const bridgeFetch = makeBridgeFetch()
-  let eventAttempts = 0
+  const attempts = []
   const fetcher = (url, init) => {
     if (String(url) === BRIDGE_EVENTS_URL) {
-      eventAttempts += 1
-      if (eventAttempts === 1) return Promise.reject(new Error('offline'))
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : { events: [] }
+      attempts.push(body.events.map((event) => event.type).join(','))
+      if (attempts.length === 1) return Promise.reject(new Error('offline'))
     }
     return bridgeFetch.fetcher(url, init)
   }
@@ -1502,7 +1913,8 @@ const flushBridgeEvents = async () => {
   bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-1', sessionId: 's-1', terminalId: 't-1' })
   await settleBridge()
   await flushBridgeEvents()
-  eq('a failed event batch is retried once', eventAttempts, 2)
+  check('the first batch is the priority one', attempts[0] === 'result', JSON.stringify(attempts))
+  eq('a failed event batch is retried once, in order', attempts[1], 'result')
   check('and the retry delivers the command result',
     bridgeFetch.events().some((event) => event.type === 'result' && event.commandId === 'c-1'),
     JSON.stringify(bridgeFetch.events()))
@@ -1576,6 +1988,211 @@ const flushBridgeEvents = async () => {
   applied.restore()
   delete context.window.addEventListener
   delete context.window.removeEventListener
+}
+
+// (11) The content identity handed to `view()` is stable per terminal, while the view key
+// stays unique per attachment. The client terminal service saves one recovery binding per
+// (session, contentId) in localStorage and only `close()` removes it — which this half never
+// calls — so a per-attachment content id would leak one permanent key per tool call.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const views = []
+  const applied = applyBridge({
+    webTerminals: { view: (...args) => { views.push(args); return makeBridgeView() } },
+    fetch: bridgeFetch.fetcher,
+  })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-1', sessionId: 's-1', terminalId: 't-1' })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-2', kind: 'attach', attachmentId: 'a-2', sessionId: 's-1', terminalId: 't-1' })
+  await settleBridge()
+  eq('two attachments for one terminal share one content id', views[1]?.[2], views[0]?.[2])
+  eq('and that content id names the terminal', views[0]?.[2], 'dsh-wsl-bridge:content:t-1')
+  check('while the view key stays unique per attachment', views[0]?.[1] !== views[1]?.[1],
+    JSON.stringify([views[0]?.[1], views[1]?.[1]]))
+  applied.restore()
+}
+
+// (12) A terminal-service call that never settles must not park the poll loop: the command
+// times out (well past the Host's own 15 s attach deadline), the Host is told, and the loop
+// keeps serving later commands.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const view = makeBridgeView()
+  let recoverCalls = 0
+  const applied = applyBridge({
+    webTerminals: {
+      recover: () => {
+        recoverCalls += 1
+        if (recoverCalls === 1) return new Promise(() => {})
+        return Promise.resolve([])
+      },
+      view: () => view,
+    },
+    fetch: bridgeFetch.fetcher,
+  })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-1', sessionId: 's-1', terminalId: 't-1' })
+  await settleBridge()
+  eq('the hung attach has not answered yet',
+    bridgeFetch.events().some((event) => event.type === 'result'), false)
+  const pollsBefore = bridgeFetch.pollCalls().length
+  fireTimers((timer) => timer.ms === 20_000)
+  await settleBridge()
+  await flushBridgeEvents()
+  const timedOut = bridgeFetch.events().find((event) => event.type === 'result' && event.commandId === 'c-1')
+  eq('the command times out instead of running forever', timedOut?.ok, false)
+  check('and says why', String(timedOut?.error).includes('in time'), String(timedOut?.error))
+  check('the poll loop is still alive', bridgeFetch.pollCalls().length > pollsBefore)
+  bridgeFetch.push({ id: 'c-2', kind: 'attach', attachmentId: 'a-2', sessionId: 's-1', terminalId: 't-2' })
+  await settleBridge()
+  await settleBridge()
+  await flushBridgeEvents()
+  const second = bridgeFetch.events().find((event) => event.type === 'result' && event.commandId === 'c-2')
+  eq('a later command still runs after the timeout', second?.ok, true)
+  applied.restore()
+}
+
+// (13) One huge output frame is split into batches the Host accepts, without losing a byte
+// and without mixing a command result into a screen batch.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const view = makeBridgeView()
+  const applied = applyBridge({ webTerminals: { view: () => view }, fetch: bridgeFetch.fetcher })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-1', sessionId: 's-1', terminalId: 't-1' })
+  await settleBridge()
+  await flushBridgeEvents()
+  const before = bridgeFetch.eventCalls().length
+  const big = 'x'.repeat(2 * 1024 * 1024)
+  view.patch({ render: { revision: 1, frame: { type: 'output', data: big } } })
+  await flushBridgeEvents()
+  await settleBridge()
+  const batches = bridgeFetch.eventCalls().slice(before)
+  check('one oversized frame becomes several event batches', batches.length > 1, String(batches.length))
+  const delivered = batches.flatMap((call) => call.body?.events ?? []).filter((event) => event.type === 'output')
+  eq('the output is delivered whole and in order', delivered.map((event) => event.data).join(''), big)
+  check('every batch stays inside the size the Host accepts',
+    batches.every((call) => (call.body?.events ?? [])
+      .reduce((sum, event) => sum + JSON.stringify(event).length * 3 + 32, 0) <= 1024 * 1024))
+  check('no batch mixes a command result into screen frames', batches.every((call) => {
+    const types = (call.body?.events ?? []).map((event) => event.type)
+    const priority = types.filter((type) => type === 'result' || type === 'error' || type === 'inventory').length
+    return priority === 0 || priority === types.length
+  }))
+  applied.restore()
+}
+
+// (14) The last batch on unload rides a keepalive request, so the Host learns what the
+// terminal said instead of waiting out its own deadline — and it stays inside the keepalive cap.
+// (Command results flush immediately now, so the queued event here is the frame batch that is
+// still waiting for its 50 ms timer.)
+{
+  const added = []
+  const removed = []
+  context.window.addEventListener = (name, handler) => added.push({ name, handler })
+  context.window.removeEventListener = (name, handler) => removed.push({ name, handler })
+  const bridgeFetch = makeBridgeFetch()
+  const view = makeBridgeView()
+  const applied = applyBridge({ webTerminals: { view: () => view }, fetch: bridgeFetch.fetcher })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-1', sessionId: 's-1', terminalId: 't-1' })
+  await settleBridge()
+  // A writable change pushes a state frame, which is deliberately batched (not urgent).
+  view.patch({ writable: false })
+  await settleBridge()
+  const unload = added.find((entry) => entry.name === 'pagehide')
+  unload.handler()
+  await settleBridge()
+  const finalCall = bridgeFetch.eventCalls().pop()
+  eq('the unload batch is sent with keepalive', finalCall?.init?.keepalive, true)
+  check('and stays inside the browser keepalive cap',
+    JSON.stringify(finalCall?.body).length * 3 <= 64 * 1024, String(JSON.stringify(finalCall?.body)?.length))
+  check('the still-queued frame made it into that batch',
+    (finalCall?.body?.events ?? []).some((event) => event.type === 'state'),
+    JSON.stringify((finalCall?.body?.events ?? []).map((event) => event.type)))
+  applied.restore()
+  delete context.window.addEventListener
+  delete context.window.removeEventListener
+}
+
+// (15) The browser terminal inventory refetches a cached-empty list before answering "there
+// are none": an empty shared cache is not the same fact as a session without terminals.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const reads = []
+  const inventory = {
+    items: new Map(),
+    read: (refresh) => {
+      reads.push(refresh)
+      return Promise.resolve(new Map())
+    },
+  }
+  const applied = applyBridge({
+    webTerminals: {
+      inventory: () => inventory,
+      view: () => makeBridgeView(),
+    },
+    fetch: bridgeFetch.fetcher,
+  })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'inventory', sessionId: 's-1' })
+  await settleBridge()
+  await flushBridgeEvents()
+  eq('the inventory refresh is requested with the refresh flag', reads[0], true)
+  const answer = bridgeFetch.events().find((event) => event.type === 'inventory' && event.commandId === 'c-1')
+  eq('and the inventory answer is reported', JSON.stringify(answer?.terminals), '[]')
+  applied.restore()
+}
+
+// (16) Latency: a command result and the first screen must not wait for the 50 ms batch
+// timer. A run used to pay that timer for every acknowledgement (measured: 247.9 ms for a run
+// whose work is 4.9 ms), while streamed output should still be batched.
+{
+  const bridgeFetch = makeBridgeFetch()
+  const view = makeBridgeView()
+  const applied = applyBridge({ webTerminals: { view: () => view }, fetch: bridgeFetch.fetcher })
+  await settleBridge()
+  bridgeFetch.push({ id: 'c-1', kind: 'attach', attachmentId: 'a-1', sessionId: 's-1', terminalId: 't-1' })
+  await settleBridge()
+  await settleBridge()
+  const attachResult = bridgeFetch.events().find((event) => event.type === 'result' && event.commandId === 'c-1')
+  eq('the command result is delivered without the batch timer', attachResult?.ok, true)
+  check('an attach costs at most two event batches', bridgeFetch.eventCalls().length <= 2,
+    String(bridgeFetch.eventCalls().length))
+  bridgeFetch.push({ id: 'c-2', kind: 'write', attachmentId: 'a-1', data: 'ls\r' })
+  await settleBridge()
+  await settleBridge()
+  const writeResult = bridgeFetch.events().find((event) => event.type === 'result' && event.commandId === 'c-2')
+  eq('a write acknowledgement is delivered without the batch timer too', writeResult?.ok, true)
+  // The first screen is what the Host's frame loop waits for before it can type.
+  view.patch({
+    render: {
+      revision: 1,
+      frame: {
+        type: 'snapshot', screen: 'ready',
+        info: { id: 't-1', title: 'WSL', state: 'running', cols: 120, rows: 30 },
+        writable: true,
+      },
+    },
+  })
+  await settleBridge()
+  await settleBridge()
+  check('the first snapshot is delivered without the batch timer',
+    bridgeFetch.events().some((event) => event.type === 'snapshot'))
+  eq('every frame is still acknowledged', JSON.stringify(view.acks), '[1]')
+  // Streaming output stays batched: one request per frame would be worse than the latency.
+  const callsBefore = bridgeFetch.eventCalls().length
+  view.patch({ render: { revision: 2, frame: { type: 'output', data: 'partial line' } } })
+  await settleBridge()
+  await settleBridge()
+  eq('a streamed frame waits for the batch timer', bridgeFetch.eventCalls().length, callsBefore)
+  fireTimers((timer) => timer.ms === 50)
+  await settleBridge()
+  await settleBridge()
+  check('and it is delivered when the timer fires',
+    bridgeFetch.events().some((event) => event.type === 'output' && event.data === 'partial line'))
+  applied.restore()
 }
 
 // The documented counts are hand-written and drift on every commit; this suite knows its own

@@ -10,8 +10,9 @@
 # the panel overwrites this file on every install.
 set -u
 
-# Filled in by the plugin when it installs this script (a /mnt/<drive>/... path).
-CONFIG='__CHANNEL_CONFIG__'
+# Filled in by the plugin when it installs this script: a shell-quoted /mnt/<drive>/... path
+# (single quotes included, so a Windows profile with spaces or a quote still parses).
+CONFIG=__CHANNEL_CONFIG__
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dsh-wsl"
 # The current session is per TERMINAL: one shared file made `dsh use`/`new` in one window
 # silently retarget another window (both are the same user, different conversations).
@@ -55,7 +56,23 @@ EOF
 
 # Read the few fields this shim needs with bash builtins only. This used to be a dozen
 # grep/sed/head forks on EVERY command — that alone was most of the delay of `dsh use`, which
-# touches no network at all.
+# touches no network at all. The parser is deliberately indifferent to the JSON writer's
+# spacing: the value is stripped of the key, a trailing comma, whitespace (CRLF included) and
+# optional quotes, so a reformatted channel.json still reads the same.
+parse_value() {
+  VALUE=${1#*:}
+  # Whitespace first (a CR from a CRLF checkout would otherwise hide the comma), then the
+  # comma, then whitespace/quotes again.
+  VALUE=${VALUE#"${VALUE%%[![:space:]]*}"}
+  VALUE=${VALUE%"${VALUE##*[![:space:]]}"}
+  VALUE=${VALUE%,}
+  VALUE=${VALUE#"${VALUE%%[![:space:]]*}"}
+  VALUE=${VALUE%"${VALUE##*[![:space:]]}"}
+  VALUE=${VALUE#\"}
+  VALUE=${VALUE%\"}
+  VALUE=${VALUE%"${VALUE##*[![:space:]]}"}
+}
+
 read_config() {
   TOKEN=''
   PORT=''
@@ -63,42 +80,31 @@ read_config() {
   DEFAULT_SESSION=''
   STARTED=''
   HOST=''
-  local line value
-  while IFS= read -r line; do
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       *'"token"'*)
-        value=${line#*: }
-        value=${value%,}
-        value=${value#\"}
-        value=${value%\"}
-        TOKEN=$value
+        parse_value "$line"
+        TOKEN=$VALUE
         ;;
       *'"port"'*)
-        value=${line#*: }
-        value=${value%,}
-        PORT=${value//[!0-9]/}
+        parse_value "$line"
+        PORT=${VALUE//[!0-9]/}
         ;;
       *'"enabled"'*)
         case "$line" in *true*) ENABLED=1 ;; esac
         ;;
       *'"sessionId"'*)
-        value=${line#*: }
-        value=${value%,}
-        value=${value#\"}
-        value=${value%\"}
-        DEFAULT_SESSION=$value
+        parse_value "$line"
+        DEFAULT_SESSION=$VALUE
         ;;
       *'"startedAt"'*)
-        value=${line#*: }
-        value=${value%,}
-        STARTED=${value//[!0-9]/}
+        parse_value "$line"
+        STARTED=${VALUE//[!0-9]/}
         ;;
       *'"host"'*)
-        value=${line#*: }
-        value=${value%,}
-        value=${value#\"}
-        value=${value%\"}
-        HOST=$value
+        parse_value "$line"
+        HOST=$VALUE
         ;;
     esac
   done < "$CONFIG"
@@ -134,7 +140,9 @@ load_channel() {
   local candidate
   for candidate in curl curl.exe; do
     command -v "$candidate" >/dev/null 2>&1 || continue
-    if "$candidate" -sS --connect-timeout 0.25 --max-time 1 "$BASE/state" >/dev/null 2>&1; then
+    # /state authenticates like every other route; the token was just read from the same file.
+    if "$candidate" -sS --connect-timeout 0.25 --max-time 1 \
+      -H "x-dsh-wsl-token: $TOKEN" "$BASE/state" >/dev/null 2>&1; then
       CURL=$candidate
       break
     fi
@@ -142,7 +150,8 @@ load_channel() {
   # Windows' own curl can reach a host that only listens on the host adapter, and the
   # service may bind loopback instead; try the Windows loopback last.
   if [ -z "$CURL" ] && command -v curl.exe >/dev/null 2>&1 \
-    && curl.exe -sS --connect-timeout 0.25 --max-time 1 "http://127.0.0.1:$PORT/state" >/dev/null 2>&1; then
+    && curl.exe -sS --connect-timeout 0.25 --max-time 1 \
+      -H "x-dsh-wsl-token: $TOKEN" "http://127.0.0.1:$PORT/state" >/dev/null 2>&1; then
     CURL=curl.exe
     BASE="http://127.0.0.1:$PORT"
   fi
@@ -182,11 +191,11 @@ post_once() {
     "$CURL" -sS "${extra[@]}" --max-time "$timeout" -X POST \
       -H "x-dsh-wsl-token: $TOKEN" \
       -H "x-dsh-wsl-session: $session" \
-      --data-binary "$body" "$BASE/$route"
+      --data-raw "$body" "$BASE/$route"
   else
     "$CURL" -sS "${extra[@]}" --max-time "$timeout" -X POST \
       -H "x-dsh-wsl-token: $TOKEN" \
-      --data-binary "$body" "$BASE/$route"
+      --data-raw "$body" "$BASE/$route"
   fi
 }
 
@@ -216,6 +225,7 @@ cmd_list() {
   case "$out" in
     err*) die "${out#err	}" ;;
   esac
+  if [ "$out" = "ok"$'\t'"(no sessions)" ]; then printf '(没有会话)\n'; return; fi
   printf '%s\n' "$out" | awk -F'\t' '
     NF == 0 { next }
     { mark = ($5 == "*") ? "*" : " "; printf "%s %-28s %s\n", mark, $1, ($2 == "" ? "(未命名)" : $2) }
@@ -268,22 +278,25 @@ cmd_insert() {
 }
 
 cmd_status() {
-  local state session_line landing
-  state=$("$CURL" -sS --connect-timeout 1 --max-time 3 "$BASE/state" 2>/dev/null) || {
+  local state session_line landing state_line
+  state=$("$CURL" -sS --connect-timeout 1 --max-time 3 -H "x-dsh-wsl-token: $TOKEN" "$BASE/state" 2>/dev/null) || {
     # The cached transport can go stale between two commands (channel restarted, firewall
     # changed): forget it and settle the current one instead of failing once.
     rm -f "$TRANSPORT_FILE"
     load_channel
-    state=$("$CURL" -sS --connect-timeout 1 --max-time 3 "$BASE/state" 2>/dev/null) \
+    state=$("$CURL" -sS --connect-timeout 1 --max-time 3 -H "x-dsh-wsl-token: $TOKEN" "$BASE/state" 2>/dev/null) \
       || die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？"
   }
+  # A wrong token is a real channel answer now: say it instead of printing it as "state".
+  case "$state" in
+    err*) die "${state#err	}" ;;
+  esac
   session_line=$(current_session)
   [ -n "$session_line" ] || session_line='默认（最近活跃会话）'
   CURRENT_SESSION=$session_line
   # The Host's channel landing (panel setting) and this shell's current session can differ;
   # naming them apart is what stops one being mistaken for the other. Parsed with builtins:
   # `dsh status` should not pay for sed/tr forks on a line of text.
-  local state_line
   landing=''
   while IFS= read -r state_line; do
     case "$state_line" in
@@ -298,26 +311,57 @@ cmd_status() {
 }
 
 # Stream one turn: `~`-prefixed frames, `~s`/`~a` carry base64 chunks of raw text.
+# A connection that fails BEFORE the first frame forgets the cached transport and retries once
+# (the recovery the management routes already had); anything after the first frame is not
+# retried, so a prompt is never delivered twice.
 cmd_say() {
   local session=$1 prompt=$2
   local reason=0 ended=0 line ms steps tin tout breason ok text_reason
   local ticker='' reason_start=0 ack_ticker='' ack_start=0
-  local shell_pid=$$ balance_pid='' balance_file=''
+  local shell_pid=$$ balance_pid='' balance_file='' say_status='' tick_fd=''
+  local got_frame=0 attempt=0 say_exit=0
   # The account wallet is fetched in the background from the moment the Host accepts the turn,
-  # so the end-of-turn line costs nothing: by the time the reply finishes it is already there.
+  # so the end-of-turn line normally costs nothing. It has its own 3 s budget and is never
+  # retried: a slow account service must not hold the prompt open after the answer is printed.
   prefetch_balance() {
     [ -n "$balance_pid" ] && return
     balance_file="$STATE_DIR/balance.$$"
-    ( post balance > "$balance_file" 2>/dev/null ) &
+    ( exec "$CURL" -sS --max-time 3 -X POST -H "x-dsh-wsl-token: $TOKEN" --data-raw '' "$BASE/balance" > "$balance_file" 2>/dev/null ) &
     balance_pid=$!
+  }
+  cleanup_balance() {
+    if [ -n "${balance_pid:-}" ]; then
+      kill "$balance_pid" 2>/dev/null
+      wait "$balance_pid" 2>/dev/null
+      balance_pid=''
+    fi
+    if [ -n "${balance_file:-}" ]; then
+      rm -f "$balance_file"
+      balance_file=''
+    fi
+  }
+  cleanup_say() {
+    if [ -n "${say_status:-}" ]; then
+      rm -f "$say_status"
+      say_status=''
+    fi
   }
   report_balance() {
     [ -n "$balance_pid" ] || return
+    local waited=0 reply='' body=''
+    # Wait at most ~0.6 s, then abandon the request: the answer is already on screen and the
+    # balance is a convenience, never a reason to keep the shell waiting.
+    while [ "$waited" -lt 6 ] && kill -0 "$balance_pid" 2>/dev/null; do
+      [ -s "$balance_file" ] && break
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    if kill -0 "$balance_pid" 2>/dev/null; then kill "$balance_pid" 2>/dev/null; fi
     wait "$balance_pid" 2>/dev/null
     balance_pid=''
-    local reply='' body=''
     if [ -r "$balance_file" ]; then IFS= read -r reply < "$balance_file"; fi
     rm -f "$balance_file"
+    balance_file=''
     case "$reply" in
       ok*)
         body=${reply#ok}
@@ -342,14 +386,46 @@ cmd_say() {
       printf '\r\033[2K'
     fi
   }
+  # One microsecond clock read without a fork: bash 5's $EPOCHREALTIME is a special variable
+  # (all digits after the filter). Older bash falls back to `date`, and the wait to `sleep`.
+  clock_us() {
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+      CLOCK_US=${EPOCHREALTIME//[!0-9]/}
+    else
+      CLOCK_US=$(($(date +%s%N) / 1000))
+    fi
+  }
+  # Zero-fork tick: a FIFO held open read-write gives `read -t` a blocking descriptor that never
+  # data or EOF, so a 0.2 s tick costs no `date` and no `sleep` process. The FIFO is unlinked at
+  # once; the descriptor (8) stays valid for this process and its ticker subshells.
+  ensure_tick_fd() {
+    [ -n "${tick_fd:-}" ] && return
+    local fifo="${TMPDIR:-/tmp}/dsh-wsl-tick.$$"
+    if mkfifo "$fifo" 2>/dev/null && exec 8<>"$fifo" 2>/dev/null; then
+      rm -f "$fifo"
+      tick_fd=8
+      return
+    fi
+    rm -f "$fifo" 2>/dev/null
+    tick_fd='none'
+  }
+  tick_wait() {
+    if [ "${tick_fd:-none}" = 8 ]; then
+      read -r -t 0.2 -u 8 _ || true
+    else
+      sleep 0.2
+    fi
+  }
   start_ack_ticker() {
-    ack_start=$(date +%s%3N)
+    ensure_tick_fd
+    clock_us
+    ack_start=$CLOCK_US
     (
       while kill -0 "$shell_pid" 2>/dev/null; do
-        now=$(date +%s%3N)
-        total=$(( (now - ack_start) / 1000 ))
+        clock_us
+        total=$(( (CLOCK_US - ack_start) / 1000000 ))
         printf '\r\033[2m… 已送达，等待模型 %d分%02d秒\033[0m' $((total / 60)) $((total % 60))
-        sleep 0.2
+        tick_wait
       done
     ) &
     ack_ticker=$!
@@ -369,65 +445,97 @@ cmd_say() {
     reason=2
   }
   # A host crash or a closed connection ends the stream WITHOUT the frames that stop the
-  # clock; without this the ticker would keep printing on this terminal forever.
-  trap 'stop_reason' INT TERM
-  local -a rest
-  while IFS= read -r line; do
-    case "$line" in
-      '~ack') start_ack_ticker; prefetch_balance ;;
-      '~r '*)
-        stop_ack_ticker
-        ms=${line#'~r '}
-        if [ "$reason" != 1 ]; then
-          reason=1
-          reason_start=$(date +%s%3N)
-          (
-            while kill -0 "$shell_pid" 2>/dev/null; do
-              now=$(date +%s%3N)
-              elapsed=$((now - reason_start + ms))
-              total=$((elapsed / 1000))
-              printf '\r\033[2m⏱ 思考中… %d分%02d秒\033[0m' $((total / 60)) $((total % 60))
-              sleep 0.2
-            done
-          ) &
-          ticker=$!
-        fi
-        ;;
-      '~t '*) stop_reason ;;
-      '~a '*) stop_ack_ticker; stop_reason; printf '%s' "${line#'~a '}" | base64 -d ;;
-      '~step '*) ;;
-      '~p') ;;
-      '~x '*)
-        stop_reason
-        [ -n "$balance_pid" ] && kill "$balance_pid" 2>/dev/null
-        text_reason=$(printf '%s' "${line#'~x '}" | base64 -d)
-        printf '\ndsh: %s\n' "$text_reason" >&2
-        exit 1
-        ;;
-      '~e '*)
-        stop_reason
-        read -r _ ok ms steps tin tout breason <<< "$line"
-        text_reason=$(printf '%s' "${breason:-}" | base64 -d 2>/dev/null)
-        printf '\n'
-        printf '✓ 完成 %d.%01ds · %s 步 · in %s / out %s tok%s\n' \
-          $((ms / 1000)) $(((ms % 1000) / 100)) "$steps" "$tin" "$tout" \
-          "${text_reason:+ (${text_reason})}"
-        # A large landing conversation is the usual reason a terminal turn takes seconds: each
-        # message re-sends its whole context. Naming the cause beats letting it look like lag.
-        if [ "${tin:-0}" -gt 50000 ] 2>/dev/null; then
-          printf '提示：目标会话上下文较大（in %s tok），每回合都要重发；终端聊天可先 %s 建一个精简会话\n' \
-            "$tin" '`dsh new terminal`' >&2
-        fi
-        report_balance
-        ended=1
-        [ "$ok" = 1 ] && exit 0 || exit 1
-        ;;
-      'err'*) stop_ack_ticker; [ -n "$balance_pid" ] && kill "$balance_pid" 2>/dev/null; die "${line#err	}" ;;
-      *) printf '%s\n' "$line" ;;
-    esac
-  done < <(post say "$prompt" "$session")
+  # clock; without this the ticker would keep printing on this terminal forever. The same
+  # handler releases the balance request and its temp file on every interruption path.
+  trap 'stop_reason; cleanup_balance; cleanup_say' INT TERM
+  stream_turn() {
+    got_frame=0
+    say_status="$STATE_DIR/say.$$"
+    while IFS= read -r line; do
+      got_frame=1
+      case "$line" in
+        '~ack') start_ack_ticker; prefetch_balance ;;
+        '~r '*)
+          stop_ack_ticker
+          ms=${line#'~r '}
+          ms=${ms//[!0-9]/}
+          [ -n "$ms" ] || ms=0
+          if [ "$reason" != 1 ]; then
+            reason=1
+            ensure_tick_fd
+            clock_us
+            reason_start=$CLOCK_US
+            (
+              while kill -0 "$shell_pid" 2>/dev/null; do
+                clock_us
+                elapsed=$(( (CLOCK_US - reason_start) / 1000 + ms ))
+                total=$((elapsed / 1000))
+                printf '\r\033[2m⏱ 思考中… %d分%02d秒\033[0m' $((total / 60)) $((total % 60))
+                tick_wait
+              done
+            ) &
+            ticker=$!
+          fi
+          ;;
+        '~t '*) stop_reason ;;
+        '~a '*) stop_ack_ticker; stop_reason; printf '%s' "${line#'~a '}" | base64 -d ;;
+        '~step '*) ;;
+        '~p') ;;
+        '~x '*)
+          stop_reason
+          cleanup_balance
+          cleanup_say
+          text_reason=$(printf '%s' "${line#'~x '}" | base64 -d)
+          printf '\ndsh: %s\n' "$text_reason" >&2
+          exit 1
+          ;;
+        '~e '*)
+          stop_reason
+          read -r _ ok ms steps tin tout breason <<< "$line"
+          ms=${ms:-0}
+          ms=${ms//[!0-9]/}
+          text_reason=$(printf '%s' "${breason:-}" | base64 -d 2>/dev/null)
+          printf '\n'
+          printf '✓ 完成 %d.%01ds · %s 步 · in %s / out %s tok%s\n' \
+            $((ms / 1000)) $(((ms % 1000) / 100)) "$steps" "$tin" "$tout" \
+            "${text_reason:+ (${text_reason})}"
+          # A large landing conversation is the usual reason a terminal turn takes seconds: each
+          # message re-sends its whole context. Naming the cause beats letting it look like lag.
+          if [ "${tin:-0}" -gt 50000 ] 2>/dev/null; then
+            printf '提示：目标会话上下文较大（in %s tok），每回合都要重发；终端聊天可先 %s 建一个精简会话\n' \
+              "$tin" '`dsh new terminal`' >&2
+          fi
+          report_balance
+          cleanup_say
+          ended=1
+          [ "$ok" = 1 ] && exit 0 || exit 1
+          ;;
+        'err'*) stop_ack_ticker; cleanup_balance; cleanup_say; die "${line#err	}" ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < <(post say "$prompt" "$session"; printf '%s' "$?" > "$say_status")
+  }
+  stream_turn
+  if [ -r "$say_status" ]; then IFS= read -r say_exit < "$say_status"; fi
+  cleanup_say
+  # No frame at all + curl failed means the cached transport is wrong, not the turn: forget it,
+  # re-probe, and try once more (management routes already recover from a stale cache this way).
+  if [ "$got_frame" = 0 ] && [ "${say_exit:-0}" != 0 ] && [ "$attempt" = 0 ]; then
+    attempt=1
+    rm -f "$TRANSPORT_FILE"
+    load_channel || return 1
+    stream_turn
+    if [ -r "$say_status" ]; then IFS= read -r say_exit < "$say_status"; fi
+    cleanup_say
+  fi
   stop_reason
-  [ "$ended" = 1 ] || { printf '\n' >&2; die "连接在回合结束前断开"; }
+  cleanup_balance
+  if [ "$ended" = 1 ]; then return 0; fi
+  printf '\n' >&2
+  if [ "${say_exit:-0}" != 0 ] && [ "$got_frame" = 0 ]; then
+    die "连不上 DSH 宿主（$BASE）—— 桌面版在运行吗？通道在面板里启用了吗？"
+  fi
+  die "连接在回合结束前断开"
 }
 
 # ---------------------------------------------------------------- entry point

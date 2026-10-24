@@ -1,27 +1,33 @@
 // dsh-wsl: model-facing WSL tools for DeepSeek Harness (DSH).
 //
-// Registers up to three tools, each one switchable from the plugin's
-// left-sidebar panel:
-//   - `wsl`      : run a Linux command through wsl.exe, returning stdout/stderr
-//                  with exit-code / signal / timeout / truncation markers.
-//   - `wsl-path` : convert between Windows and WSL paths via `wslpath`.
-//   - `wsl-env`  : summarize the WSL environment (distros, kernel, cpu, mem,
-//                  disk) so an agent knows what it is running on.
+// Registers up to six tools, each one switchable from the plugin's left-sidebar
+// panel (`wsl-term` has no switch: opening a terminal is the consent it needs):
+//   - `wsl`          : run a Linux command through wsl.exe, returning stdout/stderr
+//                      with exit-code / signal / timeout / truncation markers.
+//   - `wsl-path`     : convert between Windows and WSL paths via `wslpath`.
+//   - `wsl-env`      : summarize the WSL environment (distros, kernel, cpu, mem,
+//                      disk) so an agent knows what it is running on.
+//   - `wsl-doctor`   : compare a project's toolchain with what the distro really has.
+//   - `wsl-bootstrap`: install a fixed toolchain recipe inside the distro (dry run first).
+//   - `wsl-term`     : drive the session's own terminal / a private PTY across steps.
 //
-// Each call runs in a fresh shell, so no state persists between calls. This
-// plugin publishes nothing and only consumes the host-plane `subprocess` and
-// `tools` registries, so it needs no realm. Its own `cordis.patch.yml` inserts
-// the `tool-wsl` row process-wide, which is why the tools reach every agent
-// preset with no preset entry of its own (and why adding one there would fail).
+// `wsl` runs each command in a fresh shell, so no state persists between its calls;
+// `wsl-term` is the one shell that does. This plugin publishes nothing into an agent
+// preset — its own `cordis.patch.yml` inserts the `tool-wsl` row process-wide, which is
+// why the tools reach every preset with no preset entry of its own (and why adding one
+// there would fail). It consumes the host-plane `tools` and `subprocess` registries and
+// reads a few optional services at call time (`jobs`, `webServer`, `profileContext`,
+// `terminalController`, `spillStore`, `shellEnv`); every one of them may be absent.
 //
 // The implementation lives in `lib/`: `config` (defaults, environment overrides
 // and the plugin's own switches), `paths` (path translation and shell quoting),
 // `guard` (the destructive-command rules), `result` (markers and truncation),
-// `runner` (the one spawn path), `tools/` (the three tool definitions) and
-// `client.js` (the sidebar panel, a separate web-platform bundle).
+// `runner` (the one spawn path), `tools/` (the tool definitions), `terminal*` /
+// `pty-transport` / `term-bridge` (the terminal engine) and `client.js` (the
+// sidebar panel, a separate web-platform bundle).
 //
-// A configuration change is a mount, not something a running session re-reads:
-// every switch below is consulted once, in `apply`.
+// A configuration change is a mount, not something a running session re-reads: every
+// switch below is consulted once, in `apply`, and re-read in place on a volatile update.
 
 import { copyFileSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
@@ -799,18 +805,26 @@ export function apply(ctx, settings = {}) {
         // this route has no session of its own. A `?session=` names the dock's own conversation
         // so the terminals the USER opened can be listed as records beside the subtasks (owner
         // request), labelled as user-created and ended only once the terminal is gone.
+        // The dock names its own conversation with `?session=`: that request assembles THAT
+        // conversation only, asks the terminal transport for its inventory at most ONCE, and
+        // answers user-terminal records plus the conversation's subtasks. Without the parameter
+        // every conversation the log has seen is returned with its owned-shell liveness only —
+        // the browser reads one key, so paying a page round trip per historical session (the
+        // client polls every 2 s) buys nothing. A failure answers a structured 500: a hung
+        // response would leave the dock's poll loop waiting forever, because its fetch has no
+        // timeout of its own.
         publish(SUBTASK_ROUTE, async (request, response) => {
           if (request.method !== 'GET') {
             response.writeHead(405, { allow: 'GET' })
             response.end()
             return
           }
-          const sessions = {}
           // The transport is what keeps the row honest: an entry whose terminal no longer
-          // exists reads as closed, whatever the log last heard. Read once per session; its
-          // absence is not an error — the projection falls back to what the log recorded.
+          // exists reads as closed, whatever the log last heard. Its absence is not an error —
+          // the projection falls back to what the log recorded.
           const controller = terminalTransport
-          const listOf = async (sessionId) => {
+          /** The shells THIS plugin opened for one conversation (sync; no page needed). */
+          const ownedOf = (sessionId) => {
             const found = []
             const seen = new Set()
             const add = (info) => {
@@ -827,74 +841,47 @@ export function apply(ctx, settings = {}) {
                 // The projection falls back to the last snapshot; nothing else to do here.
               }
             }
-            // The transport's `list` only reports the shells this plugin opened. The liveness
-            // lookup needs the user's terminals too, or their record would read as closed while
-            // they are very much open.
-            if (controller !== null && typeof controller.userTerminals === 'function') {
-              try {
-                const listed = await controller.userTerminals(sessionId)
-                if (Array.isArray(listed)) for (const info of listed) add(info)
-              } catch {
-                // Same fallback as above.
-              }
-            }
             return found
           }
-          let wanted = ''
-          try {
-            wanted = new URL(String(request.url ?? '/'), 'http://localhost').searchParams.get('session') ?? ''
-          } catch {
-            wanted = ''
-          }
-          if (wanted !== '') {
-            let shared = null
-            if (controller !== null && typeof controller.userTerminals === 'function') {
-              try {
-                const listed = await controller.userTerminals(wanted)
-                if (Array.isArray(listed)) shared = listed
-              } catch {
-                shared = null
-              }
-            }
-            for (const info of shared ?? []) {
-              const id = String(info?.id ?? '')
-              if (id === '') continue
-              const mine = subtasks.list(wanted).entries
-                .filter((entry) => entry.terminalCreated !== true && String(entry.terminalId) === id)
-              const record = mine.find((entry) => entry.userTerminal === true)
-              if (record !== undefined) {
-                // Refresh the stored description; the title and the flag stay as they are.
-                subtasks.start(wanted, record.title, { terminalId: id, terminalCreated: false, terminalSnapshot: info })
-                continue
-              }
-              // A normal subtask that an explicit call recorded on this terminal stays as it
-              // is; the terminal gets its own record beside it. Titles are unique across the
-              // USER-TERMINAL records, not just this id's: a closed terminal's record keeps its
-              // title (and must read as ended), and a re-created tab with the same shell name
-              // gets a "#2" of its own instead of rewriting the old record in place.
-              const base = `用户建立的终端「${info?.title ?? 'WSL'}」`
-              const taken = new Set(subtasks.list(wanted).entries
-                .filter((entry) => entry.userTerminal === true)
-                .map((entry) => entry.title))
-              let title = base
-              for (let index = 2; taken.has(title); index += 1) title = `${base} #${index}`
-              const created = subtasks.start(wanted, title, {
-                terminalId: id,
-                terminalCreated: false,
-                terminalSnapshot: info,
-              })
-              created.userTerminal = true
+          /** The terminals the USER opened; only a live page can answer (one round trip). */
+          const inventoryOf = async (sessionId) => {
+            if (controller === null || typeof controller.userTerminals !== 'function') return []
+            try {
+              const listed = await controller.userTerminals(sessionId)
+              return Array.isArray(listed) ? listed : []
+            } catch {
+              return []
             }
           }
-          const sessionIds = Object.keys(subtasks.snapshot())
-          if (wanted !== '' && !sessionIds.includes(wanted)) sessionIds.push(wanted)
-          for (const sessionId of sessionIds) {
+          const sessions = {}
+          /**
+           * Project one conversation's log against the shell descriptions that are live now.
+           * @param {string} sessionId - conversation to project.
+           * @param {Array<object>} live - terminal descriptions that still exist.
+           * @param {{ reconcile?: boolean }} [options] - `reconcile` retires user-terminal records
+           *   whose shell is gone. It is only allowed when `live` really is the full inventory (the
+           *   `?session=` path); the no-parameter path only knows owned shells, so a user terminal
+           *   would look closed there.
+           */
+          const project = (sessionId, live, options = {}) => {
             const log = subtasks.list(sessionId)
-            const live = await listOf(sessionId)
             const byId = new Map((Array.isArray(live) ? live : []).map((info) => [String(info?.id), info]))
-            const entries = log.entries.map((entry) => (entry.terminalId === null
-              ? projectSubtask(entry)
-              : projectSubtask(entry, byId.get(String(entry.terminalId)) ?? null)))
+            const entries = log.entries.map((entry) => {
+              const projected = entry.terminalId === null
+                ? projectSubtask(entry)
+                : projectSubtask(entry, byId.get(String(entry.terminalId)) ?? null)
+              if (options.reconcile === true && entry.userTerminal === true
+                && entry.status !== 'done' && projected.status === 'done') {
+                // The shell is gone (the user closed the tab) but the record still says running.
+                // Closing it here is what lets the log's own trim() reclaim the entry instead of
+                // holding it for the whole run as an eternally-open row.
+                subtasks.finish(sessionId, entry.title, {
+                  result: projected.result ?? '终端已关闭',
+                  terminalKept: false,
+                })
+              }
+              return projected
+            })
             sessions[sessionId] = {
               total: log.total,
               // A terminal the user keeps open is not "a subtask running": count real work only.
@@ -902,11 +889,69 @@ export function apply(ctx, settings = {}) {
               entries,
             }
           }
-          response.writeHead(200, {
-            'content-type': 'application/json; charset=utf-8',
-            'cache-control': 'no-store',
-          })
-          response.end(JSON.stringify({ sessions }))
+          /** Whether a stored terminal description differs enough to be worth rewriting. */
+          const descriptionChanged = (stored, info) => stored === null || stored === undefined
+            || String(stored.title ?? '') !== String(info?.title ?? '')
+            || String(stored.state ?? '') !== String(info?.state ?? '')
+            || String(stored.cwd ?? '') !== String(info?.cwd ?? '')
+          try {
+            let wanted = ''
+            try {
+              wanted = new URL(String(request.url ?? '/'), 'http://localhost').searchParams.get('session') ?? ''
+            } catch {
+              wanted = ''
+            }
+            if (wanted !== '') {
+              // ONE inventory read for the whole request: it is what lists the user's own
+              // terminals as records and what keeps their rows from reading as closed.
+              const shared = await inventoryOf(wanted)
+              for (const info of shared) {
+                const id = String(info?.id ?? '')
+                if (id === '') continue
+                const log = subtasks.list(wanted)
+                const mine = log.entries
+                  .filter((entry) => entry.terminalCreated !== true && String(entry.terminalId) === id)
+                const record = mine.find((entry) => entry.userTerminal === true)
+                if (record !== undefined) {
+                  // The title and the flag stay as they are, and so does `updatedAt` unless the
+                  // shell really changed: rewriting it on every 2 s poll would keep these records
+                  // pinned above the conversation's real subtasks in the dock's order.
+                  if (descriptionChanged(record.terminalSnapshot ?? null, info)) {
+                    subtasks.start(wanted, record.title, { terminalId: id, terminalCreated: false, terminalSnapshot: info })
+                  }
+                  continue
+                }
+                // A normal subtask that an explicit call recorded on this terminal stays as it
+                // is; the terminal gets its own record beside it. Titles are unique across the
+                // USER-TERMINAL records, not just this id's: a closed terminal's record keeps its
+                // title (and must read as ended), and a re-created tab with the same shell name
+                // gets a "#2" of its own instead of rewriting the old record in place.
+                const base = `用户建立的终端「${info?.title ?? 'WSL'}」`
+                const taken = new Set(log.entries
+                  .filter((entry) => entry.userTerminal === true)
+                  .map((entry) => entry.title))
+                let title = base
+                for (let index = 2; taken.has(title); index += 1) title = `${base} #${index}`
+                const created = subtasks.start(wanted, title, {
+                  terminalId: id,
+                  terminalCreated: false,
+                  terminalSnapshot: info,
+                })
+                created.userTerminal = true
+              }
+              // `reconcile`: this list is the full inventory, so a user-terminal record whose
+              // shell is absent really has ended.
+              project(wanted, [...ownedOf(wanted), ...shared], { reconcile: true })
+            } else {
+              for (const sessionId of Object.keys(subtasks.snapshot())) {
+                project(sessionId, ownedOf(sessionId))
+              }
+            }
+            answerJson(response, 200, { sessions })
+          } catch (error) {
+            console.warn('dsh-wsl-tool: assembling the subtask log failed', error)
+            answerJson(response, 500, { sessions: {}, error: String(error?.message ?? error) })
+          }
         }, 'dsh-wsl-tool: subtask route')
         // The two path settings are chosen, not typed: list directories that actually
         // exist in the distro (home, its children, /mnt/c, /mnt/d and D: top-level dirs).

@@ -365,7 +365,7 @@ explanation.
 | 后台任务 | whether `wsl` accepts `runInBackground` |
 | 自动转换路径 | the default for the per-call `translatePaths` |
 | 默认跟随会话工作区 | start in the session's directory instead of `~` when `workdir` is omitted. **On by default**: with it off, every relative path an agent writes lands in the Linux home, which is invisible from Explorer and grows the WSL disk image |
-| Linux 默认工作目录 | a fixed Linux directory (for example `/mnt/d/project`) used when `workdir` is omitted. Filling it in wins over the switch above; clearing it goes back to following the session |
+| Linux 默认工作目录 | a fixed Linux directory (for example `/mnt/d/project`) used when `workdir` is omitted. Filling it in wins over the switch above; clearing it falls back to `DSH_WSL_WORKDIR` when that is set, and otherwise to following the session |
 | WSL 终端启动路径 | the optional sidebar terminal's startup directory — `--cd <dir>` on the `terminal-controller` row of your **profile patch** (see [Optional: a WSL terminal in the sidebar](#optional-a-wsl-terminal-in-the-sidebar)). Empty clears it, and the panel reads the current value from the same file |
 | 终端历史行数 | how many lines of output that terminal keeps (`scrollback` on the same row). The platform default is 1000; `0` keeps none and an empty box restores the default. Both fields take effect at the next DSH start |
 | 危险命令守卫 | whether a destructive command needs an explicit `allowDangerous` |
@@ -375,8 +375,10 @@ The panel edits the plugin's own configuration, so the same values can be writte
 by hand (`- id: tool-wsl` with `config:` in a profile patch) or by environment
 variables. `lib/config.js` owns the precedence — **plugin configuration, then the
 environment, then the built-in defaults** — and a switch left at its default lets
-the layer below decide, which is why `DSH_WSL_WORKDIR=session` keeps working for
-someone who never opened the panel.
+the layer below decide. That is why `DSH_WSL_WORKDIR` keeps working for someone
+who never opened the panel, including when the follow-session switch is still at
+its ON default: an environment variable is an explicit deployment decision, so it
+speaks louder than a switch default.
 
 「WSL 终端启动路径」 is the one exception: the sidebar terminal belongs to another
 plugin, so that field edits your profile's patch layer instead — the file is backed
@@ -525,7 +527,7 @@ switch IS the authorisation). The environment layer:
 | `DSH_WSL_DISTRO` | (system default) | Pin the distribution for every call. |
 | `DSH_WSL_TIMEOUT_MS` | `600000` | Default deadline for a model-issued command; `timeoutMs` overrides it per call. |
 | `DSH_WSL_MAX_TIMEOUT_MS` | `86400000` | Ceiling for a per-call `timeoutMs`, mirroring the platform shell tools' `maxTimeoutMs`. The default deadline obeys it too. |
-| `DSH_WSL_WORKDIR` | `home` | Where a call starts without a `workdir`: `home` (the Linux `~`), `session` (the session working directory, i.e. `/mnt/<drive>/...` for a Windows checkout), or any explicit path. |
+| `DSH_WSL_WORKDIR` | (unset: follow the switch) | Where a call starts without a `workdir`: `home` (the Linux `~`), `session` (the session working directory, i.e. `/mnt/<drive>/...` for a Windows checkout), or any explicit path (a Windows path is translated like any other `workdir`). An explicit value wins over the follow-session switch's ON default; with the variable unset the switch decides. |
 | `DSH_WSL_MAX_OUTPUT_BYTES` | `65536` | Per-stream in-memory window (1 KiB – 8 MiB). Also raises the spill ceiling when set above 64 MiB. |
 
 An unparsable or out-of-range value falls back to the default: one bad variable
@@ -539,15 +541,17 @@ takes effect on restart.
   `cat`, a `sudo` password prompt without `-S`) otherwise gets EOF immediately and
   cannot wait for input; nothing in this plugin can prompt. A password passed via
   `stdin` is recorded in the session transcript.
-- The default `workdir` is `~`; set `DSH_WSL_WORKDIR=session` to start in the
-  session's working directory instead (see Configuration).
+- With nothing configured a call starts in the session's working directory (the
+  follow-session switch is on by default). Set `DSH_WSL_WORKDIR=home` to start in
+  `~` instead, `DSH_WSL_WORKDIR=session` to say so explicitly, or an explicit path
+  for a fixed directory (see Configuration).
 - The distro is the caller's `distro`, else `DSH_WSL_DISTRO`, else the system
   default; there is no hardcoded fallback name.
 - An unknown distro is reported as a clear error (`distribution "X" is not registered`) instead of a raw `-1` exit code, and any other launcher failure (`Wsl/Service/WSL_E_*`) is surfaced with its code rather than passed off as the command's own exit status.
 - **A background job outlives the call.** `runInBackground: true` returns a job id (`wsl-N`) immediately and registers the work with the host's job registry, so `job_output` reads it (with the same markers as a foreground call) and `job_kill` stops it. The 10-minute default deadline does **not** apply in the background; an explicit `timeoutMs` still does. A non-zero exit is reported as `completed` with the exit code in the detail, exactly like the foreground rendering.
-- Windows paths in `command` and `workdir` are translated to `/mnt/...` automatically:
+- Windows paths in `command`, `workdir` and the configured/`DSH_WSL_WORKDIR` default directory are translated to `/mnt/...` automatically:
   - `C:\Users\me\a.txt` -> `/mnt/c/Users/me/a.txt`, and paths containing spaces work in either slash style and with several paths on one line: `C:\Program Files\Git`, `C:/Program Files/Git`, `C:\Program Files (x86)\Steam` and `cp C:\a.txt D:\b.txt` (both paths are translated) all behave;
-  - `\\wsl.localhost\<distro>\home\x` and `\\wsl$\<distro>\home\x` -> `/home/x`;
+  - `\\wsl.localhost\<distro>\home\x` and `\\wsl$\<distro>\home\x` -> `/home/x`. A path that names a DIFFERENT distribution is left untouched, because `/home/x` would be this distribution's directory, not that one's;
   - text that only *looks* like a drive path is left alone: a single lowercase letter followed by `/` (`a:/b`), a drive letter inside another expression (`sed "s/C:\x/y/"`), and a drive-like segment inside a URL;
   - set `translatePaths: false` when the path belongs to a **Windows** program launched through interop — WSL does not translate `/mnt/c/...` back, so `notepad.exe C:\file.txt` needs its original spelling. This affects `command` only; `workdir` is always translated.
 - A `~` in `workdir` or in a `wsl-path` argument is expanded by the shell (`~/my dir` works). Any other path is single-quoted, so `$VAR` inside a path is **not** expanded.
@@ -685,7 +689,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1098 host checks against real WSL (shim for ctx.subprocess) + 232 client checks
+npm test          # 1192 host checks against real WSL (shim for ctx.subprocess) + 301 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

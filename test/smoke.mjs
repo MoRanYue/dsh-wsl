@@ -26,7 +26,7 @@ import { resolveConfig } from '../lib/config.js'
 import { pickSchemaBuilder } from '../lib/schema.js'
 import { buildCdCommand, quotePath, shellQuote, windowsPathToWsl } from '../lib/paths.js'
 import { destructiveReason } from '../lib/guard.js'
-import { channelSessionOf, createChannel, firstUserLine, SAY_PREFIX, sessionRecordOf, titlesOf } from '../lib/channel.js'
+import { channelSessionOf, createChannel, firstUserLine, SAY_PREFIX, sessionRecordOf, titlesOf, validSessionId, walletText } from '../lib/channel.js'
 import { cleanStderr, formatResult, normalizeExitCode, streamFacts } from '../lib/result.js'
 import { assertLauncherReachable, collectForwardEnv, resolveDistro, sessionCwdOf } from '../lib/runner.js'
 import { capabilityLines, launcherSummary, parseFacts, workspaceLine } from '../lib/diagnostics.js'
@@ -40,18 +40,20 @@ import {
   commandState, composeDoctorReport, needsFromFacts, parseProbe, suggestionRecipes, versionToken,
 } from '../lib/doctor.js'
 import {
-  BOOTSTRAP_TIMEOUT_MS, parsePresence, planFor, presenceProbe, RECIPE_IDS, renderOutcome, renderPlan, resolveRecipes, tailOf,
+  BOOTSTRAP_TIMEOUT_MS, NODE_LTS_SCRIPT, parsePresence, planFor, presenceProbe, RECIPE_IDS, renderOutcome, renderPlan, resolveRecipes, tailOf,
 } from '../lib/bootstrap.js'
 import { createWslDoctorTool } from '../lib/tools/wsl-doctor.js'
 import { createWslBootstrapTool } from '../lib/tools/wsl-bootstrap.js'
+import { createWslPathTool } from '../lib/tools/wsl-path.js'
+import { createWslTool } from '../lib/tools/wsl.js'
 import {
   appendCapture, autoTerminalIds, clipTail, describeSessionCwd, END_PREFIX, extractHelperResult, HELPER_NAME,
   helperCall, helperDefinition, inputLine, looksReady, OPENED_TERMINAL_NOTE, pickTerminal, renderTerminals, spillLine,
   START_PREFIX, stripAnsi,
 } from '../lib/terminal.js'
 import { createSubtaskLog, projectSubtask } from '../lib/subtasks.js'
-import { createWslTermTool } from '../lib/tools/wsl-term.js'
-import { createTerminalTransport } from '../lib/pty-transport.js'
+import { createWslTermTool, readinessText } from '../lib/tools/wsl-term.js'
+import { createPtyTransport, createTerminalTransport } from '../lib/pty-transport.js'
 import { createBridgeTransport } from '../lib/term-bridge.js'
 
 // One resolved configuration stands in for the mount the host would create.
@@ -370,6 +372,48 @@ function makeStubRunner(answer = {}) {
 }
 
 /**
+ * A fake `spawnTerminal` provider for the private-PTY transport.
+ *
+ * The handle answers `terminate` (so an owner cleanup can be observed), records every
+ * `write`, and can reject it the way a real PTY does once the shell has exited.
+ * @param {{ writeRejects?: boolean }} [options] - make `write` reject.
+ * @returns `{ provider, calls }`.
+ */
+function makePtyProvider(options = {}) {
+  const calls = { spawned: [], writes: [], terminated: 0 }
+  const provider = {
+    resolveExecutable: async () => 'wsl.exe',
+    async spawnTerminal(spec) {
+      calls.spawned.push(spec)
+      let finishOutput
+      const outputDone = new Promise((resolve) => { finishOutput = resolve })
+      let exit
+      const done = new Promise((resolve) => { exit = resolve })
+      return {
+        output: {
+          [Symbol.asyncIterator]() {
+            return { next: () => outputDone.then(() => ({ done: true })) }
+          },
+        },
+        done,
+        async write(data) {
+          calls.writes.push(String(data))
+          if (options.writeRejects === true) throw new Error('the shell has exited')
+        },
+        async terminate() {
+          calls.terminated += 1
+          finishOutput()
+          exit({ exitCode: 0 })
+        },
+        async resize() {},
+        async inspectActivity() { return { state: 'idle', revision: 0 } },
+      }
+    },
+  }
+  return { provider, calls }
+}
+
+/**
  * A `terminalController` stand-in.
  *
  * The real service yields a screen snapshot first and only then accepts input, so
@@ -561,6 +605,15 @@ async function unitTests() {
   eq('UNC wsl.localhost', t('ls \\\\wsl.localhost\\Ubuntu-22.04\\home\\xiny'), 'ls /home/xiny')
   eq('UNC wsl$', t('ls \\\\wsl$\\Ubuntu-22.04\\home'), 'ls /home')
   eq('bare UNC distro root', t('ls \\\\wsl.localhost\\Ubuntu-22.04'), 'ls /')
+  // With the distribution known, a UNC path naming ANOTHER one is not this distribution's
+  // directory: translating it would silently repoint the command at the wrong files.
+  eq('a UNC path of the same distribution is translated with its name',
+    t('ls \\\\wsl.localhost\\Ubuntu-22.04\\home\\x', { distro: 'Ubuntu-22.04' }), 'ls /home/x')
+  eq('a UNC path of another distribution is left alone',
+    t('ls \\\\wsl.localhost\\Debian\\home\\x', { distro: 'Ubuntu-22.04' }),
+    'ls \\\\wsl.localhost\\Debian\\home\\x')
+  eq('the UNC match is case-insensitive like Windows',
+    t('ls \\\\WSL$\\ubuntu-22.04\\home', { distro: 'Ubuntu-22.04' }), 'ls /home')
   eq('plain linux path untouched', t('/mnt/c/Users'), '/mnt/c/Users')
 
   console.log('\nworkdir quoting')
@@ -1183,6 +1236,10 @@ eq('the channel session defaults to unset', resolveConfig({}, {}).channelSession
   })())
   eq('the default distro is read from the -l -v marker',
     parseDefaultDistro('  NAME   STATE   VERSION\n* Ubuntu-22.04  Running  2\n'), 'Ubuntu-22.04')
+  eq('a default name containing one space is kept whole (columns are 2+ spaces)',
+    parseDefaultDistro('  NAME   STATE   VERSION\n* Ubuntu 22.04    Running    2\n'), 'Ubuntu 22.04')
+  eq('a tab-separated default row is read too',
+    parseDefaultDistro('*\tUbuntu-22.04\tRunning\t2'), 'Ubuntu-22.04')
   eq('a list without a marker yields null', parseDefaultDistro('  NAME  STATE  VERSION'), null)
 
   console.log('\ncapability diagnostics')
@@ -1444,6 +1501,17 @@ async function terminalUnitTests() {
     looksReady('\u001b[1;32mxiny@XINY9\u001b[0m:\u001b[1;34m/home\u001b[0m$ \u001b[K'))
   check('a prompt after OSC and CRLF looks ready',
     looksReady('\u001b]0;bash\u0007xiny@XINY9:/home$ \r\n'))
+  // The gate that runs before every write only looks at the capture TAIL: the prompt is the last
+  // non-empty line, and re-stripping megabytes of ANSI on every streamed frame is quadratic (a
+  // 30 s busy wait measured ~2 s of CPU with the whole capture). The bound is what makes the
+  // check O(1) in the capture's size, so it is asserted rather than assumed.
+  const longCapture = `${'history line\n'.repeat(10_000)}xiny@host:~$ `
+  const gated = readinessText('screen', longCapture)
+  check('the readiness gate reads a bounded tail of the capture',
+    gated.length < 2_100 && gated.endsWith('xiny@host:~$ '), String(gated.length))
+  check('and the prompt in that tail is still seen as ready', looksReady(gated))
+  check('a prompt that fell out of the tail is NOT claimed as ready (the bound is real)',
+    looksReady(readinessText('', `xiny@host:~$ ${'\n'.repeat(3)}${'x'.repeat(5_000)}`)) === false)
 
   const one = { id: 'a', state: 'running', title: 'bash' }
   const two = { id: 'b', state: 'running', title: 'bash' }
@@ -1509,6 +1577,171 @@ async function terminalUnitTests() {
   eq('past the ceiling the TAIL is kept', stepB.text, 'red more'.slice(-8), stepB.text)
   eq('and the dropped count is explicit', stepB.dropped, stepA.text.length + ' more'.length - 8, String(stepB.dropped))
   eq('an empty frame is harmless', appendCapture('x', undefined, 10).text, 'x')
+
+  // ---------------------------------------------------------------- regression guards
+  // The guard is ONE linear pass over the command. The first version re-sliced the whole
+  // segment per `rm` match: measured 18 s of the host's event loop for one 60 KB command.
+  console.log('\nregression: destructive guard')
+  {
+    const started = Date.now()
+    const spam = destructiveReason('rm '.repeat(20_000))
+    check('a 60 KB `rm` spam is judged linearly and allowed',
+      spam === null && Date.now() - started < 100, `${Date.now() - started} ms, reason=${String(spam)}`)
+    const allowed = [
+      'systemctl status reboot.target',
+      'git clean -nfd',
+      'mkfs --help',
+      'fdisk -l',
+    ]
+    const allowedReasons = allowed.map((command) => destructiveReason(command))
+    check('read-only investigations of the same tools are not refused',
+      allowedReasons.every((reason) => reason === null), JSON.stringify(allowedReasons))
+    const refused = [
+      '2>/dev/null rm -r x',
+      'eval "rm -rf /tmp/x"',
+      'echo "rm -rf /" | bash',
+      'echo x >| /dev/sda',
+      'tee /dev/sdb',
+      'cp disk.img /dev/sdb',
+      'runuser -u root -- rm -rf /tmp/x',
+    ]
+    const refusedReasons = refused.map((command) => destructiveReason(command))
+    check('the indirection forms are judged at their real command',
+      refusedReasons.every((reason) => reason !== null), JSON.stringify(refusedReasons))
+    check('a command past the inspection cap is refused, never silently allowed',
+      destructiveReason('x'.repeat(70_000)) !== null)
+  }
+
+  // Workdir precedence: the environment must still reach a deployment whose switch is the
+  // volatile cell the panel writes (the default), while an explicit plain switch wins.
+  console.log('\nregression: workdir precedence')
+  eq('DSH_WSL_WORKDIR=home means the home directory',
+    resolveConfig({ DSH_WSL_WORKDIR: 'home' }, {}).defaultWorkdir, '~')
+  eq('a fixed environment directory is used verbatim',
+    resolveConfig({ DSH_WSL_WORKDIR: '/mnt/x' }, {}).defaultWorkdir, '/mnt/x')
+  eq('DSH_WSL_WORKDIR=session follows the session',
+    resolveConfig({ DSH_WSL_WORKDIR: 'session' }, {}).defaultWorkdir, null)
+  eq('a plain (non-cell) switch still wins over the environment',
+    resolveConfig({ DSH_WSL_WORKDIR: 'home' }, { startInSessionWorkspace: true }).defaultWorkdir, null)
+  eq('the switch being off falls back to the home directory',
+    resolveConfig({}, { startInSessionWorkspace: { get: () => false } }).defaultWorkdir, '~')
+  eq('the default follows the session',
+    resolveConfig({}, {}).defaultWorkdir, null)
+
+  // The apt step installs `curl`; the Node tarball step downloads WITH curl. On a fresh image
+  // the old order ran node first, so the installer died before the step that would have fixed it.
+  console.log('\nregression: installer order and discovery')
+  eq('the apt step runs before node when curl is missing',
+    planFor(resolveRecipes(['node'], {}), {}).steps.map((step) => step.id).join(','), 'tools,node')
+  eq('a machine that already has curl keeps node first',
+    planFor(resolveRecipes(['node'], { curl: true }), { curl: true }).steps.map((step) => step.id).join(','), 'node')
+  check('the LTS line is discovered and checksum-verified, not hardcoded',
+    NODE_LTS_SCRIPT.includes('index.json') && NODE_LTS_SCRIPT.includes('SHASUMS256.txt'),
+    NODE_LTS_SCRIPT.slice(0, 120))
+  {
+    // The command translator is told which distribution it translates FOR: a UNC path naming
+    // another distribution must reach the program verbatim.
+    const captureRunner = makeStubRunner()
+    const tool = createWslTool({ ctx: { get: () => undefined }, config: CONFIG, runner: captureRunner })
+    await tool.execute({ command: 'ls \\\\wsl.localhost\\Debian\\home', description: 'other distro', distro: 'Ubuntu-22.04' })
+    eq('a command naming another distribution keeps its UNC path',
+      captureRunner.calls[0].command, 'ls \\\\wsl.localhost\\Debian\\home')
+    await tool.execute({ command: 'ls \\\\wsl.localhost\\Ubuntu-22.04\\home', description: 'same distro', distro: 'Ubuntu-22.04' })
+    eq('a command naming this distribution is translated',
+      captureRunner.calls[1].command, 'ls /home')
+  }
+
+  // A byte-trimmed stream window can start inside a character; the U+FFFD it produces must not
+  // reach the model as a visible `�` at the head of every truncated Chinese output.
+  console.log('\nregression: truncated multibyte stream')
+  {
+    const facts = streamFacts({ text: '\uFFFD汉汉汉', nextOffset: 12, lossy: true })
+    eq('a truncated window does not start with U+FFFD', facts.text, '汉汉汉')
+    check('the dropped-byte count stays within the character-boundary error',
+      facts.droppedBytes >= 2 && facts.droppedBytes <= 5, String(facts.droppedBytes))
+  }
+
+  // The subtask log is bounded even when nothing is ever finished, and a running record that
+  // still owns a live shell is never dropped to make room.
+  console.log('\nregression: subtask log bounds')
+  {
+    const log = createSubtaskLog()
+    for (let index = 0; index < 300; index += 1) log.start('s', `t${String(index)}`)
+    const trimmed = log.list('s')
+    check('300 unfinished records are trimmed to the limit',
+      trimmed.entries.length <= 60, String(trimmed.entries.length))
+    eq('and the total never regresses', trimmed.total, 300)
+    const live = createSubtaskLog()
+    for (let index = 0; index < 10; index += 1) {
+      live.start('s', `live${String(index)}`, { terminalId: `live-${String(index)}` })
+    }
+    for (let index = 0; index < 300; index += 1) live.start('s', `t${String(index)}`)
+    const mixed = live.list('s')
+    check('a running record with a live shell is never trimmed',
+      mixed.entries.filter((entry) => String(entry.title).startsWith('live')).length === 10
+      && mixed.entries.length <= 60,
+      JSON.stringify({ kept: mixed.entries.length }))
+  }
+
+  // Empty or unreadable wallets are "unavailable", never a zero balance; a real zero is zero.
+  console.log('\nregression: wallet text and session ids')
+  eq('no wallets means no text (the route reports unavailable)', walletText([]), '')
+  eq('a null balance is not a zero balance', walletText([{ balance: null }]), '')
+  eq('a real zero is printed as zero', walletText([{ currency: 'CNY', balance: '0' }]), '¥0.00')
+  check('a session id rejects whitespace and control characters',
+    validSessionId('session-a') === true && validSessionId('a b') === false
+    && validSessionId('a\tb') === false && validSessionId('a\nb') === false, '')
+
+  // The private PTY transport is a small state machine whose failures are PROCESS-level when it
+  // drops a provider promise: the host turns an unhandled rejection into process.exit(1). These
+  // checks pin the three cases that matter there.
+  console.log('\npty transport: concurrency, write failures, owner cleanup')
+  {
+    const { provider, calls } = makePtyProvider()
+    const transport = createPtyTransport({ ctx: {}, config: CONFIG, subprocess: provider })
+    const agent = { id: 'session-pty-concurrent' }
+    const [first, second] = await Promise.all([
+      transport.create(agent, { id: 'dsh-agent', cols: 80, rows: 24 }),
+      transport.create(agent, { id: 'dsh-agent', cols: 80, rows: 24 }),
+    ])
+    eq('two concurrent creates of one id spawn one shell', calls.spawned.length, 1)
+    eq('and both calls answer the same terminal', `${first.id}/${second.id}`, 'dsh-agent/dsh-agent')
+  }
+  {
+    const unhandled = []
+    const listener = (reason) => unhandled.push(reason)
+    process.on('unhandledRejection', listener)
+    try {
+      const { provider } = makePtyProvider({ writeRejects: true })
+      const transport = createPtyTransport({ ctx: {}, config: CONFIG, subprocess: provider })
+      const agent = { id: 'session-pty-write' }
+      await transport.create(agent, { id: 'dsh-agent', cols: 80, rows: 24 })
+      const failure = await transport.write(agent, 'dsh-agent', 'attachment', 'x')
+        .then(() => null, (error) => String(error?.message ?? error))
+      check('a provider write rejection becomes a rejected transport write',
+        /has exited|could not write/.test(String(failure)), String(failure))
+      await tickMs(30)
+      eq('and it never escapes as an unhandled rejection', unhandled.length, 0)
+    } finally {
+      process.off('unhandledRejection', listener)
+    }
+  }
+  {
+    const { provider, calls } = makePtyProvider()
+    const transport = createPtyTransport({ ctx: {}, config: CONFIG, subprocess: provider })
+    const disposers = []
+    const agent = {
+      id: 'session-pty-owner',
+      ctx: { effect: (fn) => { disposers.push(fn); return () => {} } },
+    }
+    await transport.create(agent, { id: 'dsh-agent', cols: 80, rows: 24 })
+    eq('the owning conversation registers one shell cleanup', disposers.length, 1)
+    // `effect(callback)` takes a callback that RETURNS the disposer (the cordis shape), so the
+    // shell cleanup is the result of calling it once and then the result again.
+    const dispose = disposers[0]()
+    await (typeof dispose === 'function' ? dispose() : dispose)
+    eq('disposing that conversation terminates its shell', calls.terminated, 1)
+  }
 }
 
 // --- tool-level tests ------------------------------------------------------
@@ -1538,7 +1771,18 @@ async function toolTests(tools, shim) {
     command: 'true', description: 'bad env', env: { 'BAD KEY': 'x' },
   }), /not a valid shell variable name/)
   await rejects('empty command is refused', () => tools.wsl.execute({ command: '  ', description: 'x' }), /non-empty string/)
-  await rejects('zero timeout is refused', () => tools.wsl.execute({ command: 'true', description: 'x', timeoutMs: 0 }), /positive number/)
+  await rejects('zero timeout is refused', () => tools.wsl.execute({ command: 'true', description: 'x', timeoutMs: 0 }), /positive integer/)
+  // The result schema declares `timeoutMs` as an integer; a fractional deadline used to pass the
+  // check here and then be rejected by the host AFTER the command had already run.
+  await rejects('a fractional timeout is refused', () => tools.wsl.execute({
+    command: 'true', description: 'x', timeoutMs: 1.5,
+  }), /positive integer/)
+  await rejects('a non-string workdir is refused', () => tools.wsl.execute({
+    command: 'pwd', description: 'x', workdir: 5,
+  }), /workdir must be a string/)
+  await rejects('a non-string distro is refused', () => tools.wsl.execute({
+    command: 'true', description: 'x', distro: 7,
+  }), /distro must be a string/)
 
   console.log('\nwsl: workdir')
   const tilde = await tools.wsl.execute({ command: 'pwd', description: 'home', workdir: '~/.' })
@@ -2193,7 +2437,13 @@ async function toolTests(tools, shim) {
   const settled = await jobs.settled(started.jobId)
   eq('the job completed', settled.outcome.status, 'completed')
   check('the job detail carries the exit code', /exit code 0/.test(settled.outcome.detail ?? ''), String(settled.outcome.detail))
-  check('the job output holds the command output', (settled.outcome.output ?? '').includes('from-the-job'), JSON.stringify(settled.outcome.output))
+  // The registry's terminal payload is `result` (`dsh-jobs-local` keeps only `outcome.result`,
+  // and `job_output` renders it once after settlement). `output` is not a field anything reads:
+  // sending the text there made every background command's output unreachable while the fake
+  // registry still "passed", which is exactly how the bug shipped.
+  check('the job result holds the command output', (settled.outcome.result ?? '').includes('from-the-job'), JSON.stringify(settled.outcome.result))
+  check('and the dead `output` field is gone from the outcome',
+    !('output' in settled.outcome), JSON.stringify(Object.keys(settled.outcome)))
   // `owner` must be the owner's SESSION ID, not the Agent handle: the registry
   // resolves it through the live-agent registry (`agents.get(sessionId)`) and
   // answers `session "…" has no live agent` for anything else. DSH 0.1.5
@@ -2230,12 +2480,15 @@ async function toolTests(tools, shim) {
   const failedSettled = await jobs.settled(failingJob.jobId)
   eq('a non-zero exit is completed, not failed', failedSettled.outcome.status, 'completed')
   check('the failure detail carries the code', /exit code 3/.test(failedSettled.outcome.detail ?? ''), String(failedSettled.outcome.detail))
+  check('and the failing command\'s output still rides the result',
+    (failedSettled.outcome.result ?? '').includes('bad') && /\[exit code: 3\]/.test(failedSettled.outcome.result ?? ''),
+    JSON.stringify(failedSettled.outcome.result))
 
   const stderrJob = await tools.wsl.execute({
     command: 'echo oops 1>&2; exit 1', description: 'background stderr', runInBackground: true,
   })
   const stderrSettled = await jobs.settled(stderrJob.jobId)
-  check('stderr is kept in the job output', (stderrSettled.outcome.output ?? '').includes('oops'), JSON.stringify(stderrSettled.outcome.output))
+  check('stderr is kept in the job result', (stderrSettled.outcome.result ?? '').includes('oops'), JSON.stringify(stderrSettled.outcome.result))
 
   const longJob = await tools.wsl.execute({
     command: 'sleep 30', description: 'background cancel', runInBackground: true,
@@ -2247,11 +2500,14 @@ async function toolTests(tools, shim) {
   // The status line says `killed`; an exit code left in the body would be the
   // kill's own artifact and would contradict it.
   check('a cancelled job does not also report an exit code',
-    !/\[exit code:/.test(cancelled.outcome.output ?? ''), JSON.stringify(cancelled.outcome.output))
+    !/\[exit code:/.test(cancelled.outcome.result ?? ''), JSON.stringify(cancelled.outcome.result))
 
   const timedJob = await tools.wsl.execute({
     command: 'sleep 5', description: 'background timeout', runInBackground: true, timeoutMs: 700,
   })
+  // The start result names the deadline the job really armed, not a blanket null: a caller has to
+  // be able to tell a no-deadline job from a 700 ms one before it settles.
+  eq('a background start reports the deadline it armed', timedJob.timeoutMs, 700)
   const timedOutcome = await jobs.settled(timedJob.jobId)
   eq('an explicit timeout still kills a background job', timedOutcome.outcome.status, 'killed')
   check('the timeout is named in the detail', /timed out/.test(timedOutcome.outcome.detail ?? ''), String(timedOutcome.outcome.detail))
@@ -2354,6 +2610,9 @@ async function toolTests(tools, shim) {
   const bootstrapRunner = makeStubRunner({
     run: (command) => {
       if (command.includes('command -v')) return { stdout: presentOutput }
+      if (command.includes('apt-get update --print-uris')) {
+        return { stdout: 'apt-get update (dry run, --print-uris): sources resolve\nInst python3 (simulated)' }
+      }
       if (command.includes('apt-get -s')) return { stdout: 'Inst python3 (simulated)' }
       return { stdout: 'installed python3' }
     },
@@ -2366,6 +2625,18 @@ async function toolTests(tools, shim) {
   check('the dry run says nothing was installed',
     dryValue.summary.startsWith('dry run — nothing has been installed'), dryValue.summary.slice(0, 80))
   check('it shows what apt would report', dryValue.summary.includes('Inst python3 (simulated)'), dryValue.summary)
+  const updateAt = dryValue.summary.indexOf('apt-get update (dry run')
+  check('the simulated plan reflects the real order (update before install)',
+    updateAt >= 0 && updateAt < dryValue.summary.indexOf('Inst python3 (simulated)'), dryValue.summary.slice(-420))
+  {
+    // A dry run must not touch the package lists: `apt-get -s update` is not even supported by
+    // apt, so the update half is simulated with the read-only `--print-uris` form.
+    const simulateCall = bootstrapRunner.calls.find((call) => String(call.command).includes('apt-get -s'))
+    check('the simulated update is the read-only --print-uris form',
+      String(simulateCall?.command).includes('apt-get update --print-uris')
+      && !String(simulateCall?.command).includes('apt-get update -y'),
+      String(simulateCall?.command).slice(0, 160))
+  }
   check('it prints the exact command',
     dryValue.summary.includes('apt-get install -y python3 python3-pip python3-venv'), dryValue.summary)
   check('it says how to really install', dryValue.summary.includes('dryRun: false'), dryValue.summary)
@@ -2445,6 +2716,20 @@ async function toolTests(tools, shim) {
   const tildePath = await tools['wsl-path'].execute({ path: '~' })
   check('tilde path is expanded before conversion', tildePath.converted !== '~' && /home/.test(tildePath.converted), tildePath.converted)
   await rejects('empty path is refused', () => tools['wsl-path'].execute({ path: '  ' }), /non-empty string/)
+  // A RELATIVE input used to come back as a relative Windows path (`relative\dir`): a Windows
+  // path that names nothing. `-a` resolves it against the shell's own directory (the session
+  // workspace), and absolute inputs are unchanged by it. Asserted on the command line the runner
+  // is handed, so the flag cannot silently disappear again.
+  {
+    const pathRunner = makeStubRunner({ run: () => ({ stdout: '/converted\n' }) })
+    const pathTool = createWslPathTool({ config: CONFIG, runner: pathRunner })
+    await pathTool.execute({ path: '/home/x' })
+    eq('a linux path is converted with wslpath -a -w', pathRunner.calls[0].command, "wslpath -a -w '/home/x'")
+    await pathTool.execute({ path: 'C:\\x' })
+    eq('a windows path is converted with wslpath -a -u', pathRunner.calls[1].command, "wslpath -a -u 'C:\\x'")
+    await rejects('an unknown direction is refused instead of auto-detected',
+      () => pathTool.execute({ path: '/tmp', direction: 'up' }), /direction must be one of/)
+  }
 
   console.log('\nwsl-env')
   const env = await tools['wsl-env'].execute({})
@@ -2503,13 +2788,15 @@ async function toolTests(tools, shim) {
     kind: 'bridge',
     bridgeCapable: false,
     provider: undefined,
-    owns: () => true,
+    // Ownership is per terminal, like the real transports: everything this fake shell table
+    // holds belongs to the tool except the synthetic `user-term` the tests add by hand.
+    owns: (_sessionId, id) => !String(id).startsWith('user-term'),
     kindOf: () => 'bridge',
     describe: (sessionId, id) => stub.list(sessionId).find((info) => String(info.id) === String(id)) ?? null,
     list: (sessionId) => stub.list(sessionId),
     userTerminals: async () => [],
     create: (agent, request, signal) => stub.create(agent, request, signal),
-    follow: (agent, id, attachmentId, signal) => stub.follow(agent, id, attachmentId, signal),
+    follow: (agent, id, attachmentId, signal, options) => stub.follow(agent, id, attachmentId, signal, options),
     write: (agent, id, attachmentId, data) => stub.write(agent, id, attachmentId, data),
     close: (agent, id) => stub.close(agent, id),
   })
@@ -2895,6 +3182,17 @@ async function toolTests(tools, shim) {
     const input = await makeTermTool(stub).execute({ action: 'input', data: 'ls', submit: true }, { agent: termAgent })
     eq('input sends the keystrokes with Enter', stub.calls.write[0].data, 'ls\r')
     check('the summary echoes what was typed', input.summary.includes('"ls"'), input.summary)
+    // `input` is raw keystrokes, but with `submit` the line is EXECUTED — otherwise it would be
+    // the one unguarded way to run a destructive command through a shell nobody inspected.
+    const guardedInput = makeTerminalStub({ terminals: [termInfoOf('t1')] })
+    await rejects('input with submit goes through the destructive guard',
+      () => makeTermTool(guardedInput).execute(
+        { action: 'input', data: 'rm -rf /tmp/dsh-wsl-term-input', submit: true }, { agent: termAgent }),
+      /refused a destructive command/)
+    eq('and the refusal typed nothing', guardedInput.calls.write.length, 0)
+    const rawOnly = makeTerminalStub({ terminals: [termInfoOf('t1')] })
+    await makeTermTool(rawOnly).execute({ action: 'input', data: 'rm -rf /tmp/dsh-wsl-term-input' }, { agent: termAgent })
+    eq('without submit the same keys are only typed, not refused', rawOnly.calls.write.length, 1)
   }
   {
     const stub = makeTerminalStub({ terminals: [termInfoOf('t1')] })
@@ -2909,6 +3207,23 @@ async function toolTests(tools, shim) {
     const closed = await tool.execute({ action: 'close', id: 't1' }, { agent: termAgent })
     eq('close closes the terminal it was told to close', stub.calls.close[0], 't1')
     check('the summary confirms it', closed.summary.includes('closed.'), closed.summary)
+  }
+  // The host does not validate a plugin tool's parameters, so the tool's own checks are the only
+  // boundary. A wrong type must be an ERROR, never a fall-through: `id: 7` used to be ignored and
+  // the command was typed into whatever terminal the automatic selection picked instead.
+  {
+    const stub = makeTerminalStub({ terminals: [termInfoOf('t1')] })
+    const tool = makeTermTool(stub)
+    await rejects('a non-string id is refused, not silently ignored',
+      () => tool.execute({ action: 'run', id: 7, command: 'echo x' }, { agent: termAgent }), /id must be a string/)
+    eq('and nothing was typed anywhere', stub.calls.write.length + stub.calls.follow.length, 0)
+    await rejects('a non-boolean keepTerminal is refused',
+      () => tool.execute({ action: 'subtask-done', subtask: 'x', keepTerminal: 'no' }, { agent: termAgent }),
+      /keepTerminal must be a boolean/)
+    await rejects('a non-boolean submit is refused',
+      () => tool.execute({ action: 'input', data: 'x', submit: 'yes' }, { agent: termAgent }), /submit must be a boolean/)
+    await rejects('a non-string subtask is refused',
+      () => tool.execute({ action: 'run', command: 'echo x', subtask: 5 }, { agent: termAgent }), /subtask must be a string/)
   }
   {
     const stub = makeTerminalStub({
@@ -3048,6 +3363,54 @@ async function toolTests(tools, shim) {
     check('and says it left that terminal alone',
       typeof finished.summary === 'string' && finished.summary.includes('the user opened it'),
       String(finished?.summary).slice(-160))
+  }
+  // A subtask spans SEVERAL `run` calls in the same shell. The ownership mark describes the shell
+  // the record points at, not "did this call create it": the second step used to reset it, so
+  // `subtask-done keepTerminal:false` silently kept a shell this tool had opened and even called
+  // it "the user opened it".
+  {
+    const log = createSubtaskLog()
+    const stub = makeTerminalStub({ terminals: [], onWrite: replyWithCommand })
+    const tool = makeTermTool(stub, CONFIG, log)
+    await tool.execute({ action: 'run', command: 'echo one', subtask: '两步' }, { agent: termAgent })
+    eq('the first step marks the shell it opened as the tool\'s own',
+      log.list('session-1').entries[0]?.terminalCreated, true)
+    await tool.execute({ action: 'run', command: 'echo two', subtask: '两步' }, { agent: termAgent })
+    eq('the second step keeps that mark on the same shell',
+      log.list('session-1').entries[0]?.terminalCreated, true)
+    eq('and both steps reused one terminal', stub.calls.create.length, 1)
+    const finished = await tool.execute(
+      { action: 'subtask-done', subtask: '两步', result: 'done', keepTerminal: false }, { agent: termAgent })
+    check('subtask-done closes the shell a multi-step subtask opened',
+      stub.calls.close.includes('dsh-agent') && finished.summary.includes('closed (this tool opened it)'),
+      `${JSON.stringify(stub.calls.close)} ${String(finished.summary).slice(-160)}`)
+  }
+  // A run that fails while attaching never typed anything: the record it opened must not stay
+  // "running" for the rest of the run (the dock would show work in progress forever).
+  {
+    const log = createSubtaskLog()
+    const stub = makeTerminalStub({ terminals: [] })
+    stub.follow = () => { throw new Error('attach refused by the host') }
+    const tool = makeTermTool(stub, CONFIG, log)
+    const failure = await tool.execute({ action: 'run', command: 'echo x', subtask: '幽灵' }, { agent: termAgent })
+      .then(() => null, (error) => String(error?.message ?? error))
+    check('a failed attach is reported', /attach refused by the host/.test(String(failure)), String(failure))
+    const entry = log.list('session-1').entries[0]
+    eq('and the record it opened is finished, not left running', entry?.status, 'done')
+    eq('with the failure as its result', entry?.result, '终端不可用')
+  }
+  // Automatic selection never lands on an exited private shell: a fresh one is opened instead.
+  // An explicit id still reaches it (the caller named it).
+  {
+    const stub = makeTerminalStub({
+      terminals: [{ ...termInfoOf('dead'), state: 'exited', exitCode: 0 }],
+      onWrite: replyWithCommand,
+    })
+    const run = await makeTermTool(stub).execute({ action: 'run', command: 'echo fresh' }, { agent: termAgent })
+    eq('an exited shell is not reused by the automatic choice', stub.calls.create[0]?.id, 'dsh-agent')
+    check('and the fresh shell ran the command', run.summary.includes('exit code: 0'), run.summary.slice(-160))
+    check('the header does not name the exited shell',
+      !/terminal dead /.test(String(run.summary).split('\n')[0]), String(run.summary).slice(0, 120))
   }
   // Terminal ids are per Session, and a tool-opened terminal is named from a STABLE pool
   // (`dsh-agent`, `dsh-agent-2`, …), so two conversations both get `dsh-agent` — in two
@@ -3823,6 +4186,11 @@ async function bridgeUnitTests() {
     eq('with no window polling, the transport reports the private-shell kind', host.transport.kind, 'pty')
     eq('and its status says no page is holding the bridge', host.transport.status().client, false)
     eq('an undrivable browser terminal is not listed without a page', host.transport.list('session-1').length, 0)
+    // A window that is closed cannot answer an inventory, so the collaboration list is EMPTY
+    // rather than "the host controller still remembers some terminals": returning them made the
+    // tool's automatic choice land in a terminal it could never drive.
+    eq('with no page there are no collaboration targets at all',
+      (await host.transport.userTerminals('session-1')).length, 0)
   }
 
   // The happy path: an EXPLICIT id names the user's terminal, so the bridge drives it once.
@@ -3882,6 +4250,20 @@ async function bridgeUnitTests() {
       () => tool.execute({ action: 'close', id: 'user-term' }, { agent: { id: 'session-1' } }),
       /not opened by this tool/)
     eq('and no close reached the controller', host.calls.closed.length, 0)
+  }
+
+  // An explicit id naming a terminal that exists but cannot be driven right now (no page is
+  // polling) is answered BEFORE attaching: the transport's `describe` carries `drivable: false`
+  // and a note, and that note is the actionable answer — `follow()` would only report a generic
+  // "window not answering" after the call's wait.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    eq('the transport marks the terminal as undrivable without a page',
+      host.transport.describe('session-1', 'user-term')?.drivable, false)
+    await rejects('an explicit id on an undrivable terminal says why, before attaching',
+      () => tool.execute({ action: 'read', id: 'user-term', timeoutMs: 200 }, { agent: { id: 'session-1' } }),
+      /这个终端当前不可驱动.*DSH window is not open/)
   }
 
   // Ad-hoc commands ARE collaborative: without a `subtask`, the newest terminal the user has
@@ -3991,17 +4373,58 @@ async function bridgeUnitTests() {
     eq('and no keystrokes reached it', page.writes.length, 0)
   }
 
-  // Raw keystrokes/Ctrl-C are never auto-aimed at a terminal the user opened: an explicit id
-  // is the consent, because neither action can be taken back once it lands.
+  // `>` is a fish prompt, but it is ALSO a Python REPL (`>>>`) and a heredoc continuation (`> `).
+  // In a terminal the USER opened those are running programs, not a shell: the helper must not be
+  // typed into them (in a heredoc it would land in the file the user is writing).
+  for (const screen of ['>>> ', '> ']) {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const page = makeBridgePage(host, { screen })
+    const warm = page.poll()
+    await tickMs(5)
+    const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+    const running = tool.execute({ action: 'run', command: 'echo hi', timeoutMs: 450 }, { agent: { id: 'session-1' } })
+    const first = await warm
+    for (const command of first.commands ?? []) await page.handle(command)
+    const run = await driveBridge(page, running)
+    check(`a bare ${JSON.stringify(screen)} prompt is not treated as a shell`,
+      run.summary.includes('no prompt this tool recognises'), run.summary.slice(-420))
+    eq(`and nothing is typed into ${JSON.stringify(screen)}`, page.writes.length, 0)
+  }
+
+  // No page at all: the bridge reports `pty`, and an ad-hoc run must fall back to the private
+  // shell instead of picking the user's (undrivable) sidebar terminal out of the host list.
   {
     const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    eq('with no page the transport is the private shell', host.transport.kind, 'pty')
     const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
-    await rejects('input without an id refuses to aim raw keys at the user terminal',
-      () => tool.execute({ action: 'input', data: 'x' }, { agent: { id: 'session-1' } }),
-      /explicit `id`/)
-    await rejects('interrupt without an id is refused the same way',
-      () => tool.execute({ action: 'interrupt' }, { agent: { id: 'session-1' } }),
-      /explicit `id`/)
+    const run = await tool.execute({ action: 'run', command: 'pwd' }, { agent: { id: 'session-1' } })
+    check('an ad-hoc run with no page uses the private shell',
+      run.summary.includes('pty fallback output') && !run.summary.includes('user-term'), run.summary.slice(0, 300))
+    eq('and it really opened one', host.calls.spawned.length, 1)
+    eq('and the user terminal was not attached to', host.calls.closed.length, 0)
+  }
+
+  // Raw keystrokes/Ctrl-C are never auto-aimed at a terminal the user opened: an explicit id
+  // is the consent, because neither action can be taken back once it lands. That rule is about a
+  // terminal the bridge can really drive — i.e. one a live page reports — so this harness keeps a
+  // page polling while the two refusals are proven.
+  {
+    for (const [label, args] of [
+      ['input without an id refuses to aim raw keys at the user terminal', { action: 'input', data: 'x' }],
+      ['interrupt without an id is refused the same way', { action: 'interrupt' }],
+    ]) {
+      const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+      const page = makeBridgePage(host)
+      const warm = page.poll()
+      await tickMs(5)
+      const tool = createWslTermTool({ ctx: host.ctx, config: CONFIG, transport: host.transport })
+      const outcome = tool.execute(args, { agent: { id: 'session-1' } })
+        .then(() => null, (error) => String(error?.message ?? error))
+      const first = await warm
+      for (const command of first.commands ?? []) await page.handle(command)
+      const failure = await outcome
+      check(label, /explicit `id`/.test(String(failure)), String(failure))
+    }
   }
 
   // `read` over the bridge: the snapshot is the screen, and the call still detaches.
@@ -4062,6 +4485,34 @@ async function bridgeUnitTests() {
       }
     }
     await rejects('a read-only terminal surfaces as a refused write', () => running, /read-only/)
+  }
+
+  // Detaching an attachment must settle its in-flight write instead of leaving the `await`
+  // pending until the 20 s write timeout — a dropped promise is also how an unhandled rejection
+  // escapes later. This is the transport contract the tool's `finally` relies on.
+  {
+    const host = makeBridgeHarness({ terminals: [browserTerminalOf('user-term')] })
+    const page = makeBridgePage(host)
+    const warm = page.poll()
+    await tickMs(5)
+    const controller = new AbortController()
+    const frames = host.transport.follow({ id: 'session-1' }, 'user-term', 'att-detach', controller.signal)
+    const iterator = frames[Symbol.asyncIterator]()
+    const attachBatch = await warm
+    for (const command of attachBatch.commands ?? []) await page.handle(command)
+    const snapshot = await iterator.next()
+    check('the attachment starts with its snapshot', snapshot.value?.type === 'snapshot')
+    const write = host.transport.write({ id: 'session-1' }, 'user-term', 'att-detach', 'echo dropped')
+    // The page receives the write and never acknowledges it; the caller detaches instead.
+    await page.poll()
+    const started = Date.now()
+    await iterator.return()
+    const outcome = await Promise.race([
+      write.then(() => 'resolved', (error) => `rejected: ${String(error?.message ?? error)}`),
+      tickMs(1_000).then(() => 'hung'),
+    ])
+    check('detaching rejects a write the page never acknowledged',
+      String(outcome).startsWith('rejected') && Date.now() - started < 1_000, String(outcome))
   }
 
   // A closed window: the poll heartbeat stops and the call does not wait out its deadline.
@@ -4280,14 +4731,6 @@ async function bridgeUnitTests() {
     const subtaskRoute = tools.routes.find((entry) => entry.path === '/dsh-wsl-tool/subtasks')
     check('the subtask route is namespaced', subtaskRoute !== undefined,
       JSON.stringify(tools.routes.map((entry) => entry.path)))
-    const readSubtasks = async (sessionId) => {
-      const response = {
-        writeHead() {},
-        end(text) { this.body = text },
-      }
-      await subtaskRoute.handler({ method: 'GET', url: `/dsh-wsl-tool/subtasks?session=${sessionId}` }, response)
-      return JSON.parse(response.body)
-    }
     // The self-info route is how a person (or a script) checks, after a restart, whether the
     // bridge half is really mounted and whether a page is polling right now.
     const infoRoute = tools.routes.find((entry) => entry.path === '/dsh-wsl-tool/info')
@@ -4303,18 +4746,49 @@ async function bridgeUnitTests() {
       JSON.stringify(Object.keys(info.terminal ?? {}).sort()) === '["bridge","bridgeCapable","kind"]'
       && JSON.stringify(Object.keys(info.terminal?.bridge ?? {}).sort()) === '["attachments","client","pending"]',
       JSON.stringify(info.terminal))
+    // The user's own terminals are a PAGE fact: only a live page can answer `userTerminals`, which
+    // is the same rule that makes an ad-hoc command fall back to the private shell when the window
+    // is closed. So the dock's check keeps a page polling for its whole length.
+    const page = makeBridgePage({ routes: tools.routes, live: shared })
+    let polling = true
+    const pump = (async () => {
+      while (polling) {
+        const batch = await page.poll()
+        for (const command of batch.commands ?? []) await page.handle(command)
+      }
+    })().catch(() => {})
+    await tickMs(10)
+    const readSubtasks = async (sessionId) => {
+      const response = {
+        writeHead() {},
+        end(text) { this.body = text },
+      }
+      const query = sessionId === undefined ? '' : `?session=${encodeURIComponent(sessionId)}`
+      await subtaskRoute.handler({ method: 'GET', url: `/dsh-wsl-tool/subtasks${query}` }, response)
+      return JSON.parse(response.body)
+    }
     // The user's terminal is listed as a record of its own once the dock asks for its session.
-    // No page polls here: the transport then falls back to the host controller's list, which is
-    // the pre-bridge path this fake host provides.
+    const inventoriesBefore = page.inventories
     let payload = await readSubtasks('session-1')
+    eq('the dock request answers only the session it asked about',
+      Object.keys(payload.sessions).join(','), 'session-1')
+    eq('and one request costs exactly one inventory round trip', page.inventories - inventoriesBefore, 1)
     const record = payload.sessions['session-1']?.entries?.[0]
     check('a terminal the user opened is listed beside the subtasks',
       String(record?.title ?? '').startsWith('用户建立的终端'), JSON.stringify(record))
     eq('and it is marked as a user terminal', record?.userTerminal, true)
     eq('and it shows as in use while the terminal runs', record?.status, 'running')
     eq('and it does not count as a running subtask', payload.sessions['session-1']?.running, 0)
+    // Polling again must not re-create or rewrite anything while the shell is unchanged: the row
+    // used to be refreshed (and re-sorted above real subtasks) on every 2 s poll.
+    const secondPoll = await readSubtasks('session-1')
+    eq('a second poll returns the same single record',
+      (secondPoll.sessions['session-1']?.entries ?? []).length, 1)
     // Closing it (the user closes the tab) ends that record; the tool never closes it itself.
     shared.length = 0
+    // The bridge caches the page's inventory for a second (the dock asks every 2 s), so a change
+    // is observed only after that TTL: waiting it out is what a real window would do too.
+    await tickMs(1_100)
     payload = await readSubtasks('session-1')
     const ended = payload.sessions['session-1']?.entries?.[0]
     eq('after the user closes it the record reads as ended', ended?.status, 'done')
@@ -4322,6 +4796,7 @@ async function bridgeUnitTests() {
     // The app re-creates a tab with a new id but the same shell title. That must be a NEW
     // record: the closed one keeps its ended state, and nothing is rewritten in place.
     shared.push(browserTerminalOf('shared-term-2', 'session-1'))
+    await tickMs(1_100)
     payload = await readSubtasks('session-1')
     const entries = payload.sessions['session-1']?.entries ?? []
     eq('a re-created terminal gets a second record', entries.length, 2)
@@ -4333,6 +4808,13 @@ async function bridgeUnitTests() {
       recreated?.title === '用户建立的终端「WSL」 #2', recreated?.title)
     eq('while the closed one still reads as ended', closed?.status, 'done')
     eq('and it still points at the old terminal', closed?.terminalId, 'shared-term')
+    // A request without `?session` still answers every logged conversation (the browser always
+    // names one; this keeps the route usable from a script).
+    const unfiltered = await readSubtasks(undefined)
+    check('a request without ?session still returns the logged session',
+      'session-1' in unfiltered.sessions, JSON.stringify(Object.keys(unfiltered.sessions)))
+    polling = false
+    await pump
   }
 }
 
@@ -4487,8 +4969,15 @@ async function channelUnitTests() {
     eq('the state file carries a 64-char token', state.token.length, 64)
     eq('the token is this channel instance\'s', state.token, channel.token)
 
-    const stateLine = await call('GET', '/state')
-    check('the state route answers the shim', stateLine.body.includes('enabled=1') && stateLine.body.includes(`port=${String(port)}`), stateLine.body)
+    // `/state` authenticates like every other route: the shim holds the token before it probes,
+    // and an unauthenticated status line would hand the port/session to anything on 127.0.0.1.
+    const stateDenied = await call('GET', '/state')
+    eq('the state route needs the channel token', stateDenied.status, 401)
+    const stateLine = await call('GET', '/state', undefined, { 'x-dsh-wsl-token': state.token })
+    check('the state route answers the shim with the token',
+      stateLine.status === 200
+      && stateLine.body.includes('enabled=1') && stateLine.body.includes(`port=${String(port)}`),
+      `[${stateLine.status}] ${stateLine.body}`)
 
     const denied = await call('POST', '/say', 'hi', { 'content-type': 'text/plain' })
     eq('a request without the token is refused', denied.status, 401)
@@ -4617,6 +5106,37 @@ async function channelUnitTests() {
     eq('a spent bonus wallet is not printed as a fraction of a cent', spentBonus.body.trim(), 'ok\t余额 ¥1.60')
     const balanceDenied = await call('POST', '/balance', '', { 'content-type': 'text/plain' })
     eq('the balance route needs the channel token', balanceDenied.status, 401)
+    // An empty/unreadable wallet is "unavailable", never a zero balance — the one thing the
+    // terminal line must not do is claim ¥0.00 for an account it could not read.
+    balanceReply = { status: 'ready', value: [], bonusWallets: [] }
+    const emptyWallet = await call('POST', '/balance', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('an empty wallet is unavailable, not zero', emptyWallet.body.trim(), 'ok\t暂不可用')
+    balanceReply = { status: 'ready', value: [{ currency: 'CNY', balance: null }], bonusWallets: [] }
+    const nullWallet = await call('POST', '/balance', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('a null balance is unavailable too', nullWallet.body.trim(), 'ok\t暂不可用')
+    balanceReply = { status: 'ready', value: [{ currency: 'CNY', balance: '0' }], bonusWallets: [] }
+    const zeroWallet = await call('POST', '/balance', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('a real zero balance is printed as zero', zeroWallet.body.trim(), 'ok\t余额 ¥0.00')
+
+    // A signed-in account with a large history: the picker (and `dsh list`) stays within the
+    // documented twelve-row cap, and the configured session stays visible even when it is not
+    // among the newest rows.
+    for (let index = 0; index < 20; index += 1) {
+      sessions.set(`extra-${String(index)}`, { id: `extra-${String(index)}`, cwd: 'D:\\work', createdAt: 1_000 + index })
+    }
+    const many = await call('POST', '/list', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    const manyRows = many.body.split('\n').filter((line) => line.trim() !== '')
+    check('the session list is capped at twelve rows', manyRows.length <= 12, String(manyRows.length))
+    check('and the configured session stays visible under the cap',
+      manyRows.some((line) => line.startsWith('wsl\t')), many.body.slice(0, 200))
+    for (const id of [...sessions.keys()].filter((key) => String(key).startsWith('extra-'))) sessions.delete(id)
+
+    // An id travels through the line protocol, the TSV list and the per-terminal current file:
+    // control characters and whitespace would split all three, so they are refused up front.
+    const badNew = await call('POST', '/new', 'a\tb', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('a session id with a control character is refused', badNew.status, 400)
+    const badRm = await call('POST', '/rm', 'a\tb', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('the archive route refuses it the same way', badRm.status, 400)
 
     const created = await call('POST', '/new', 'brand-new', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
     eq('a new session is created', created.body.trim(), 'ok\tbrand-new')
@@ -4645,8 +5165,22 @@ async function channelUnitTests() {
     check('the installed shim resolves its transport once per channel start, not per command',
       shim.includes('TRANSPORT_FILE') && shim.includes('--connect-timeout 0.25'),
       shim.slice(0, 500))
-    check('the installed shim asks for the account balance after a finished turn',
-      shim.includes('post balance') && shim.includes('账户余额'), shim.slice(-1200))
+    // The balance line changed: it is prefetched in the background with its own SHORT budget, it
+    // is never retried, its temp file is removed on every path (success, failure, Ctrl-C), and the
+    // end-of-turn arm prints it without holding the prompt open beyond ~0.6 s.
+    check('the installed shim prefetches the balance with its own short budget',
+      shim.includes('prefetch_balance')
+      && /--max-time 3[^\n]*--data-raw ''[^\n]*\$BASE\/balance/.test(shim)
+      && shim.slice(shim.indexOf("'~ack')")).includes('prefetch_balance'),
+      shim.slice(-1600))
+    check('the balance prefetch is never retried and is cleaned up on every exit path',
+      !/prefetch_balance[\s\S]{0,300}--retry/.test(shim)
+      && (shim.match(/rm -f "\$balance_file"/g) ?? []).length >= 2
+      && /trap '[^']*cleanup_balance/.test(shim),
+      shim.slice(-1600))
+    check('the installed shim prints the balance after a finished turn',
+      shim.slice(shim.indexOf("'~e '*)")).includes('report_balance')
+      && shim.includes('账户余额'), shim.slice(-1600))
     check('the installed shim names a large landing conversation as the cost of a slow turn',
       shim.includes('等待模型') && shim.includes('上下文较大'), shim.slice(-900))
     check('the installed shim shows the thinking clock as minutes and seconds',

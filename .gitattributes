@@ -1,0 +1,4 @@
+# The shim is a bash script: it must keep LF endings even on a Windows checkout
+# (`core.autocrlf=true` would otherwise rewrite the shebang to `bash\r`, which WSL
+# cannot execute). Everything else is read by Node, which tolerates either ending.
+extras/*.sh text eol=lf
