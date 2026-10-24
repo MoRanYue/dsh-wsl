@@ -739,7 +739,13 @@ export function apply(ctx, settings = {}) {
   })
   let channel = null
   try {
-    channel = createChannel({ ctx, config, wsl: (argv) => runWslHost(argv, config.distro) })
+    channel = createChannel({
+      ctx,
+      config,
+      wsl: (argv) => runWslHost(argv, config.distro),
+      // Lets a terminal prompt carry the screen of the terminal it was typed in (read-only).
+      transport: terminalTransport,
+    })
     // Lazy on purpose: a disabled channel must not bind a port or spawn wsl.exe. Turning
     // the switch on (or a mount that already has it on) starts it; the panel's install
     // action starts it too, because the shim needs the port and token it writes.

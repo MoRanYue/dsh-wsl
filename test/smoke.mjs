@@ -4936,6 +4936,9 @@ async function channelUnitTests() {
       get(id) {
         if (id === 'open-1') return { id }
         if (id === 'session-busy') return { id, status: 'running' }
+        // The terminal-history scenarios target this conversation; it must have a live agent
+        // (the bridge needs one to attach), while `session-a` stays archiveable below.
+        if (id === 'history-session') return { id }
         return undefined
       },
     },
@@ -5436,6 +5439,124 @@ async function channelUnitTests() {
 
     const refuseInstall = await createChannel({ ctx, config: { channelEnabled: false } }).install()
     eq('install without a wsl runner is refused', refuseInstall.ok, false)
+
+    // The terminal's own screen history travels with a terminal-sent prompt: a person typing at
+    // a shell has context in front of them, and the client conversation is where the answer goes.
+    // The transport is fixed at channel creation, so these scenarios use a second channel over a
+    // fake transport; it shares the fake host services, so the prompt it produces lands in
+    // `calls` like every other one.
+    {
+      const historyHome = mkdtempSync(join(tmpdir(), 'dsh-wsl-history-'))
+      const historyBehavior = {
+        screens: new Map(),
+        userTerminalsError: null,
+        followError: null,
+        calls: { userTerminals: 0, follow: 0 },
+      }
+      const historyTransport = {
+        async userTerminals() {
+          historyBehavior.calls.userTerminals += 1
+          if (historyBehavior.userTerminalsError !== null) throw historyBehavior.userTerminalsError
+          return [...historyBehavior.screens.keys()].map((id) => ({ id, title: 'WSL' }))
+        },
+        follow(_agent, terminalId, _attachmentId, _signal) {
+          historyBehavior.calls.follow += 1
+          if (historyBehavior.followError !== null) throw historyBehavior.followError
+          const screen = historyBehavior.screens.get(terminalId) ?? ''
+          return (async function* historyFrames() {
+            yield { type: 'snapshot', sequence: 0, screen }
+          })()
+        },
+      }
+      const historyChannel = createChannel({
+        ctx, config, wsl, transport: historyTransport, env: { USERPROFILE: historyHome },
+      })
+      const { port: historyPort } = await historyChannel.start()
+      const sayOnHistory = (text, extraHeaders = {}) => new Promise((resolve, reject) => {
+        const request = httpRequest({
+          host: '127.0.0.1', port: historyPort, method: 'POST', path: '/say',
+          headers: {
+            'content-type': 'text/plain',
+            'x-dsh-wsl-token': historyChannel.token,
+            'x-dsh-wsl-session': 'history-session',
+            ...extraHeaders,
+          },
+        }, (response) => {
+          const chunks = []
+          response.on('data', (chunk) => chunks.push(chunk))
+          response.on('end', () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+        })
+        request.on('error', reject)
+        request.write(text)
+        request.end()
+      })
+      const lastPromptText = () => calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.content?.[0]?.text ?? ''
+      try {
+        const message = '解释一下这个报错'
+        const screen = [
+          'xiny@XINY9:~$ git status --short',
+          ' M lib/tools/wsl.js',
+          'xiny@XINY9:~$ git log --oneline -3',
+          'abc1234 fix: something',
+          `xiny@XINY9:~$ dsh "${message}"`,
+        ].join('\r\n')
+        historyBehavior.screens.set('user-term', screen)
+        const withHistory = await sayOnHistory(message)
+        const promptText = lastPromptText()
+        check('a terminal prompt carries the screen history block',
+          promptText.includes('【终端历史】') && promptText.includes('【终端历史结束】'), promptText.slice(0, 200))
+        check('and it carries the commands that were already on the screen',
+          promptText.includes('git status --short') && promptText.includes('abc1234 fix: something'),
+          promptText.slice(0, 420))
+        check('while the original terminal message still follows the history',
+          promptText.endsWith(`${SAY_PREFIX}${message}`)
+          && promptText.indexOf('【终端历史结束】') < promptText.indexOf(`${SAY_PREFIX}${message}`),
+          promptText.slice(-200))
+        {
+          const block = promptText.slice(promptText.indexOf('【终端历史】'), promptText.indexOf('【终端历史结束】'))
+          check('the echoed dsh command line itself is not repeated inside the history',
+            block.length > 0 && !block.includes(message) && !block.includes(`dsh "${message}"`),
+            block.slice(-200))
+        }
+        check('and the turn still completes', withHistory.body.includes('~e 1'), withHistory.body.slice(-90))
+
+        // No transport at all (a build without one): exactly the old prompt shape.
+        await call('POST', '/say', message, {
+          'content-type': 'text/plain', 'x-dsh-wsl-token': state.token, 'x-dsh-wsl-session': 'history-session',
+        })
+        eq('without a transport the prompt is exactly the old shape', lastPromptText(), `${SAY_PREFIX}${message}`)
+
+        // A screen that is missing the typed command (a different tab, a cleared screen).
+        historyBehavior.screens.clear()
+        historyBehavior.screens.set('user-term', 'xiny@XINY9:~$ ls -la\r\ntotal 0\r\n')
+        await sayOnHistory(message)
+        eq('a screen without the typed command adds no history', lastPromptText(), `${SAY_PREFIX}${message}`)
+
+        // A failing terminal list / attach is silent context loss, never a failed prompt.
+        historyBehavior.screens.clear()
+        historyBehavior.screens.set('user-term', `xiny@XINY9:~$ dsh "${message}"`)
+        historyBehavior.userTerminalsError = new Error('no page is polling')
+        const failingList = await sayOnHistory(message)
+        eq('a failing terminal list still sends the prompt unchanged', lastPromptText(), `${SAY_PREFIX}${message}`)
+        check('and the turn itself is unaffected', failingList.body.includes('~e 1'), failingList.body.slice(-90))
+        historyBehavior.userTerminalsError = null
+        historyBehavior.followError = new Error('the attach was refused')
+        const failingFollow = await sayOnHistory(message)
+        void failingFollow
+        eq('a failing attach still sends the prompt unchanged', lastPromptText(), `${SAY_PREFIX}${message}`)
+        historyBehavior.followError = null
+
+        // A tool-invoked prompt (caller header present) was never typed at a screen, so it gets
+        // no history even though the transport could read one.
+        const readsBefore = historyBehavior.calls.userTerminals
+        await sayOnHistory(message, { 'x-dsh-wsl-caller': 'session-other' })
+        eq('a tool-invoked prompt is not given screen history', lastPromptText(), `${SAY_PREFIX}${message}`)
+        eq('and the transport is not even consulted for it', historyBehavior.calls.userTerminals, readsBefore)
+      } finally {
+        await historyChannel.stop()
+        try { rmSync(historyHome, { recursive: true, force: true }) } catch {}
+      }
+    }
 
     // Last, because it tears the channel down: a plugin unmount / hot reload destroys in-flight
     // streams, but that is NOT a Ctrl+C — cancelling there would kill a turn the user is still

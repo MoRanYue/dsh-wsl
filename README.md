@@ -493,6 +493,8 @@ A `dsh "…"` aimed at the very conversation whose tool call is running it canno
 
 While a turn streams, the terminal has no prompt — but it is still yours: press Enter once and the answer is held back (the live clock stops painting, the input line is clean), type the message, press Enter again and it is delivered to the same conversation as an insert (steer), after which the answer resumes (`已插入当前对话，继续输出`). A second empty Enter cancels. Set `DSH_WSL_NO_STEER=1` to turn that reader off (scripts and pipes never get it; only a real terminal does).
 
+A terminal prompt also carries what you were just looking at: the Host asks the page's terminal bridge for a **read-only snapshot of the terminal the command was typed in** (found by the command line itself), and prefixes the conversation message with up to sixty lines of that screen, framed as 【终端历史】. It is best effort and bounded — no open DSH window, no matching terminal, or a slow attach simply means no snapshot, and the turn is never delayed by more than ~3 s. A prompt that came from a tool call gets no snapshot: nobody typed it at a screen.
+
 Set it up once in the panel: turn on **启用 dsh 命令** and click **安装 dsh 命令** — the default landing is the most recently active conversation — the one you are looking at (pick another from the list, or create one right there, if you want a different landing); the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
 server to the address WSL uses as its default gateway, on a random port, and demands
 the token it generated at mount on every request. The desktop has to be running, and
@@ -692,7 +694,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1218 host checks against real WSL (shim for ctx.subprocess) + 301 client checks
+npm test          # 1230 host checks against real WSL (shim for ctx.subprocess) + 301 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 
