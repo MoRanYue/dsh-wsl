@@ -302,6 +302,35 @@ cmd_say() {
   local session=$1 prompt=$2
   local reason=0 ended=0 line ms steps tin tout breason ok text_reason
   local ticker='' reason_start=0 ack_ticker='' ack_start=0
+  local balance_pid='' balance_file=''
+  # The account wallet is fetched in the background from the moment the Host accepts the turn,
+  # so the end-of-turn line costs nothing: by the time the reply finishes it is already there.
+  prefetch_balance() {
+    [ -n "$balance_pid" ] && return
+    balance_file="$STATE_DIR/balance.$$"
+    ( post balance > "$balance_file" 2>/dev/null ) &
+    balance_pid=$!
+  }
+  report_balance() {
+    [ -n "$balance_pid" ] || return
+    wait "$balance_pid" 2>/dev/null
+    balance_pid=''
+    local reply='' body=''
+    if [ -r "$balance_file" ]; then IFS= read -r reply < "$balance_file"; fi
+    rm -f "$balance_file"
+    case "$reply" in
+      ok*)
+        body=${reply#ok}
+        body=${body#$'\t'}
+        case "$body" in
+          '未登录') body='未登录 DeepSeek 账号' ;;
+          '暂不可用') return ;;
+          '') return ;;
+        esac
+        printf '账户余额：%s\n' "$body"
+        ;;
+    esac
+  }
   # `~ack` only says the Host accepted the request; the model's first frame can be seconds
   # away when the target conversation carries a large context. A live elapsed counter from
   # that moment makes the wait honest instead of looking frozen.
@@ -344,7 +373,7 @@ cmd_say() {
   local -a rest
   while IFS= read -r line; do
     case "$line" in
-      '~ack') start_ack_ticker ;;
+      '~ack') start_ack_ticker; prefetch_balance ;;
       '~r '*)
         stop_ack_ticker
         ms=${line#'~r '}
@@ -368,6 +397,7 @@ cmd_say() {
       '~p') ;;
       '~x '*)
         stop_reason
+        [ -n "$balance_pid" ] && kill "$balance_pid" 2>/dev/null
         text_reason=$(printf '%s' "${line#'~x '}" | base64 -d)
         printf '\ndsh: %s\n' "$text_reason" >&2
         exit 1
@@ -386,10 +416,11 @@ cmd_say() {
           printf '提示：目标会话上下文较大（in %s tok），每回合都要重发；终端聊天可先 %s 建一个精简会话\n' \
             "$tin" '`dsh new terminal`' >&2
         fi
+        report_balance
         ended=1
         [ "$ok" = 1 ] && exit 0 || exit 1
         ;;
-      'err'*) stop_ack_ticker; die "${line#err	}" ;;
+      'err'*) stop_ack_ticker; [ -n "$balance_pid" ] && kill "$balance_pid" 2>/dev/null; die "${line#err	}" ;;
       *) printf '%s\n' "$line" ;;
     esac
   done < <(post say "$prompt" "$session")

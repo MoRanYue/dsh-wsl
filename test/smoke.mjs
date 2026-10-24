@@ -4381,6 +4381,12 @@ async function channelUnitTests() {
     ['wsl', { id: 'wsl', cwd: 'D:\\work', createdAt: 2 }],
   ])
   const emit = (name, ...args) => { for (const fn of listeners.get(name) ?? []) fn(...args) }
+  let balanceReply = {
+    status: 'ready',
+    value: [{ currency: 'CNY', balance: '12.5' }],
+    bonusWallets: [{ currency: 'CNY', balance: '2' }],
+  }
+  const balanceClients = []
   const services = {
     sessionController: {
       async prompt(request, signal) {
@@ -4424,6 +4430,12 @@ async function channelUnitTests() {
     },
     workspaceController: {
       async archiveSession(request) { calls.push(['archive', request]); return {} },
+    },
+    deepseekAccount: {
+      async getBalance(client) {
+        balanceClients.push(client)
+        return balanceReply
+      },
     },
     agents: {
       get(id) {
@@ -4582,6 +4594,27 @@ async function channelUnitTests() {
     check('the CLI current session is marked', cliLines.some((line) => line.startsWith('session-a\t') && line.endsWith('*')), cliListed.body)
     check('the panel landing is not marked when the CLI switched', !cliLines.some((line) => line.startsWith('wsl\t') && line.endsWith('*')), cliListed.body)
 
+    // The wallet is read host-side with the account service's own client identity headers;
+    // a signed-out or failed read is reported as such, never formatted as a zero balance.
+    const wallet = await call('POST', '/balance', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('the balance route formats the wallet', wallet.body.trim(), 'ok\t余额 ¥12.50（赠金 ¥2.00）')
+    check('it carries the client identity the account service expects',
+      typeof balanceClients[0]?.version === 'string' && balanceClients[0].version !== ''
+      && balanceClients[0]?.locale === 'zh-CN'
+      && typeof balanceClients[0]?.timezoneOffsetSeconds === 'number',
+      JSON.stringify(balanceClients[0]))
+    balanceReply = null
+    const signedOut = await call('POST', '/balance', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('a signed-out account is reported, not shown as zero', signedOut.body.trim(), 'ok\t未登录')
+    balanceReply = { status: 'failed' }
+    const failedRead = await call('POST', '/balance', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('a failed read is not a zero balance either', failedRead.body.trim(), 'ok\t暂不可用')
+    balanceReply = { status: 'ready', value: [{ currency: 'USD', balance: '0.004' }], bonusWallets: [] }
+    const subCent = await call('POST', '/balance', '', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
+    eq('a sub-cent balance reads as <0.01', subCent.body.trim(), 'ok\t余额 <$0.01')
+    const balanceDenied = await call('POST', '/balance', '', { 'content-type': 'text/plain' })
+    eq('the balance route needs the channel token', balanceDenied.status, 401)
+
     const created = await call('POST', '/new', 'brand-new', { 'content-type': 'text/plain', 'x-dsh-wsl-token': state.token })
     eq('a new session is created', created.body.trim(), 'ok\tbrand-new')
     const createCall = calls.find((entry) => entry[0] === 'create')
@@ -4609,6 +4642,8 @@ async function channelUnitTests() {
     check('the installed shim resolves its transport once per channel start, not per command',
       shim.includes('TRANSPORT_FILE') && shim.includes('--connect-timeout 0.25'),
       shim.slice(0, 500))
+    check('the installed shim asks for the account balance after a finished turn',
+      shim.includes('post balance') && shim.includes('账户余额'), shim.slice(-1200))
     check('the installed shim names a large landing conversation as the cost of a slow turn',
       shim.includes('等待模型') && shim.includes('上下文较大'), shim.slice(-900))
 
