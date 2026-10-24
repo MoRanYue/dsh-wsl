@@ -202,7 +202,7 @@ check('spill file starts at the head of the stream', readFileSync(big.stdoutSpil
 const timedOut = await tools.wsl.execute({ command: 'sleep 60', description: 'slow', timeoutMs: 1200 })
 check('timeout is classified', timedOut.timedOut === true)
 // Match the probe's own command line, not any `sleep`: the terminal shim's live clock also spawns `sleep 0.2` children, which are unrelated.
-const orphan = await tools.wsl.execute({ command: `pgrep -f 'sleep 60' || echo NO_ORPHAN`, description: 'orphan check' })
+const orphan = await tools.wsl.execute({ command: `pgrep -f '[s]leep 60' || echo NO_ORPHAN`, description: 'orphan check' })
 check('provider kills the Linux side too', orphan.stdout.includes('NO_ORPHAN'), JSON.stringify(orphan.stdout.trim()))
 
 const pathTool = await tools['wsl-path'].execute({ path: 'C:\\Program Files\\Git' })
