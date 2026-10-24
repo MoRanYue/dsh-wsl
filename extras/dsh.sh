@@ -251,22 +251,35 @@ cmd_status() {
 cmd_say() {
   local session=$1 prompt=$2
   local reason=0 ended=0 line ms steps tin tout breason ok text_reason
-  local ticker='' reason_start=0 ack_note=0
-  # `~ack` arrives as soon as the Host accepted the request, long before the model's first
-  # token. Saying so on that line is what makes the command feel immediate; the first timer or
-  # text frame erases it.
-  clear_ack_note() {
-    if [ "$ack_note" = 1 ]; then
+  local ticker='' reason_start=0 ack_ticker='' ack_start=0
+  # `~ack` only says the Host accepted the request; the model's first frame can be seconds
+  # away when the target conversation carries a large context. A live elapsed counter from
+  # that moment makes the wait honest instead of looking frozen.
+  stop_ack_ticker() {
+    if [ -n "$ack_ticker" ]; then
+      kill "$ack_ticker" 2>/dev/null
+      wait "$ack_ticker" 2>/dev/null
+      ack_ticker=''
       printf '\r\033[2K'
-      ack_note=0
     fi
+  }
+  start_ack_ticker() {
+    ack_start=$(date +%s%3N)
+    (
+      while :; do
+        now=$(date +%s%3N)
+        printf '\r\033[2m… 已送达，等待模型 %ds\033[0m' $(( (now - ack_start) / 1000 ))
+        sleep 0.2
+      done
+    ) &
+    ack_ticker=$!
   }
   # The first `~r` only says WHEN reasoning began: the elapsed time up to that point would stay
   # frozen on screen while the model keeps thinking. Keep a live clock instead — it ticks on the
   # same line (carriage return) until the first text arrives.
   stop_reason() {
     local had=$reason
-    clear_ack_note
+    stop_ack_ticker
     if [ -n "$ticker" ]; then
       kill "$ticker" 2>/dev/null
       wait "$ticker" 2>/dev/null
@@ -281,14 +294,9 @@ cmd_say() {
   local -a rest
   while IFS= read -r line; do
     case "$line" in
-      '~ack')
-        if [ "$ack_note" = 0 ]; then
-          printf '\033[2m… 已送达，等待回复\033[0m'
-          ack_note=1
-        fi
-        ;;
+      '~ack') start_ack_ticker ;;
       '~r '*)
-        clear_ack_note
+        stop_ack_ticker
         ms=${line#'~r '}
         if [ "$reason" != 1 ]; then
           reason=1
@@ -305,12 +313,11 @@ cmd_say() {
         fi
         ;;
       '~t '*) stop_reason ;;
-      '~a '*) stop_reason; printf '%s' "${line#'~a '}" | base64 -d ;;
+      '~a '*) stop_ack_ticker; stop_reason; printf '%s' "${line#'~a '}" | base64 -d ;;
       '~step '*) ;;
       '~p') ;;
       '~x '*)
         stop_reason
-        clear_ack_note
         text_reason=$(printf '%s' "${line#'~x '}" | base64 -d)
         printf '\ndsh: %s\n' "$text_reason" >&2
         exit 1
@@ -326,7 +333,7 @@ cmd_say() {
         ended=1
         [ "$ok" = 1 ] && exit 0 || exit 1
         ;;
-      'err'*) clear_ack_note; die "${line#err	}" ;;
+      'err'*) stop_ack_ticker; die "${line#err	}" ;;
       *) printf '%s\n' "$line" ;;
     esac
   done < <(post say "$prompt" "$session")
