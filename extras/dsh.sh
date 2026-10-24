@@ -20,7 +20,7 @@ tty_key() {
   local t
   t=$(tty 2>/dev/null || true)
   case "$t" in
-    /dev/*) printf '%s' "$(basename "$t")" ;;
+    /dev/*) printf '%s' "${t##*/}" ;;
     *) printf '%s' 'shared' ;;
   esac
 }
@@ -53,16 +53,60 @@ usage() {
 EOF
 }
 
-cfg_json() { grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$CONFIG" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)"$/\1/'; }
-cfg_num() { grep -o "\"$1\"[[:space:]]*:[[:space:]]*[0-9][0-9]*" "$CONFIG" 2>/dev/null | head -1 | grep -o '[0-9][0-9]*$'; }
+# Read the few fields this shim needs with bash builtins only. This used to be a dozen
+# grep/sed/head forks on EVERY command — that alone was most of the delay of `dsh use`, which
+# touches no network at all.
+read_config() {
+  TOKEN=''
+  PORT=''
+  ENABLED=0
+  DEFAULT_SESSION=''
+  STARTED=''
+  HOST=''
+  local line value
+  while IFS= read -r line; do
+    case "$line" in
+      *'"token"'*)
+        value=${line#*: }
+        value=${value%,}
+        value=${value#\"}
+        value=${value%\"}
+        TOKEN=$value
+        ;;
+      *'"port"'*)
+        value=${line#*: }
+        value=${value%,}
+        PORT=${value//[!0-9]/}
+        ;;
+      *'"enabled"'*)
+        case "$line" in *true*) ENABLED=1 ;; esac
+        ;;
+      *'"sessionId"'*)
+        value=${line#*: }
+        value=${value%,}
+        value=${value#\"}
+        value=${value%\"}
+        DEFAULT_SESSION=$value
+        ;;
+      *'"startedAt"'*)
+        value=${line#*: }
+        value=${value%,}
+        STARTED=${value//[!0-9]/}
+        ;;
+      *'"host"'*)
+        value=${line#*: }
+        value=${value%,}
+        value=${value#\"}
+        value=${value%\"}
+        HOST=$value
+        ;;
+    esac
+  done < "$CONFIG"
+}
 
 load_channel() {
   [ -r "$CONFIG" ] || die "找不到通道配置 $CONFIG —— 先在 DSH 侧边栏的 WSL 面板里打开「启用 dsh 命令」并安装 dsh 命令"
-  TOKEN=$(cfg_json token)
-  PORT=$(cfg_num port)
-  ENABLED=$(grep -o '"enabled"[[:space:]]*:[[:space:]]*true' "$CONFIG" >/dev/null 2>&1 && echo 1 || echo 0)
-  DEFAULT_SESSION=$(cfg_json sessionId)
-  STARTED=$(cfg_num startedAt)
+  read_config
   [ -n "${TOKEN:-}" ] && [ -n "${PORT:-}" ] || die "通道配置不完整 —— 在 DSH 面板里重新安装一次 dsh 命令"
   [ "$ENABLED" = 1 ] || die "WSL 通道没有启用 —— 在 DSH 侧边栏的 WSL 面板里打开「启用 dsh 命令」"
   # Reuse the transport that worked for this exact channel instance. This is the hot path:
@@ -79,10 +123,8 @@ load_channel() {
   fi
   # First command after a (re)start: resolve the address once and probe with a SHORT connect
   # timeout, so a blocked path costs ~0.5 s instead of seconds.
-  local host
-  host=$(cfg_json host)
-  if [ -n "${host:-}" ]; then
-    BASE="http://$host:$PORT"
+  if [ -n "${HOST:-}" ]; then
+    BASE="http://$HOST:$PORT"
   else
     GW=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
     [ -n "${GW:-}" ] || die "WSL 没有默认网关，无法连到 DSH 宿主机"
@@ -110,12 +152,13 @@ load_channel() {
 }
 
 current_session() {
-  local saved=''
-  [ -r "$CURRENT_FILE" ] && saved=$(tr -d '[:space:]' < "$CURRENT_FILE")
+  local saved='' line=''
+  if [ -r "$CURRENT_FILE" ]; then IFS= read -r line < "$CURRENT_FILE" || true; saved=${line//[[:space:]]/}; fi
   # A terminal that has never chosen one adopts the old shared value once (upgrade path);
   # after its first `use`/`new` the per-terminal file is the only source.
   if [ -z "$saved" ] && [ -r "$STATE_DIR/current" ]; then
-    saved=$(tr -d '[:space:]' < "$STATE_DIR/current")
+    IFS= read -r line < "$STATE_DIR/current" || true
+    saved=${line//[[:space:]]/}
   fi
   [ -n "$saved" ] && { printf '%s' "$saved"; return; }
   # Empty means auto: the host keeps a dedicated session for the terminal.
@@ -238,10 +281,17 @@ cmd_status() {
   [ -n "$session_line" ] || session_line='默认（最近活跃会话）'
   CURRENT_SESSION=$session_line
   # The Host's channel landing (panel setting) and this shell's current session can differ;
-  # naming them apart is what stops one being mistaken for the other.
-  landing=$(printf '%s\n' "$state" | sed -n 's/.*session=\([^ ]*\).*/\1/p')
+  # naming them apart is what stops one being mistaken for the other. Parsed with builtins:
+  # `dsh status` should not pay for sed/tr forks on a line of text.
+  local state_line
+  landing=''
+  while IFS= read -r state_line; do
+    case "$state_line" in
+      session=*) landing=${state_line#session=} ;;
+    esac
+  done <<< "$state"
   printf '当前会话：%s\n' "${CURRENT_SESSION:-$(current_session)}"
-  printf '通道：%s\n' "$(printf '%s\n' "$state" | tr '\n' ' ')"
+  printf '通道：%s\n' "${state//$'\n'/ }"
   if [ -n "${landing:-}" ]; then printf '面板落点：%s（未用 dsh use 指定时的目标）\n' "$landing"; fi
   printf 'shim：%s\n' "$(command -v dsh || printf '未知')"
   printf '客户端：%s\n' "$CURL"
@@ -354,12 +404,16 @@ case "$1" in
   -h|--help|help) usage; exit 0 ;;
 esac
 
+# `use` touches one local file: no channel, no network, no probe.
+case "$1" in
+  use) cmd_use "${2:-}"; exit 0 ;;
+esac
+
 load_channel
 
 case "$1" in
   list|ls) cmd_list; exit 0 ;;
   new) cmd_new "${2:-}"; exit 0 ;;
-  use) cmd_use "${2:-}"; exit 0 ;;
   rm|archive) cmd_rm "${2:-}"; exit 0 ;;
   status) cmd_status; exit 0 ;;
   insert)
