@@ -320,6 +320,8 @@ cmd_say() {
   local ticker='' reason_start=0 ack_ticker='' ack_start=0
   local shell_pid=$$ balance_pid='' balance_file='' say_status='' tick_fd=''
   local got_frame=0 attempt=0 say_exit=0
+  local start_us=0 last_status_us=0 step_count=0 last_reason_ms=0
+  local DURATION='' TOKENS='' sec='' frac='' tin_text='' tout_text='' reason_note=''
   # The account wallet is fetched in the background from the moment the Host accepts the turn,
   # so the end-of-turn line normally costs nothing. It has its own 3 s budget and is never
   # retried: a slow account service must not hold the prompt open after the answer is printed.
@@ -395,18 +397,51 @@ cmd_say() {
       CLOCK_US=$(($(date +%s%N) / 1000))
     fi
   }
+  # `41s` under a minute, `34分18秒` above it: a 2058.0s turn should not read like a timer.
+  format_duration_ms() {
+    local ms=${1:-0} total
+    total=$((ms / 1000))
+    if [ "$total" -ge 60 ]; then
+      printf -v sec '%02d' $((total % 60))
+      DURATION=$((total / 60))分${sec}秒
+    else
+      DURATION=${total}s
+    fi
+  }
+  # The live-progress lines read like the thinking clock (`0分41秒`) even under a minute.
+  format_clock_ms() {
+    local ms=${1:-0} total
+    total=$((ms / 1000))
+    printf -v sec '%02d' $((total % 60))
+    DURATION=$((total / 60))分${sec}秒
+  }
+  # `187` stays readable; `12345` becomes `12.3k` (builtins only: this runs at turn end).
+  format_tokens() {
+    local n=${1:-0}
+    if [ "$n" -ge 1000 ]; then
+      printf -v frac '%d' $(((n % 1000) / 100))
+      TOKENS=$((n / 1000)).${frac}k
+    else
+      TOKENS=$n
+    fi
+  }
   # Zero-fork tick: a FIFO held open read-write gives `read -t` a blocking descriptor that never
   # data or EOF, so a 0.2 s tick costs no `date` and no `sleep` process. The FIFO is unlinked at
   # once; the descriptor (8) stays valid for this process and its ticker subshells.
   ensure_tick_fd() {
     [ -n "${tick_fd:-}" ] && return
     local fifo="${TMPDIR:-/tmp}/dsh-wsl-tick.$$"
-    if mkfifo "$fifo" 2>/dev/null && exec 8<>"$fifo" 2>/dev/null; then
-      rm -f "$fifo"
-      tick_fd=8
-      return
+    if mkfifo "$fifo" 2>/dev/null; then
+      # `exec 8<>file 2>/dev/null` would redirect THIS shell's stderr for the rest of the turn
+      # (a bare `exec` applies every redirection permanently), silently swallowing every later
+      # error line. The brace group scopes the stderr redirect; fd 8 still survives it.
+      if { exec 8<>"$fifo"; } 2>/dev/null; then
+        rm -f "$fifo"
+        tick_fd=8
+        return
+      fi
+      rm -f "$fifo" 2>/dev/null
     fi
-    rm -f "$fifo" 2>/dev/null
     tick_fd='none'
   }
   tick_wait() {
@@ -444,6 +479,36 @@ cmd_say() {
     if [ "$had" = 1 ]; then printf '\033[0m\n'; fi
     reason=2
   }
+  # The first text frame ends the thinking phase: close the live clock with one honest summary
+  # line instead of freezing it mid-number, then leave the terminal to the answer itself.
+  finish_thinking() {
+    [ "$reason" = 2 ] && return
+    local elapsed_ms
+    clock_us
+    if [ "$reason" = 1 ]; then
+      elapsed_ms=$((last_reason_ms + (CLOCK_US - reason_start) / 1000))
+    else
+      elapsed_ms=$(( (CLOCK_US - start_us) / 1000 ))
+    fi
+    stop_reason
+    format_clock_ms "$elapsed_ms"
+    printf '\033[2m⏱ 思考 %s · 开始输出\033[0m\n' "$DURATION"
+    last_status_us=$CLOCK_US
+  }
+  # After the text started, a step boundary is the natural place for a progress line. The 10 s
+  # throttle keeps a 98-step turn to a handful of lines instead of one per step (and the clock
+  # read is a builtin, so no `date` process appears in the tick period).
+  maybe_step_status() {
+    [ "$reason" = 2 ] || return
+    clock_us
+    [ $(( (CLOCK_US - last_status_us) / 1000 )) -ge 10000 ] || return
+    format_clock_ms $(( (CLOCK_US - start_us) / 1000 ))
+    printf '\n\033[2m⏱ 已用 %s · 第 %d 步\033[0m\n' "$DURATION" "$step_count"
+    last_status_us=$CLOCK_US
+  }
+  clock_us
+  start_us=$CLOCK_US
+  last_status_us=$CLOCK_US
   # A host crash or a closed connection ends the stream WITHOUT the frames that stop the
   # clock; without this the ticker would keep printing on this terminal forever. The same
   # handler releases the balance request and its temp file on every interruption path.
@@ -460,6 +525,7 @@ cmd_say() {
           ms=${line#'~r '}
           ms=${ms//[!0-9]/}
           [ -n "$ms" ] || ms=0
+          last_reason_ms=$ms
           if [ "$reason" != 1 ]; then
             reason=1
             ensure_tick_fd
@@ -477,9 +543,12 @@ cmd_say() {
             ticker=$!
           fi
           ;;
-        '~t '*) stop_reason ;;
-        '~a '*) stop_ack_ticker; stop_reason; printf '%s' "${line#'~a '}" | base64 -d ;;
-        '~step '*) ;;
+        '~t '*) finish_thinking ;;
+        '~a '*) stop_ack_ticker; finish_thinking; printf '%s' "${line#'~a '}" | base64 -d ;;
+        '~step '*)
+          step_count=$((step_count + 1))
+          maybe_step_status
+          ;;
         '~p') ;;
         '~x '*)
           stop_reason
@@ -494,11 +563,23 @@ cmd_say() {
           read -r _ ok ms steps tin tout breason <<< "$line"
           ms=${ms:-0}
           ms=${ms//[!0-9]/}
+          tin=${tin//[!0-9]/}
+          tout=${tout//[!0-9]/}
+          [ -n "$tin" ] || tin=0
+          [ -n "$tout" ] || tout=0
           text_reason=$(printf '%s' "${breason:-}" | base64 -d 2>/dev/null)
+          case "$text_reason" in
+            ''|completed|done|finished) reason_note='' ;;
+            error) reason_note='（回合出错）' ;;
+            timeout) reason_note='（超时）' ;;
+            *) reason_note="（${text_reason}）" ;;
+          esac
+          format_duration_ms "$ms"
+          format_tokens "$tin"; tin_text=$TOKENS
+          format_tokens "$tout"; tout_text=$TOKENS
           printf '\n'
-          printf '✓ 完成 %d.%01ds · %s 步 · in %s / out %s tok%s\n' \
-            $((ms / 1000)) $(((ms % 1000) / 100)) "$steps" "$tin" "$tout" \
-            "${text_reason:+ (${text_reason})}"
+          printf '✓ 完成 %s · %s 步 · in %s / out %s tok%s\n' \
+            "$DURATION" "${steps:-0}" "$tin_text" "$tout_text" "$reason_note"
           # A large landing conversation is the usual reason a terminal turn takes seconds: each
           # message re-sends its whole context. Naming the cause beats letting it look like lag.
           if [ "${tin:-0}" -gt 50000 ] 2>/dev/null; then
@@ -510,7 +591,7 @@ cmd_say() {
           ended=1
           [ "$ok" = 1 ] && exit 0 || exit 1
           ;;
-        'err'*) stop_ack_ticker; cleanup_balance; cleanup_say; die "${line#err	}" ;;
+        'err'*) stop_reason; cleanup_balance; cleanup_say; die "${line#err	}" ;;
         *) printf '%s\n' "$line" ;;
       esac
     done < <(post say "$prompt" "$session"; printf '%s' "$?" > "$say_status")

@@ -4858,6 +4858,9 @@ async function channelUnitTests() {
   const home = mkdtempSync(join(tmpdir(), 'dsh-wsl-channel-'))
   const listeners = new Map()
   const calls = []
+  // One-shot script for the next `prompt` call, so a test can emit exactly the events its
+  // scenario is about (multi-step usage, a stream-only usage, ...). Null = the default answer.
+  let promptScript = null
   const sessions = new Map([
     ['session-a', { id: 'session-a', cwd: 'D:\\work', createdAt: 3 }],
     ['wsl', { id: 'wsl', cwd: 'D:\\work', createdAt: 2 }],
@@ -4874,6 +4877,10 @@ async function channelUnitTests() {
       async prompt(request, signal) {
         calls.push(['prompt', request, signal])
         const id = request.sessionId
+        if (typeof promptScript === 'function') {
+          promptScript(emit, id)
+          return { accepted: true }
+        }
         setTimeout(() => {
           emit('agent/assistant-stream', { agent: { session: { id } }, frame: { type: 'start' } })
           emit('agent/assistant-stream', { agent: { session: { id } }, frame: { type: 'chunk', chunk: { type: 'reasoning-delta', text: 'why' } } })
@@ -5043,6 +5050,57 @@ async function channelUnitTests() {
     })
     eq('a prompt from another session still streams', callerElsewhere.status, 200)
 
+    // Multi-step turns: every `assistant/message` carries THAT step's usage, so the end frame
+    // must report the SUM over the turn. The live `usage` chunk is only the current step's
+    // progress (and the fallback when no message-level usage arrives). The measured regression:
+    // a long task ended with `in 187 / out 42 tok` while the turn had spent far more.
+    {
+      const endUsage = (body) => {
+        const end = (body.split('\n').find((line) => line.startsWith('~e ')) ?? '').split(' ')
+        return { ok: end[1], steps: end[3], usage: `${end[4]}/${end[5]}` }
+      }
+      promptScript = (emit, id) => {
+        setTimeout(() => {
+          emit('session/event', { id }, { type: 'step/start', data: { turn: 1, step: 1 } })
+          emit('session/event', { id }, {
+            type: 'assistant/message',
+            data: { message: { content: [] }, usage: { inputTokens: 20, outputTokens: 3 } },
+          })
+          emit('session/event', { id }, { type: 'step/start', data: { turn: 1, step: 2 } })
+          emit('session/event', { id }, {
+            type: 'assistant/message',
+            data: { message: { content: [] }, usage: { inputTokens: 10, outputTokens: 2 } },
+          })
+          emit('session/event', { id }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+        }, 5)
+      }
+      const multi = await call('POST', '/say', 'two steps', {
+        'content-type': 'text/plain', 'x-dsh-wsl-token': state.token, 'x-dsh-wsl-session': 'session-a',
+      })
+      const multiEnd = endUsage(multi.body)
+      eq('a two-step turn sums both steps\' usage in the end frame', multiEnd.usage, '30/5')
+      eq('and the end frame counts both steps', multiEnd.steps, '2')
+      // Control: no message-level usage at all. The streamed usage chunk is the fallback, and it
+      // must be reported instead of a zero that reads like a free turn.
+      promptScript = (emit, id) => {
+        setTimeout(() => {
+          emit('agent/assistant-stream', {
+            agent: { session: { id } },
+            frame: { type: 'chunk', chunk: { type: 'usage', usage: { inputTokens: 7, outputTokens: 3 } } },
+          })
+          emit('session/event', { id }, { type: 'step/start', data: { turn: 1, step: 1 } })
+          emit('session/event', { id }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+        }, 5)
+      }
+      const streamOnly = await call('POST', '/say', 'stream usage only', {
+        'content-type': 'text/plain', 'x-dsh-wsl-token': state.token, 'x-dsh-wsl-session': 'session-a',
+      })
+      const streamEnd = endUsage(streamOnly.body)
+      eq('without step usage the streamed usage is the fallback', streamEnd.usage, '7/3')
+      check('and it is not reported as a free turn', streamEnd.usage !== '0/0', streamEnd.usage)
+      promptScript = null
+    }
+
     // `dsh insert`: the supported way to put a message into a conversation without waiting for
     // its turn — including the conversation that is running this very command.
     const inserted = await call('POST', '/insert', 'note for later', {
@@ -5185,6 +5243,34 @@ async function channelUnitTests() {
       shim.includes('等待模型') && shim.includes('上下文较大'), shim.slice(-900))
     check('the installed shim shows the thinking clock as minutes and seconds',
       shim.includes('分%02d秒') && shim.includes('思考中'), shim.slice(-900))
+    // The clock/status contract the terminal reader depends on: a live thinking clock, an
+    // honest summary when the text starts, a throttled step line, and a completion line that
+    // formats minutes and seconds (and not a raw millisecond count).
+    check('the shim owns the thinking clock and status-line words',
+      shim.includes('⏱ 思考') && shim.includes('开始输出')
+      && shim.includes('⏱ 已用') && shim.includes('第 %d 步'),
+      shim.slice(-2000))
+    check('the completion line formats minutes and seconds',
+      shim.includes('分${sec}秒') && shim.includes('✓ 完成') && shim.includes('format_duration_ms'),
+      shim.slice(-2000))
+    // Zero-fork tick: bash's $EPOCHREALTIME plus a FIFO-held descriptor gives `read -t` something
+    // to wait on, so a 0.2 s tick spawns neither `date` nor `sleep`. The millisecond `date` form
+    // is what used to fork on every tick and froze the clock when the model started talking.
+    check('the clock ticks without forking date or sleep per tick',
+      shim.includes('EPOCHREALTIME') && shim.includes('read -r -t 0.2 -u 8')
+      && shim.includes('mkfifo') && !shim.includes('date +%s%3N'),
+      shim.slice(-2000))
+    // A failed turn must wipe the live status line before printing its error, or the terminal is
+    // left with a stale `… 思考中` prefix glued to the failure text.
+    {
+      const xArm = shim.slice(shim.indexOf("'~x '*"))
+      const errArm = shim.slice(shim.indexOf("'err'*)"))
+      check('a failed turn erases the live status line before it complains',
+        shim.includes("printf '\\r\\033[2K'")
+        && xArm.indexOf('stop_reason') >= 0 && xArm.indexOf('stop_reason') < xArm.indexOf('dsh: %s')
+        && /^'err'\*\) stop_reason/.test(errArm),
+        `${JSON.stringify(xArm.slice(0, 90))} | ${JSON.stringify(errArm.slice(0, 60))}`)
+    }
 
     const refuseInstall = await createChannel({ ctx, config: { channelEnabled: false } }).install()
     eq('install without a wsl runner is refused', refuseInstall.ok, false)
