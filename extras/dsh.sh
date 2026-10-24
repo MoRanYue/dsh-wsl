@@ -330,6 +330,12 @@ cmd_say() {
         printf '✓ 完成 %d.%01ds · %s 步 · in %s / out %s tok%s\n' \
           $((ms / 1000)) $(((ms % 1000) / 100)) "$steps" "$tin" "$tout" \
           "${text_reason:+ (${text_reason})}"
+        # A large landing conversation is the usual reason a terminal turn takes seconds: each
+        # message re-sends its whole context. Naming the cause beats letting it look like lag.
+        if [ "${tin:-0}" -gt 50000 ] 2>/dev/null; then
+          printf '提示：目标会话上下文较大（in %s tok），每回合都要重发；终端聊天可先 %s 建一个精简会话\n' \
+            "$tin" '`dsh new terminal`' >&2
+        fi
         ended=1
         [ "$ok" = 1 ] && exit 0 || exit 1
         ;;

@@ -4609,6 +4609,8 @@ async function channelUnitTests() {
     check('the installed shim resolves its transport once per channel start, not per command',
       shim.includes('TRANSPORT_FILE') && shim.includes('--connect-timeout 0.25'),
       shim.slice(0, 500))
+    check('the installed shim names a large landing conversation as the cost of a slow turn',
+      shim.includes('等待模型') && shim.includes('上下文较大'), shim.slice(-900))
 
     const refuseInstall = await createChannel({ ctx, config: { channelEnabled: false } }).install()
     eq('install without a wsl runner is refused', refuseInstall.ok, false)
