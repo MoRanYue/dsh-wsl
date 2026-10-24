@@ -144,6 +144,7 @@ function defineConfig(Schema) {
   allowRoot: Schema.boolean().default(false).description('允许 `wsl` 以 root 执行（`asRoot: true`）。WSL 的 root 免密，所以这项开关就是授权本身；默认关。').volatile(),
   channelEnabled: Schema.boolean().default(false).description('启用 WSL 通道：在 WSL 终端里用 `dsh "问题"` 把话发进指定会话，回复流式回到终端。默认关。').volatile(),
   channelSession: Schema.string().default('').description('WSL 通道的落点会话 id；留空表示使用最近活跃的会话（通常就是你在看的那段对话）。终端里的 `dsh use <id>` 可临时切换。').volatile(),
+  autoInstallShim: Schema.boolean().default(true).description('启动时检查 WSL 里的 dsh 命令：没安装或与当前版本不一致就自动装好，不用再手动点「安装」。默认开。').volatile(),
   distro: Schema.string().default('').description('固定使用的发行版；留空表示使用系统默认（也可用 `DSH_WSL_DISTRO`）。').volatile(),
   timeoutMs: Schema.number().default(0).description('默认命令超时（毫秒）；0 表示使用内置默认（也可用 `DSH_WSL_TIMEOUT_MS`）。').volatile(),
   }).description('dsh-wsl 的功能开关与默认值。')

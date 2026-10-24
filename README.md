@@ -492,7 +492,7 @@ While a turn streams, the terminal has no prompt — but it is still yours: pres
 
 A terminal prompt also carries what you were just looking at: the Host asks the page's terminal bridge for a **read-only snapshot of the terminal the command was typed in** (found by the command line itself), and prefixes the conversation message with the newest hundred lines of that screen, framed as 【终端历史】. That is the fast copy; when the model needs more it reads the same terminal again with this plugin's own terminal tool (the block names the terminal id), so there is no extra command to learn. It is best effort and bounded — no open DSH window, no matching terminal, or a slow attach simply means no snapshot, and the turn is never delayed by more than ~3 s. A prompt that came from a tool call gets no snapshot: nobody typed it at a screen.
 
-Set it up once in the panel: turn on **启用 dsh 命令** and click **安装 dsh 命令** — the default landing is the most recently active conversation — the one you are looking at (pick another from the list, or create one right there, if you want a different landing); the shim lands in `~/.local/bin/dsh`. The plugin binds a small HTTP
+Set it up once in the panel: turn on **启用 dsh 命令** and click **安装 dsh 命令** — the default landing is the most recently active conversation — the one you are looking at (pick another from the list, or create one right there, if you want a different landing); the shim lands in `~/.local/bin/dsh`. After that the plugin keeps it healthy by itself: on every start (and settings change) it reads the installed shim and, when it is missing or older than the running version, installs it again without asking — the check costs one `cat`, it never touches the distro while the channel is off or while a turn is streaming, and `autoInstallShim: false` in the plugin config turns it off. The plugin binds a small HTTP
 server to the address WSL uses as its default gateway, on a random port, and demands
 the token it generated at mount on every request. The desktop has to be running, and
 the designated conversation is ordinary: the channel admits a normal user message (prefixed
@@ -691,7 +691,7 @@ them process-wide, so no preset declares the row.
 ### Tests
 
 ```sh
-npm test          # 1234 host checks against real WSL (shim for ctx.subprocess) + 301 client checks
+npm test          # 1255 host checks against real WSL (shim for ctx.subprocess) + 301 client checks
 npm run test:real # the same checks against the REAL provider, plus the seam-fact suite
 ```
 

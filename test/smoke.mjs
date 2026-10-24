@@ -885,6 +885,22 @@ async function unitTests() {
     })
     eq('the real builder builds a schema that fills in defaults',
       JSON.stringify(built({})), '{"tools":{"wsl":true},"timeoutMs":0}')
+    // The plugin's own Config must declare the auto-install switch, default ON and volatile
+    // (every switch is volatile or the settings form never appears). A volatile field comes back
+    // as a cosmokit cell, not a plain value, so read it the way the host does.
+    const pluginSchema = buildConfig(builder)
+    if (pluginSchema !== undefined) {
+      const resolvedSchema = pluginSchema({})
+      const switchValue = resolvedSchema?.autoInstallShim
+      const switchOn = switchValue !== null && typeof switchValue === 'object'
+        && typeof switchValue.get === 'function' ? switchValue.get() : switchValue
+      eq('the config schema defaults auto-installing the dsh shim on', switchOn, true)
+      check('and that switch is volatile like the rest of the panel',
+        switchValue !== null && typeof switchValue === 'object' && typeof switchValue.get === 'function',
+        typeof switchValue)
+    } else {
+      console.log('  skip  the repo Config schema could not be built with the real builder')
+    }
   } else {
     console.log(`  skip  real schemastery not reachable at ${realSchemaEntry}`)
   }
@@ -5581,6 +5597,167 @@ async function channelUnitTests() {
       } finally {
         await historyChannel.stop()
         try { rmSync(historyHome, { recursive: true, force: true }) } catch {}
+      }
+    }
+
+    // Auto-installing the `dsh` shim: a missing or outdated file in the distro is repaired when
+    // the channel comes up, without a panel click. Each scenario needs its own channel (the
+    // throttle and the registered state live per instance) and its own fake `wsl`.
+    {
+      /** A fake `wsl.exe` runner that distinguishes the commands the channel issues. */
+      const makeShimBox = () => {
+        const home = mkdtempSync(join(tmpdir(), 'dsh-wsl-autoshim-'))
+        const calls = []
+        const state = { installed: '', installCode: 0 }
+        const wslFake = async (argv) => {
+          calls.push(argv)
+          const command = argv.join(' ')
+          if (command.includes('cat "$HOME/.local/bin/dsh"')) {
+            return { code: 0, stdout: state.installed, stderr: '' }
+          }
+          if (command.includes(' route ')) return { code: 0, stdout: '', stderr: '' }
+          if (command.includes('install -m 0755')) {
+            return state.installCode === 0
+              ? { code: 0, stdout: '/home/xiny/.local/bin/dsh\n', stderr: '' }
+              : { code: state.installCode, stdout: '', stderr: 'install failed' }
+          }
+          return { code: 0, stdout: '', stderr: '' }
+        }
+        return { home, calls, state, wslFake }
+      }
+      const openShimChannel = (box, overrides = {}) => createChannel({
+        ctx,
+        config: { channelEnabled: true, channelSession: 'wsl', autoInstallShim: true, ...overrides },
+        wsl: box.wslFake,
+        env: { USERPROFILE: box.home },
+      })
+      const shimCheckSeen = (box) => box.calls.some((argv) => argv.join(' ').includes('cat "$HOME/.local/bin/dsh"'))
+      const installSeen = (box) => box.calls.some((argv) => argv.join(' ').includes('install -m 0755'))
+      const waitFor = async (predicate, ms = 2_000) => {
+        const deadline = Date.now() + ms
+        while (Date.now() < deadline) {
+          if (predicate()) return true
+          await tickMs(10)
+        }
+        return predicate()
+      }
+      const cleanupShim = async (box, instance) => {
+        try { await instance.stop() } catch { /* it may never have started */ }
+        try { rmSync(box.home, { recursive: true, force: true }) } catch {}
+      }
+
+      // 1) missing -> installed, both when asked directly and from the channel's own start.
+      {
+        const box = makeShimBox()
+        const auto = openShimChannel(box)
+        try {
+          const result = await auto.ensureShim()
+          eq('a missing dsh shim is installed automatically', result.state, 'missing')
+          eq('and the automatic result says it installed one', result.installed, true)
+          check('the runner was asked to read the installed shim and then to install it',
+            shimCheckSeen(box) && installSeen(box),
+            JSON.stringify(box.calls.map((argv) => argv.join(' ').slice(0, 50))))
+        } finally {
+          await cleanupShim(box, auto)
+        }
+      }
+      {
+        const box = makeShimBox()
+        const auto = openShimChannel(box)
+        try {
+          await auto.start()
+          check('channel start heals a missing shim without a panel click',
+            await waitFor(() => installSeen(box)),
+            JSON.stringify(box.calls.map((argv) => argv.join(' ').slice(0, 50))))
+        } finally {
+          await cleanupShim(box, auto)
+        }
+      }
+
+      // 2) stale -> replaced (the template changed since the last install).
+      {
+        const box = makeShimBox()
+        box.state.installed = '#!/bin/bash\necho stale\n'
+        const auto = openShimChannel(box)
+        try {
+          const result = await auto.ensureShim()
+          eq('an outdated dsh shim is reported stale and replaced', result.state, 'stale')
+          eq('and the replacement really installed', result.installed, true)
+          check('the stale file was replaced', installSeen(box),
+            JSON.stringify(box.calls.map((argv) => argv.join(' ').slice(0, 50))))
+        } finally {
+          await cleanupShim(box, auto)
+        }
+      }
+
+      // 3) current -> nothing to do.
+      {
+        const box = makeShimBox()
+        const first = openShimChannel(box)
+        try {
+          await first.install()
+          const rendered = readFileSync(join(dirname(first.stateFile), 'dsh.sh'), 'utf8')
+          await first.stop()
+          box.state.installed = rendered
+          box.calls.length = 0
+          const current = openShimChannel(box)
+          try {
+            const result = await current.ensureShim()
+            eq('a current shim is left alone', result.state, 'current')
+            eq('and nothing was installed', result.installed, false)
+            check('and no install command was issued', !installSeen(box),
+              JSON.stringify(box.calls.map((argv) => argv.join(' ').slice(0, 50))))
+          } finally {
+            await current.stop()
+          }
+        } finally {
+          try { await first.stop() } catch { /* already stopped */ }
+          try { rmSync(box.home, { recursive: true, force: true }) } catch {}
+        }
+      }
+
+      // 4) A failing install is a warning, never a thrown error.
+      {
+        const box = makeShimBox()
+        box.state.installCode = 1
+        const auto = openShimChannel(box)
+        try {
+          const result = await auto.ensureShim()
+          eq('a failing shim install is reported instead of thrown', result.state, 'missing')
+          eq('and the result says nothing was installed', result.installed, false)
+          check('with the runner\'s reason attached', /install failed/.test(String(result.detail)),
+            String(result.detail))
+        } finally {
+          await cleanupShim(box, auto)
+        }
+      }
+
+      // 5) The switch off (or absent, which is how the old configs read) means no shim work at all.
+      {
+        const before = wslCalls.length
+        const result = await channel.ensureShim()
+        eq('auto-install is off when the switch is missing', result.state, 'disabled')
+        eq('and nothing was installed', result.installed, false)
+        eq('and no wsl command was run for the check', wslCalls.length - before, 0)
+      }
+
+      // 7) A disabled channel has nothing to install into.
+      {
+        const box = makeShimBox()
+        const off = createChannel({
+          ctx,
+          config: { channelEnabled: false, autoInstallShim: true },
+          wsl: box.wslFake,
+          env: { USERPROFILE: box.home },
+        })
+        try {
+          const result = await off.ensureShim()
+          eq('a disabled channel skips the automatic shim work', result.state, 'skipped')
+          eq('and runs no wsl command for it', box.calls.length, 0)
+          check('and writes no shim file', !existsSync(join(dirname(off.stateFile), 'dsh.sh')))
+        } finally {
+          await cleanupShim(box, off)
+        }
       }
     }
 
