@@ -53,7 +53,7 @@ import {
 } from '../lib/terminal.js'
 import { createSubtaskLog, projectSubtask } from '../lib/subtasks.js'
 import { createWslTermTool, readinessText } from '../lib/tools/wsl-term.js'
-import { createPtyTransport, createTerminalTransport } from '../lib/pty-transport.js'
+import { createLazyTerminalTransport, createPtyTransport, createTerminalTransport } from '../lib/pty-transport.js'
 import { createBridgeTransport } from '../lib/term-bridge.js'
 
 // One resolved configuration stands in for the mount the host would create.
@@ -4834,6 +4834,209 @@ async function bridgeUnitTests() {
   }
 }
 
+/**
+ * DSH 0.2.1-rc.3 mounts the web-app rows (and `terminalController`) AFTER a profile plugin's
+ * `apply`. The plugin used to resolve the terminal transport once at apply, silently froze the
+ * private-PTY fallback for the whole run, and kept reporting `terminal: pty` in `/info` while the
+ * browser bridge (terminal history, user-terminal collaboration) was unavailable.
+ *
+ * These checks drive the lazy handle directly, then the whole plugin through a fake ctx whose
+ * `get('terminalController')` appears later and whose `inject` callback is kept for the test.
+ */
+async function lazyTransportTests() {
+  console.log('\nterminal transport: lazy resolution and late upgrade')
+
+  /** The host subprocess seam: `spawn` for the runner's probes, `spawnTerminal` for the PTY. */
+  const makeFakeSubprocess = () => {
+    const empty = () => ({ readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) })
+    return {
+      spawn() {
+        return {
+          done: Promise.resolve({ exitCode: 0, signal: null }),
+          terminate() {},
+          collected: { stdout: empty(), stderr: empty() },
+        }
+      },
+      resolveExecutable: async (name) => `C:/Windows/System32/${name}`,
+      async spawnTerminal() { return makeBridgePtyHandle() },
+    }
+  }
+  /** The host's `terminalController` once it mounts: the three calls the bridge requires. */
+  const makeFakeController = () => {
+    const calls = { list: [], create: [], close: [] }
+    return {
+      calls,
+      list(sessionId) {
+        calls.list.push(sessionId)
+        return [{ id: 'user-term', title: 'WSL', sessionId }]
+      },
+      async create(agent, request) {
+        calls.create.push({ agentId: agent?.id, id: request?.id })
+        return { id: request?.id, title: 'WSL', state: 'running', cols: 80, rows: 24 }
+      },
+      async close(agent, id) {
+        calls.close.push({ agentId: agent?.id, id })
+      },
+    }
+  }
+  /**
+   * A fake plugin context whose terminal service can appear later.
+   *
+   * `inject(['terminalController', …])` callbacks are KEPT so the test decides when the service
+   * "mounts"; the bridge's own `inject(['webServer'])` is answered at once so it can publish its
+   * two routes.
+   */
+  const makeLateCtx = ({ withPty = true } = {}) => {
+    const state = { controller: undefined }
+    const tools = {}
+    const routes = []
+    const injected = []
+    const registered = []
+    const effects = []
+    const webServer = { register(route) { routes.push(route); return () => {} } }
+    const effect = (fn) => { effects.push(fn); return () => {} }
+    const subprocess = makeFakeSubprocess()
+    const ctx = {
+      tools: {
+        register(tool) {
+          tools[tool.name] = tool
+          registered.push(tool.name)
+          return () => { if (tools[tool.name] === tool) delete tools[tool.name] }
+        },
+      },
+      subprocess,
+      get(name) {
+        if (name === 'terminalController') return state.controller
+        if (name === 'subprocess') return withPty ? subprocess : undefined
+        return undefined
+      },
+      on() { return () => {} },
+      inject(deps, callback) {
+        const list = Array.isArray(deps) ? deps : []
+        if (list.includes('terminalController')) {
+          injected.push(callback)
+          return
+        }
+        try {
+          callback({ webServer, effect })
+        } catch {
+          // A host whose web server cannot serve the routes keeps the PTY fallback.
+        }
+      },
+      effect,
+    }
+    return { ctx, tools, state, injected, routes, registered, webServer, effect, subprocess }
+  }
+  const readInfo = async (routes) => {
+    const response = await callRoute(routes.find((route) => route.path === '/dsh-wsl-tool/info'), 'GET')
+    return JSON.parse(response.body)
+  }
+  const termRegistrations = (host) => host.registered.filter((name) => name === 'wsl-term').length
+
+  // 1) The PTY first, then the controller arrives: the stable handle upgrades and follows it.
+  {
+    const late = makeLateCtx()
+    const lazy = createLazyTerminalTransport({ ctx: late.ctx, config: CONFIG })
+    eq('a host without a terminal controller starts on the private shell', lazy.kind, 'pty')
+    eq('and is not bridge-capable yet', lazy.bridgeCapable, false)
+    const controller = makeFakeController()
+    late.state.controller = controller
+    eq('upgrade reports that the bridge took over', await lazy.upgrade(), true)
+    eq('and the handle is now bridge-capable', lazy.bridgeCapable, true)
+    // The bridge reports `kind: 'bridge'` once a page is really polling: drive one poll.
+    const page = makeBridgePage({ routes: late.routes, live: [] })
+    const warm = page.poll()
+    await tickMs(5)
+    eq('and once a page polls it reports the bridge generation', lazy.kind, 'bridge')
+    warm.catch(() => {})
+    lazy.describe('s', 'gone')
+    eq('describe now goes through the new controller', controller.calls.list[0], 's')
+  }
+
+  // 2) No controller ever appears: the upgrade refuses and the PTY stays.
+  {
+    const late = makeLateCtx()
+    const lazy = createLazyTerminalTransport({ ctx: late.ctx, config: CONFIG })
+    eq('an upgrade with nothing to upgrade to reports false', await lazy.upgrade(), false)
+    eq('and the handle keeps serving the private shell', lazy.kind, 'pty')
+  }
+
+  // 3) A host with no terminal service at all: every call is inert or says what is missing.
+  {
+    const bare = makeLateCtx({ withPty: false })
+    const lazy = createLazyTerminalTransport({ ctx: bare.ctx, config: CONFIG })
+    eq('a host with neither a controller nor a PTY has no generation', lazy.kind, null)
+    eq('and is not bridge-capable', lazy.bridgeCapable, false)
+    eq('its list is empty', JSON.stringify(lazy.list('s')), '[]')
+    eq('its user-terminal list is empty', JSON.stringify(lazy.userTerminals('s')), '[]')
+    eq('its status is null', lazy.status(), null)
+    eq('its describe is null', lazy.describe('s', 'x'), null)
+    await rejects('create without a transport says so', () => lazy.create({ id: 's' }, { id: 't' }),
+      /no terminal transport/)
+    await rejects('follow without a transport says so', () => lazy.follow({ id: 's' }, 't', 'a', new AbortController().signal),
+      /no terminal transport/)
+  }
+
+  // 4) The whole plugin: apply runs BEFORE the controller is mounted (the rc.3 ordering).
+  {
+    const late = makeLateCtx()
+    apply(late.ctx, {})
+    const infoBefore = await readInfo(late.routes)
+    eq('before the controller mounts the info route reports the private shell', infoBefore.terminal?.kind, 'pty')
+    eq('and reports the build as not bridge-capable', infoBefore.terminal?.bridgeCapable, false)
+    const oldTerm = late.tools['wsl-term']
+    check('the terminal tool words itself as the private-shell variant',
+      typeof oldTerm?.description === 'string' && oldTerm.description.includes('does not let a plugin join'),
+      String(oldTerm?.description).slice(-200))
+    const before = termRegistrations(late)
+    // The host now mounts its web-app rows; `terminalController` becomes available.
+    late.state.controller = makeFakeController()
+    for (const callback of late.injected) callback({ webServer: late.webServer, effect: late.effect })
+    eq('the terminal tool is re-registered after the upgrade', termRegistrations(late), before + 1)
+    const newTerm = late.tools['wsl-term']
+    check('the re-registered instance is a new object', newTerm !== oldTerm)
+    check('and its description offers the browser terminal',
+      typeof newTerm?.description === 'string'
+      && newTerm.description.includes('接管输入') && newTerm.description.includes('runs in the terminal YOU have open'),
+      String(newTerm?.description).slice(-260))
+    eq('the info route now reports a bridge-capable build',
+      (await readInfo(late.routes)).terminal?.bridgeCapable, true)
+    const page = makeBridgePage({ routes: late.routes, live: [] })
+    const warm = page.poll()
+    await tickMs(5)
+    eq('and the generation is the browser bridge once a page polls',
+      (await readInfo(late.routes)).terminal?.kind, 'bridge')
+    warm.catch(() => {})
+  }
+
+  // 5) A host that already had the controller at apply: nothing is re-registered.
+  {
+    const ready = makeLateCtx()
+    ready.state.controller = makeFakeController()
+    apply(ready.ctx, {})
+    const termBefore = ready.tools['wsl-term']
+    const before = termRegistrations(ready)
+    eq('a host that already has the controller starts bridge-capable',
+      (await readInfo(ready.routes)).terminal?.bridgeCapable, true)
+    for (let round = 0; round < 2; round += 1) {
+      for (const callback of ready.injected) callback({ webServer: ready.webServer, effect: ready.effect })
+    }
+    eq('a later injection of the same services does not re-register the tool', termRegistrations(ready), before)
+    check('and the terminal tool instance is unchanged', ready.tools['wsl-term'] === termBefore)
+  }
+
+  // 6) `/info` with no resolved generation omits the terminal block entirely.
+  {
+    const bare = makeLateCtx({ withPty: false })
+    apply(bare.ctx, {})
+    eq('a host with no terminal service reports no terminal block',
+      (await readInfo(bare.routes)).terminal, null)
+    check('and the terminal tool says it cannot drive anything',
+      String(bare.tools['wsl-term']?.description ?? '').includes('no terminal this tool can drive'),
+      String(bare.tools['wsl-term']?.description ?? '').slice(-160))
+  }
+}
+
 
 /**
  * Drive `lib/channel.js` against fake host services: a real HTTP server on loopback, the
@@ -5942,6 +6145,7 @@ try {
   await unitTests()
   await terminalUnitTests()
   await bridgeUnitTests()
+  await lazyTransportTests()
   await channelUnitTests()
   await toolTests(tools, shim)
 } finally {
