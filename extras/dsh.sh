@@ -47,6 +47,7 @@ usage() {
   dsh use <会话id>          切换当前会话
   dsh rm <会话id>           归档会话（可恢复）
   dsh status                当前会话与通道状态
+  dsh screen [-n 行数]      读取这个终端最近 N 行屏幕（只读快照；默认 300，最多 1000）
 
 说明：回复来自 DSH 客户端里的同一段对话；在终端按 Ctrl+C 会停止等待，并且
 客户端里那一轮也会一起中止。等待回复期间终端仍可输入：**先按一次回车暂停输出**，
@@ -287,6 +288,17 @@ cmd_insert() {
     err*) die "${out#err	}" ;;
   esac
   printf '已插入对话 %s\n' "$(printf '%s\n' "$out" | tr '\t' ' ')"
+}
+
+# Read this terminal's own screen, deeper than the copy a prompt carries (read-only snapshot).
+# The Host remembers which terminal the last prompt came from, so this needs no argument.
+cmd_screen() {
+  local session=$1 lines=${2:-300} out
+  out=$(post screen "$lines" "$session")
+  case "$out" in
+    err*) die "${out#err	}" ;;
+  esac
+  printf '%s\n' "$out"
 }
 
 cmd_status() {
@@ -785,6 +797,18 @@ case "$1" in
     else
       cmd_insert "$(current_session)" "${1:-}" "$insert_nowait"
     fi
+    exit 0
+    ;;
+  screen)
+    # `dsh screen [-n N] [<id>]`: deeper terminal history on demand (read-only snapshot).
+    shift
+    screen_lines=300
+    if [ "${1:-}" = '-n' ] || [ "${1:-}" = '--lines' ]; then
+      screen_lines=${2:-300}
+      shift
+      [ $# -gt 0 ] && shift
+    fi
+    cmd_screen "${1:-$(current_session)}" "$screen_lines"
     exit 0
     ;;
 esac

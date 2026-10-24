@@ -5491,6 +5491,25 @@ async function channelUnitTests() {
         request.end()
       })
       const lastPromptText = () => calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.content?.[0]?.text ?? ''
+      /** `dsh screen [-n N]`: the deeper read of the same terminal. */
+      const screenOnHistory = (body, extraHeaders = {}) => new Promise((resolve, reject) => {
+        const request = httpRequest({
+          host: '127.0.0.1', port: historyPort, method: 'POST', path: '/screen',
+          headers: {
+            'content-type': 'text/plain',
+            'x-dsh-wsl-token': historyChannel.token,
+            'x-dsh-wsl-session': 'history-session',
+            ...extraHeaders,
+          },
+        }, (response) => {
+          const chunks = []
+          response.on('data', (chunk) => chunks.push(chunk))
+          response.on('end', () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+        })
+        request.on('error', reject)
+        request.write(body)
+        request.end()
+      })
       try {
         const message = '解释一下这个报错'
         const screen = [
@@ -5552,6 +5571,69 @@ async function channelUnitTests() {
         await sayOnHistory(message, { 'x-dsh-wsl-caller': 'session-other' })
         eq('a tool-invoked prompt is not given screen history', lastPromptText(), `${SAY_PREFIX}${message}`)
         eq('and the transport is not even consulted for it', historyBehavior.calls.userTerminals, readsBefore)
+
+        // The default history is 100 lines now (it used to be 60): a long screen keeps its
+        // NEWEST lines, drops the oldest, and cuts at the start of the echoed command's line so
+        // no half-typed `$ dsh "…"` reaches the conversation.
+        const longScreen = [
+          ...Array.from({ length: 150 }, (_, index) => `out-${String(index + 1).padStart(3, '0')} ${'x'.repeat(20)}`),
+          `xiny@XINY9:~$ dsh "${message}"`,
+        ].join('\n')
+        historyBehavior.screens.clear()
+        historyBehavior.screens.set('user-term', longScreen)
+        const longSay = await sayOnHistory(message)
+        const longPrompt = lastPromptText()
+        /** The text between the header line and the closing marker, trailing newline removed. */
+        const historyBodyOf = (text) => {
+          const at = text.indexOf('【终端历史】')
+          const end = text.indexOf('【终端历史结束】')
+          if (at < 0 || end < 0) return ''
+          const firstBreak = text.indexOf('\n', at)
+          if (firstBreak < 0 || firstBreak > end) return ''
+          return text.slice(firstBreak + 1, end).replace(/\n+$/, '')
+        }
+        const longBody = historyBodyOf(longPrompt)
+        const longLines = longBody === '' ? [] : longBody.split('\n')
+        eq('a long screen keeps exactly the newest 100 lines', longLines.length, 100)
+        check('and the newest line is kept while the oldest is dropped',
+          longBody.includes('out-150') && !longBody.includes('out-001'), longBody.slice(0, 140))
+        check('the history hint points at the deeper read',
+          longPrompt.includes('dsh screen -n 300') && longPrompt.includes('最多 1000 行'),
+          longPrompt.slice(0, 300))
+        check('the cut happens at the echoed command\'s line start',
+          !longBody.includes('dsh "') && !longBody.includes(message), longBody.slice(-160))
+        check('and that turn still completes', longSay.body.includes('~e 1'), longSay.body.slice(-90))
+
+        // `dsh screen -n N`: the same terminal, deeper. It must prefer the terminal this
+        // conversation's last prompt came from (there is no literal `dsh screen` on the screen
+        // below, so the fallback search could not answer at all).
+        const screenAll = await screenOnHistory('300')
+        eq('a deep screen read answers 200', screenAll.status, 200)
+        {
+          const allLines = screenAll.body.replace(/\n$/, '').split('\n')
+          check('and returns the whole screen tail, including the oldest lines',
+            allLines.length >= 150
+            && allLines.some((line) => line.includes('out-001'))
+            && allLines.some((line) => line.includes('out-150')),
+            `${allLines.length} lines, first=${String(allLines[0]).slice(0, 40)}`)
+          check('the deep read used the remembered terminal, not a literal dsh-screen line',
+            !longScreen.includes('dsh screen'), 'the fallback path would have found nothing')
+        }
+        const screen20 = await screenOnHistory('20')
+        eq('a line-limited deep read answers 200', screen20.status, 200)
+        eq('and returns exactly the requested number of lines',
+          screen20.body.replace(/\n$/, '').split('\n').length, 20)
+
+        // A channel without a transport has no screen; and the route authenticates like the rest.
+        const noTransport = await call('POST', '/screen', '300', {
+          'content-type': 'text/plain', 'x-dsh-wsl-token': state.token, 'x-dsh-wsl-session': 'history-session',
+        })
+        eq('a channel without a transport has no screen to read', noTransport.status, 404)
+        check('and says so with an error line', noTransport.body.startsWith('err'), noTransport.body.slice(0, 120))
+        const noToken = await call('POST', '/screen', '300', {
+          'content-type': 'text/plain', 'x-dsh-wsl-session': 'history-session',
+        })
+        eq('the screen route needs the channel token too', noToken.status, 401)
       } finally {
         await historyChannel.stop()
         try { rmSync(historyHome, { recursive: true, force: true }) } catch {}
