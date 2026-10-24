@@ -39,24 +39,18 @@ usage() {
 用法：
   dsh "问题"                把问题发给当前会话，流式显示思考与回复
   dsh <会话id> "问题"       发给指定会话
-  dsh insert "消息"         插入当前对话并流式显示那一轮（与 dsh "问题" 同格式）
-  dsh insert --nowait "消息" 只插入、立即返回（往正在进行的回合里插话时用）
-  dsh insert <会话id> "消息" 插入指定会话，同样流式显示
   dsh list                  列出会话（* 表示当前）
   dsh new <会话id>          新建会话并设为当前
   dsh use <会话id>          切换当前会话
   dsh rm <会话id>           归档会话（可恢复）
   dsh status                当前会话与通道状态
-  dsh screen [-n 行数]      读取这个终端最近 N 行屏幕（只读快照；默认 300，最多 1000）
 
 说明：回复来自 DSH 客户端里的同一段对话；在终端按 Ctrl+C 会停止等待，并且
-客户端里那一轮也会一起中止。等待回复期间终端仍可输入：**先按一次回车暂停输出**，
-敲完内容再回车即插入当前对话（等同 `dsh insert --nowait`），随后继续输出；
+客户端里那一轮也会一起中止。等待回复期间终端仍可输入：先按一次回车暂停输出，
+敲完内容再回车就插入当前对话（等同往正在进行的回合里插话），随后继续输出；
 第二次回车留空则取消插入。设 DSH_WSL_NO_STEER=1 可关掉这个输入。`dsh "…"` 若
-目标正是正在等待这条命令的会话会自锁，此时会直接报「无法执行」并说明原因；
-要往正在进行的对话里送消息，用 `dsh insert --nowait`（立即返回）——从工具调用
-里发起的 insert 也始终立即返回，不会自锁。当前会话按终端分别保存：两个终端
-互不影响。
+目标正是正在等待这条命令的会话会自锁，此时会直接报「无法执行」并说明原因，
+等这一轮结束或在客户端里输入即可。当前会话按终端分别保存：两个终端互不影响。
 EOF
 }
 
@@ -269,36 +263,6 @@ cmd_rm() {
   esac
   if [ "$(current_session)" = "$id" ]; then rm -f "$CURRENT_FILE"; fi
   printf '已归档会话 %s\n' "$id"
-}
-
-# Hand a message to a conversation. A person typing at a terminal gets the same live turn as
-# `dsh "…"` — streaming reply, thinking clock, completion line — because that is what they
-# asked the conversation to do. There is one caller that must NOT wait: a tool call inside the
-# very conversation it writes into (the turn cannot end until the command returns, so waiting
-# would deadlock), and `--nowait` asks for that at-once behaviour from a terminal too.
-cmd_insert() {
-  local session=$1 prompt=$2 nowait=${3:-0} out
-  [ -n "$prompt" ] || die "用法：dsh insert [--nowait] \"消息\" 或 dsh insert [--nowait] <会话id> \"消息\""
-  if [ "$nowait" != 1 ] && [ -z "${DSH_WSL_CALLER_SESSION:-}" ]; then
-    cmd_say "$session" "$prompt"
-    return
-  fi
-  out=$(post insert "$prompt" "$session")
-  case "$out" in
-    err*) die "${out#err	}" ;;
-  esac
-  printf '已插入对话 %s\n' "$(printf '%s\n' "$out" | tr '\t' ' ')"
-}
-
-# Read this terminal's own screen, deeper than the copy a prompt carries (read-only snapshot).
-# The Host remembers which terminal the last prompt came from, so this needs no argument.
-cmd_screen() {
-  local session=$1 lines=${2:-300} out
-  out=$(post screen "$lines" "$session")
-  case "$out" in
-    err*) die "${out#err	}" ;;
-  esac
-  printf '%s\n' "$out"
 }
 
 cmd_status() {
@@ -576,11 +540,11 @@ cmd_say() {
   trap 'on_interrupt 143' TERM
   trap 'on_interrupt 129' HUP
   trap 'stop_reason; cleanup_balance; cleanup_say' EXIT
-  # While a turn streams the terminal has no prompt — which used to be the only place a person
-  # could type `dsh insert`. A background reader hands a typed line to the same insert route
-  # (fire-and-forget, marked like every terminal prompt), so a running `dsh "…"` can be steered
-  # without a second window. Only a real terminal gets this: a pipe or a tool shell must not
-  # have its stdin read out from under the command that owns it.
+  # While a turn streams the terminal has no prompt. Pressing Enter there holds the answer back
+  # and the next line goes into the conversation as a steer (the same `/insert` route the old
+  # `dsh insert` command used), so a running `dsh "…"` can be talked into without a second window.
+  # Only a real terminal gets this: a pipe or a tool shell must not have its stdin read out from
+  # under the command that owns it.
   start_steer_reader() {
     [ -t 0 ] || return
     [ "${DSH_WSL_NO_STEER:-}" = 1 ] && return
@@ -773,6 +737,10 @@ cmd_say() {
 [ $# -eq 0 ] && { usage; exit 1; }
 case "$1" in
   -h|--help|help) usage; exit 0 ;;
+  # Removed commands answer for themselves instead of falling through as a prompt aimed at a
+  # session literally named "insert" or "screen".
+  insert) die "dsh insert 已移除：等待回复时按一次回车暂停输出，输入内容再回车，就插入当前对话" ;;
+  screen) die "dsh screen 已移除：终端历史会随消息自动带给模型，不需要手动读取" ;;
 esac
 
 # `use` touches one local file: no channel, no network, no probe.
@@ -787,30 +755,6 @@ case "$1" in
   new) cmd_new "${2:-}"; exit 0 ;;
   rm|archive) cmd_rm "${2:-}"; exit 0 ;;
   status) cmd_status; exit 0 ;;
-  insert)
-    # `--nowait` first, then the optional session id: `dsh insert [--nowait] [<id>] "消息"`.
-    shift
-    insert_nowait=0
-    if [ "${1:-}" = '--nowait' ] || [ "${1:-}" = '-n' ]; then insert_nowait=1; shift; fi
-    if [ $# -ge 2 ]; then
-      cmd_insert "$1" "${*:2}" "$insert_nowait"
-    else
-      cmd_insert "$(current_session)" "${1:-}" "$insert_nowait"
-    fi
-    exit 0
-    ;;
-  screen)
-    # `dsh screen [-n N] [<id>]`: deeper terminal history on demand (read-only snapshot).
-    shift
-    screen_lines=300
-    if [ "${1:-}" = '-n' ] || [ "${1:-}" = '--lines' ]; then
-      screen_lines=${2:-300}
-      shift
-      [ $# -gt 0 ] && shift
-    fi
-    cmd_screen "${1:-$(current_session)}" "$screen_lines"
-    exit 0
-    ;;
 esac
 
 # A bare first word that names no command is either a session id (two or more args) or

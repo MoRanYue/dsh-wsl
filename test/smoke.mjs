@@ -5332,20 +5332,14 @@ async function channelUnitTests() {
     check('the install command copies and marks the shim executable',
       (wslCalls[wslCalls.length - 1] ?? []).join(' ').includes('install -m 0755'), JSON.stringify(wslCalls[wslCalls.length - 1]))
     check('the installed shim forwards the caller session, so self-lock can be diagnosed',
-      shim.includes('x-dsh-wsl-caller') && shim.includes('DSH_WSL_CALLER_SESSION')
-      && shim.includes('cmd_insert'),
+      shim.includes('x-dsh-wsl-caller') && shim.includes('DSH_WSL_CALLER_SESSION'),
       shim.slice(-1200))
-    // `dsh insert` typed by a person streams the turn like `dsh "…"` (clock and reply); only a
-    // tool-invoked insert (caller session present) or an explicit `--nowait` hands the message
-    // over and returns. The tool split is what keeps the self-lock case possible, and the
-    // terminal split is what keeps `insert` from looking like it silently did nothing.
-    check('a terminal insert streams like a prompt, a tool insert returns at once',
-      /cmd_insert\(\)[\s\S]{0,1200}cmd_say "\$session" "\$prompt"/.test(shim)
-      && shim.includes('nowait')
-      && shim.includes('DSH_WSL_CALLER_SESSION'),
-      shim.slice(shim.indexOf('cmd_insert()'), shim.indexOf('cmd_insert()') + 1200))
-    check('the insert usage documents the waiting and the --nowait form',
-      shim.includes('dsh insert --nowait') && shim.includes('dsh insert <会话id>'),
+    // The old `dsh insert` and `dsh screen` commands are gone: the first is replaced by pressing
+    // Enter while a turn streams (the same `/insert` route, driven by the terminal reader), and
+    // the second was only ever for the model, which reads the terminal with its own tool.
+    check('the user-facing CLI has no insert or screen command',
+      !shim.includes('cmd_insert') && !shim.includes('cmd_screen')
+      && !shim.includes('dsh insert "') && !shim.includes('dsh screen [-n'),
       shim.slice(0, 900))
     // A turn in flight holds the terminal, but not the person: one Enter holds the answer back
     // so the compose line is typed on a quiet terminal, the second delivers it as an insert.
@@ -5491,25 +5485,6 @@ async function channelUnitTests() {
         request.end()
       })
       const lastPromptText = () => calls.filter((entry) => entry[0] === 'prompt').at(-1)?.[1]?.content?.[0]?.text ?? ''
-      /** `dsh screen [-n N]`: the deeper read of the same terminal. */
-      const screenOnHistory = (body, extraHeaders = {}) => new Promise((resolve, reject) => {
-        const request = httpRequest({
-          host: '127.0.0.1', port: historyPort, method: 'POST', path: '/screen',
-          headers: {
-            'content-type': 'text/plain',
-            'x-dsh-wsl-token': historyChannel.token,
-            'x-dsh-wsl-session': 'history-session',
-            ...extraHeaders,
-          },
-        }, (response) => {
-          const chunks = []
-          response.on('data', (chunk) => chunks.push(chunk))
-          response.on('end', () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
-        })
-        request.on('error', reject)
-        request.write(body)
-        request.end()
-      })
       try {
         const message = '解释一下这个报错'
         const screen = [
@@ -5597,43 +5572,12 @@ async function channelUnitTests() {
         eq('a long screen keeps exactly the newest 100 lines', longLines.length, 100)
         check('and the newest line is kept while the oldest is dropped',
           longBody.includes('out-150') && !longBody.includes('out-001'), longBody.slice(0, 140))
-        check('the history hint points at the deeper read',
-          longPrompt.includes('dsh screen -n 300') && longPrompt.includes('最多 1000 行'),
+        check('the history hint tells the model where to read more',
+          longPrompt.includes('wsl-term') && longPrompt.includes('id=user-term'),
           longPrompt.slice(0, 300))
         check('the cut happens at the echoed command\'s line start',
           !longBody.includes('dsh "') && !longBody.includes(message), longBody.slice(-160))
         check('and that turn still completes', longSay.body.includes('~e 1'), longSay.body.slice(-90))
-
-        // `dsh screen -n N`: the same terminal, deeper. It must prefer the terminal this
-        // conversation's last prompt came from (there is no literal `dsh screen` on the screen
-        // below, so the fallback search could not answer at all).
-        const screenAll = await screenOnHistory('300')
-        eq('a deep screen read answers 200', screenAll.status, 200)
-        {
-          const allLines = screenAll.body.replace(/\n$/, '').split('\n')
-          check('and returns the whole screen tail, including the oldest lines',
-            allLines.length >= 150
-            && allLines.some((line) => line.includes('out-001'))
-            && allLines.some((line) => line.includes('out-150')),
-            `${allLines.length} lines, first=${String(allLines[0]).slice(0, 40)}`)
-          check('the deep read used the remembered terminal, not a literal dsh-screen line',
-            !longScreen.includes('dsh screen'), 'the fallback path would have found nothing')
-        }
-        const screen20 = await screenOnHistory('20')
-        eq('a line-limited deep read answers 200', screen20.status, 200)
-        eq('and returns exactly the requested number of lines',
-          screen20.body.replace(/\n$/, '').split('\n').length, 20)
-
-        // A channel without a transport has no screen; and the route authenticates like the rest.
-        const noTransport = await call('POST', '/screen', '300', {
-          'content-type': 'text/plain', 'x-dsh-wsl-token': state.token, 'x-dsh-wsl-session': 'history-session',
-        })
-        eq('a channel without a transport has no screen to read', noTransport.status, 404)
-        check('and says so with an error line', noTransport.body.startsWith('err'), noTransport.body.slice(0, 120))
-        const noToken = await call('POST', '/screen', '300', {
-          'content-type': 'text/plain', 'x-dsh-wsl-session': 'history-session',
-        })
-        eq('the screen route needs the channel token too', noToken.status, 401)
       } finally {
         await historyChannel.stop()
         try { rmSync(historyHome, { recursive: true, force: true }) } catch {}
