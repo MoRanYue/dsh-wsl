@@ -512,7 +512,11 @@ cmd_say() {
   # A host crash or a closed connection ends the stream WITHOUT the frames that stop the
   # clock; without this the ticker would keep printing on this terminal forever. The same
   # handler releases the balance request and its temp file on every interruption path.
-  trap 'stop_reason; cleanup_balance; cleanup_say' INT TERM
+  # EXIT covers the paths that never reach the cleanup below (a `die` after the stream, an
+  # `exit` from a frame branch); HUP covers a terminal tab closing rather than Ctrl+C. Left
+  # behind once, a `balance.<pid>` file names a wallet this shell no longer holds.
+  trap 'stop_reason; cleanup_balance; cleanup_say' INT TERM EXIT
+  trap 'stop_reason; cleanup_balance; cleanup_say; exit 129' HUP
   stream_turn() {
     got_frame=0
     say_status="$STATE_DIR/say.$$"
